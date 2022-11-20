@@ -579,6 +579,15 @@ def init_directories() -> None:
 
 def start() -> None:
     def start_swapd() -> None:
+        fd = "/sys/kernel/mm/transparent_hugepage/enabled"
+        file = open(fd, 'w')
+        file.write("never")
+        file.close()
+        fd = "/sys/kernel/mm/transparent_hugepage/defrag"
+        file = open(fd, 'w')
+        file.write("never")
+        file.close()
+
         systemd.daemon.notify("STATUS=Activating swap units...")
         info("swapD: pick up devices from systemd-gpt-auto-generator")
         for unit_path in find_swap_units():
