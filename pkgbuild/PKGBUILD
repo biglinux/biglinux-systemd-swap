@@ -10,14 +10,13 @@ license=('GPL3')
 depends=('python' 'python-systemd' 'python-sysv_ipc' 'util-linux')
 makedepends=('git')
 provides=('systemd-swap')
-conflicts=('systemd-swap-git')
+conflicts=('systemd-swap-git' 'systemd-swap')
 backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
 
 package() {
-#   cd "systemd-swap"
-    cd ${srcdir}/${pkgname}
-
+#     cd ${srcdir}/${pkgname}
+    cd ${srcdir}/systemd-swap
     make DESTDIR="$pkgdir" install
 }
