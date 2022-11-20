@@ -11,6 +11,8 @@ if [ ! -e "/swap" ]; then
     chattr +C /swap
 fi
 
+systemctl enable --now systemd-swap.service
+
 ## arg 1:  the new package version
 ## arg 2:  the old package version
 #pre_upgrade() {
@@ -22,6 +24,7 @@ fi
 post_upgrade() {
 
 post_install
+systemctl restart systemd-swap.service
 
 }
 
