@@ -86,7 +86,7 @@ endef
 swap.conf: ## Generate swap.conf
 	@echo '** Generating swap.conf..'
 	@printf "$(banner)" > $@
-	@grep -o '^[^#]*' include/swap-default.conf | sed 's/^/#/;s/[ \t]*$$//' >> $@
+	@cat include/swap-default.conf >> $@
 
 files: $(BIN_T) $(SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T)
 

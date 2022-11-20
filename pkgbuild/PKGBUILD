@@ -1,0 +1,23 @@
+# Maintainer: Barnabé <barnabedikartola@gmail.com>
+
+pkgname=systemd-swap
+pkgver=$(date +%y.%m.%d)
+pkgrel=$(date +%H%M)
+pkgdesc="Script for creating hybrid swap space from zram swaps, swap files and swap partitions"
+arch=('any')
+url="https://github.com/biglinux/systemd-swap"
+license=('GPL3')
+depends=('python' 'python-systemd' 'python-sysv_ipc' 'util-linux')
+makedepends=('git')
+provides=('systemd-swap')
+conflicts=('systemd-swap-git')
+backup=('etc/systemd/swap.conf')
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+package() {
+#   cd "systemd-swap"
+    cd ${srcdir}/${pkgname}
+
+    make DESTDIR="$pkgdir" install
+}
