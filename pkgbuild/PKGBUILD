@@ -1,6 +1,6 @@
 # Maintainer: Barnabé <barnabedikartola@gmail.com>
 
-pkgname=systemd-swap
+pkgname=systemd-swap-big
 pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
 pkgdesc="Script for creating hybrid swap space from zram swaps, swap files and swap partitions"
