@@ -19,4 +19,6 @@ install=pkgbuild.install
 package() {
     cd ${srcdir}/${pkgname}
     make DESTDIR="$pkgdir" install
+    cp "${srcdir}/${pkgname}/src/pre-systemd-swap" "${pkgdir}/usr/bin/"
+    cp "${srcdir}/${pkgname}/include/pre-systemd-swap.service" "${pkgdir}/usr/lib/systemd/system/"
 }

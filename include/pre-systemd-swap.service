@@ -1,0 +1,11 @@
+[Unit]
+Description=Manage swap spaces on zram, files and partitions.
+Wants=modprobe@zram.service
+After=modprobe@zram.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/pre-systemd-swap
+
+[Install]
+WantedBy=multi-user.target

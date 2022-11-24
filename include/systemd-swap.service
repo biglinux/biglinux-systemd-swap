@@ -1,7 +1,7 @@
 [Unit]
 Description=Manage swap spaces on zram, files and partitions.
-Wants=modprobe@zram.service
-After=modprobe@zram.service
+Wants=pre-systemd-swap.service
+After=pre-systemd-swap.service
 
 [Service]
 Type=notify

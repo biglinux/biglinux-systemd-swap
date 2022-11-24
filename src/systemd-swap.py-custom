@@ -270,6 +270,92 @@ class SwapFc:
             path = os.path.dirname(self.swapfc_path)
         else:
             error("swapfc_path is invalid")
+
+        #pasta raiz do ponto de montagem do swapfc
+        #separar por /
+        root_swapfc_path = self.swapfc_path.split("/")
+        #concatena /+pastaraiz
+        # root_swapfc_path = str('/' + str(root_swapfc_path[1]))
+        #se a pasta existir
+        if os.path.isdir('/' + str(root_swapfc_path[1])):
+            #tenta pegar o top_level_id
+            try:
+                output = subprocess.run(
+                    ["btrfs", "subvolume", "show", '/' + str(root_swapfc_path[1])], check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    # ["btrfs", "subvolume", "show", root_swapfc_path], text=True, stdout=subprocess.PIPE,
+                ).stdout
+                top_level_id = output.splitlines()[10]
+                top_level_id = top_level_id.split()
+                top_level_id = top_level_id[3]
+                # print (str(top_level_id[3]))
+            #se falhar passa e cria tudo
+            except:
+                top_level_id = 255
+                pass
+        else:
+            os.mkdir('/' + str(root_swapfc_path[1]))
+
+        #se o subvolume não estiver montado na raiz
+
+        if top_level_id != "5":
+            info(
+            f"swapFC: {root_swapfc_path[1]} is not a root subvolume, creating..."
+            )
+            output = subprocess.run(
+                ["df", "--output=source", "/"], check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            output = output.splitlines()[1]
+            # print (output)
+
+            #pasta de montagem da raiz
+            mp = "/mpswapfc"
+
+            #se a pasta existir
+            if os.path.isdir(mp) is False:
+                os.mkdir(mp)
+
+            #tenta montar
+            # try:
+            os.system(f"mount {output} {mp}")
+            # except:
+                # pass
+
+            #criar o subvolume na raiz
+            # print (str(mp) + '/' + '@' + str(root_swapfc_path[1]))
+            if os.path.isdir(str(mp) + '/' + '@' + str(root_swapfc_path[1])) is False:
+                subprocess.run(
+                    ["btrfs", "subvolume", "create", str(mp) + '/' + '@' + str(root_swapfc_path[1]) ],
+                    )
+            #desmontar o mountpoint
+            os.system(f"umount {mp}")
+
+            #pegar UUID da raiz
+            uuid = subprocess.run(
+                ["blkid", output], check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            uuid = uuid.split()
+            uuid = uuid[1]
+            uuid = uuid.replace('"',"")
+
+            #se não tiver o monto de montagem no /etc/fstab criar
+            fd = "/etc/fstab"
+            # file = open(fd, 'r')
+            with open(fd, 'r') as file:
+                # read all content of a file
+                content = file.read()
+                # check if string present in a file
+                if str(root_swapfc_path[1]) not in content:
+                    with open(fd, 'a') as file2:
+                        file2.write('\n' + uuid + ' /' + str(root_swapfc_path[1]) + " btrfs" + ' subvol=/@' + str(root_swapfc_path[1]) + ',defaults,noatime 0 0')
+                        file2.close()
+                file.close()
+            #montar tudo do /etc/fstab
+            subprocess.run(["systemctl", "daemon-reload"],)
+            subprocess.run(["mount", "-a"],)
+
+            #remover a pasta de moutpoint
+            os.rmdir(mp)
+
         output = subprocess.run(
             ["df", path, "--output=fstype"],
             check=True,
@@ -579,6 +665,15 @@ def init_directories() -> None:
 
 def start() -> None:
     def start_swapd() -> None:
+        fd = "/sys/kernel/mm/transparent_hugepage/enabled"
+        file = open(fd, 'w')
+        file.write("never")
+        file.close()
+        fd = "/sys/kernel/mm/transparent_hugepage/defrag"
+        file = open(fd, 'w')
+        file.write("never")
+        file.close()
+
         systemd.daemon.notify("STATUS=Activating swap units...")
         info("swapD: pick up devices from systemd-gpt-auto-generator")
         for unit_path in find_swap_units():

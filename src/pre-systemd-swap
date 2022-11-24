@@ -1,0 +1,38 @@
+#!/bin/bash
+
+swapfcfolder=$(cat /etc/systemd/swap.conf | grep swapfc_path= | awk -F\/ '{print $2}')
+toplevelid=$(btrfs subvolume show /$swapfcfolder | grep -i "top level id" | awk '{print $4}')
+rootpartion=$(df --output=source / | tail -n 1)
+
+if [ "$toplevelid" != "5" ];then
+    #montar partição atual em /mnt
+    mount $rootpartion /mnt
+    #criar subvolume dentro da partição root
+
+    if [ ! -e "/mnt/@${swapfcfolder}" ]; then
+        #criar pasta local para montagem do subvolume
+        btrfs subvolume create /mnt/@${swapfcfolder}
+    fi
+
+    if [ -z "$(grep @${swapfcfolder} /etc/fstab )" ];then
+        #adicionar ao fstab
+        echo $(blkid $rootpartion | awk '{print $2}' | sed 's/\"//g')" /${swapfcfolder} btrfs subvol=/@${swapfcfolder},defaults 0 0" | tee -a /etc/fstab
+    fi
+    #desmontar partição root
+    sudo umount /mnt
+
+    #reload /etc/fstab
+    sudo systemctl daemon-reload
+
+    if [ ! -e "/${swapfcfolder}" ]; then
+        sudo mkdir /$swapfcfolder
+    fi
+    #montar subvolume na pasta local
+    sudo mount /${swapfcfolder}
+fi
+
+#se tiver partição swap, desligar
+partswap=$(lsblk -lI 8 | grep SWAP | awk '{print $1}')
+if [ -n "$partswap" ]; then
+    swapoff /dev/$partswap
+fi
