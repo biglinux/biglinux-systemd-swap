@@ -4,7 +4,7 @@ Wants=modprobe@zram.service
 After=modprobe@zram.service
 
 [Service]
-Type=notify
+Type=forking
 ExecStart=/usr/bin/pre-systemd-swap
 
 [Install]
