@@ -3,8 +3,9 @@
 swapfcfolder=$(cat /etc/systemd/swap.conf | grep swapfc_path= | awk -F\/ '{print $2}')
 toplevelid=$(btrfs subvolume show /$swapfcfolder | grep -i "top level id" | awk '{print $4}')
 rootpartion=$(df --output=source / | tail -n 1)
+fstype=$(lsblk -fin $rootpartion | awk '{print $2}')
 
-if [ "$toplevelid" != "5" ];then
+if [ "$toplevelid" != "5" -a "$fstype" = "btrfs" ];then
     #montar partição atual em /mnt
     mount $rootpartion /mnt
     #criar subvolume dentro da partição root
