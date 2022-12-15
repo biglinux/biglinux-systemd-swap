@@ -14,6 +14,7 @@ conflicts=('systemd-swap-git' 'systemd-swap' 'auto-zram-and-swappiness')
 backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
+replaces=('auto-zram-and-swappiness')
 install=pkgbuild.install
 
 package() {
