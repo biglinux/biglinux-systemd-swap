@@ -6,9 +6,10 @@
 ## arg 1:  the new package version
 post_install() {
 
-systemctl enable --now pre-systemd-swap.service
-systemctl enable --now systemd-swap.service
-
+if [ ! -d "/run/miso" ];then
+    systemctl enable --now pre-systemd-swap.service
+    systemctl enable --now systemd-swap.service
+fi
 }
 
 ## arg 1:  the new package version
@@ -20,11 +21,11 @@ systemctl enable --now systemd-swap.service
 ## arg 1:  the new package version
 ## arg 2:  the old package version
 post_upgrade() {
-
-post_install
-systemctl restart pre-systemd-swap.service
-systemctl restart systemd-swap.service
-
+if [ ! -d "/run/miso" ];then
+    post_install
+    systemctl restart pre-systemd-swap.service
+    systemctl restart systemd-swap.service
+fi
 }
 
 ## arg 1:  the old package version
