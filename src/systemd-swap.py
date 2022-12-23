@@ -375,18 +375,19 @@ class SwapFc:
         if self.fs_type == "btrfs" and self.swapfc_nocow:
             subprocess.run(["chattr", "+C", path], check=True)
         zeros = b"\x00" * 1024 * 1024
-        with open(path, "wb") as swapfile:
-            for _ in range(round(self.chunk_size / (1024 * 1024))):
-                swapfile.write(zeros)
-                swapfile.flush()
-            remaining_bytes_to_zero_out = self.chunk_size % (1024 * 1024)
-            if remaining_bytes_to_zero_out:
-                warn(
-                    "swapFC: chunk size not set to multiple of 1 MiB, current chunk "
-                    f"size = {self.chunk_size} byte(s)"
-                )
-                swapfile.write(b"\x00" * remaining_bytes_to_zero_out)
-                swapfile.flush()
+        subprocess.run (["fallocate", "-l", str(self.chunk_size), path], check=True)
+        # with open(path, "wb") as swapfile:
+        #     for _ in range(round(self.chunk_size / (1024 * 1024))):
+        #         swapfile.write(zeros)
+        #         swapfile.flush()
+        #     remaining_bytes_to_zero_out = self.chunk_size % (1024 * 1024)
+        #     if remaining_bytes_to_zero_out:
+        #         warn(
+        #             "swapFC: chunk size not set to multiple of 1 MiB, current chunk "
+        #             f"size = {self.chunk_size} byte(s)"
+        #         )
+        #         swapfile.write(b"\x00" * remaining_bytes_to_zero_out)
+        #         swapfile.flush()
         return path if not self.swapfc_force_use_loop else self.losetup_w(path)
 
     def losetup_w(self, path: str) -> str:
