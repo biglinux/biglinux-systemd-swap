@@ -22,4 +22,10 @@ package() {
     make DESTDIR="$pkgdir" install
     cp "${srcdir}/${pkgname}/src/pre-systemd-swap" "${pkgdir}/usr/bin/"
     cp "${srcdir}/${pkgname}/include/pre-systemd-swap.service" "${pkgdir}/usr/lib/systemd/system/"
+    mkdir -p "${pkgdir}/etc/sysctl.d/"
+    echo 'vm.overcommit_memory=1
+vm.overcommit_ratio=300
+vm.swappiness=5
+vm.vfs_cache_pressure=10
+vm.page-cluster=0' > "${pkgdir}/etc/sysctl.d/91-swap.conf"
 }
