@@ -7,8 +7,8 @@
 post_install() {
 
 if [ ! -d "/run/miso" ];then
-    systemctl enable --now pre-systemd-swap.service
-    systemctl enable --now systemd-swap.service
+    systemctl enable pre-systemd-swap.service
+    systemctl enable systemd-swap.service
 fi
 }
 
