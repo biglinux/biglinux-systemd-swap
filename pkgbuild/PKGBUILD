@@ -10,11 +10,11 @@ license=('GPL3')
 depends=('python' 'python-systemd' 'python-sysv_ipc' 'util-linux')
 makedepends=('git')
 provides=('systemd-swap')
-conflicts=('systemd-swap-git' 'systemd-swap' 'auto-zram-and-swappiness')
+conflicts=('systemd-swap-git' 'systemd-swap' 'auto-zram-and-swappiness' 'systemd-oomd-defaults')
 backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
-replaces=('auto-zram-and-swappiness')
+replaces=('auto-zram-and-swappiness' 'auto-zram-and-swappiness')
 install=pkgbuild.install
 
 package() {
