@@ -6,6 +6,12 @@
 ## arg 1:  the new package version
 post_install() {
 
+# Disable hugepage in grub and if need enable in systemd
+if ! grep -q 'transparent_hugepage' /etc/default/grub; then
+    sed -i 's|\bquiet\b|transparent_hugepage=never quiet|g' /etc/default/grub
+    update-grub
+fi
+
 if [ ! -d "/run/miso" ];then
     systemctl enable pre-systemd-swap.service
     systemctl enable systemd-swap.service

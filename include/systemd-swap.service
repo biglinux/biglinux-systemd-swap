@@ -5,6 +5,7 @@ After=pre-systemd-swap.service
 
 [Service]
 Type=notify
+ExecStartPre=-/usr/bin/auto-hugepages
 ExecStart=/usr/bin/systemd-swap start
 # ExecStop=/usr/bin/systemd-swap stop
 ExecStop=/usr/bin/swapoff -a
