@@ -10,7 +10,7 @@ license=('GPL3')
 depends=('python' 'python-systemd' 'python-sysv_ipc' 'util-linux')
 makedepends=('git')
 provides=('systemd-swap')
-conflicts=('systemd-swap-git' 'systemd-swap' 'auto-zram-and-swappiness' 'systemd-oomd-defaults')
+conflicts=('systemd-swap-git' 'systemd-swap' 'auto-zram-and-swappiness' 'systemd-oomd-defaults' 'cfs-zen-tweaks')
 backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
@@ -23,6 +23,8 @@ package() {
     cp "${srcdir}/${pkgname}/src/pre-systemd-swap" "${pkgdir}/usr/bin/"
     cp "${srcdir}/${pkgname}/src/auto-hugepages" "${pkgdir}/usr/bin/"
     cp "${srcdir}/${pkgname}/include/pre-systemd-swap.service" "${pkgdir}/usr/lib/systemd/system/"
+    mkdir -p "${pkgdir}/etc/tmpfiles.d/"
+    cp "${srcdir}/${pkgname}/include/better-lattency.conf" "${pkgdir}/etc/tmpfiles.d/"
     mkdir -p "${pkgdir}/etc/sysctl.d/"
     echo 'vm.overcommit_memory=1
 vm.overcommit_ratio=300
