@@ -641,10 +641,16 @@ def start() -> None:
             f'{config.get("zswap_max_pool_percent")}, Zpool: '
             f'{config.get("zswap_zpool")}'
         )
-        write(config.get("zswap_enabled"), f"{ZSWAP_M_P}/enabled")
-        write(config.get("zswap_compressor"), f"{ZSWAP_M_P}/compressor")
-        write(config.get("zswap_max_pool_percent"), f"{ZSWAP_M_P}/max_pool_percent")
-        write(config.get("zswap_zpool"), f"{ZSWAP_M_P}/zpool")
+        keys = ["zswap_enabled", "zswap_compressor", "zswap_max_pool_percent", "zswap_zpool"]
+        paths = ["enabled", "compressor", "max_pool_percent", "zpool"]
+
+        for key, path in zip(keys, paths):
+            try:
+                write(config.get(key), f"{ZSWAP_M_P}/{path}")
+            except Exception as e:
+                print(f"Fail to write '{key}': {e}")
+
+
         info("Zswap: set new parameters: complete")
 
     def start_zram() -> None:
