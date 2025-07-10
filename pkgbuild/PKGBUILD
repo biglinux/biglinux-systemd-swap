@@ -23,6 +23,4 @@ package() {
     cp "${srcdir}/${pkgname}/src/pre-systemd-swap" "${pkgdir}/usr/bin/"
     cp "${srcdir}/${pkgname}/src/auto-hugepages" "${pkgdir}/usr/bin/"
     cp "${srcdir}/${pkgname}/include/pre-systemd-swap.service" "${pkgdir}/usr/lib/systemd/system/"
-    mkdir -p "${pkgdir}/etc/tmpfiles.d/"
-    cp "${srcdir}/${pkgname}/include/better-lattency.conf" "${pkgdir}/etc/tmpfiles.d/"
 }
