@@ -3,23 +3,45 @@
 pkgname=biglinux-systemd-swap
 pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
-pkgdesc="Script for creating hybrid swap space from zram swaps, swap files and swap partitions - biglinux fork"
-arch=('any')
+pkgdesc="Dynamic swap management for zram, zswap, and swap files - biglinux fork"
+arch=('x86_64' 'aarch64')
 url="https://github.com/biglinux/biglinux-systemd-swap"
 license=('GPL3')
-depends=('python' 'python-systemd' 'python-sysv_ipc' 'util-linux')
-makedepends=('git')
+depends=('systemd-libs' 'util-linux')
+makedepends=('git' 'rust' 'cargo')
 provides=('systemd-swap')
-conflicts=('systemd-swap-git' 'systemd-swap' 'cfs-zen-tweaks')
+conflicts=('systemd-swap-git' 'systemd-swap')
 backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
 replaces=('auto-zram-and-swappiness' 'systemd-oomd-defaults')
 install=pkgbuild.install
 
+build() {
+    cd ${srcdir}/${pkgname}
+    cargo build --release
+}
+
 package() {
     cd ${srcdir}/${pkgname}
-    make DESTDIR="$pkgdir" install
-    cp "${srcdir}/${pkgname}/src/pre-systemd-swap" "${pkgdir}/usr/bin/"
-    cp "${srcdir}/${pkgname}/include/pre-systemd-swap.service" "${pkgdir}/usr/lib/systemd/system/"
+    
+    # Install Rust binary
+    install -Dm755 target/release/systemd-swap "${pkgdir}/usr/bin/systemd-swap"
+    
+    # Install pre-systemd-swap bash script
+    install -Dm755 src/pre-systemd-swap "${pkgdir}/usr/bin/pre-systemd-swap"
+    
+    # Install systemd services
+    install -Dm644 include/systemd-swap.service "${pkgdir}/usr/lib/systemd/system/systemd-swap.service"
+    install -Dm644 include/pre-systemd-swap.service "${pkgdir}/usr/lib/systemd/system/pre-systemd-swap.service"
+    
+    # Install default config
+    install -Dm644 include/swap-default.conf "${pkgdir}/usr/share/systemd-swap/swap-default.conf"
+    
+    # Install user config
+    install -Dm644 include/swap-default.conf "${pkgdir}/etc/systemd/swap.conf"
+    
+    # Install man pages
+    install -Dm644 man/swap.conf.5 "${pkgdir}/usr/share/man/man5/swap.conf.5"
+    install -Dm644 man/systemd-swap.8 "${pkgdir}/usr/share/man/man8/systemd-swap.8"
 }
