@@ -4,28 +4,55 @@ Smart dynamic swap management for Linux, written in Rust.
 
 ## Features
 
-- **Auto-detection**: Automatically chooses best swap strategy for your system
-- **btrfs optimized**: Uses zswap + swap files on btrfs
-- **Universal fallback**: Uses zram on non-btrfs systems
-- **Low memory**: ~250 KB vs ~10 MB Python version
+- **Auto-detection**: Automatically chooses optimal swap strategy for your filesystem
+- **Zswap + SwapFC**: Compressed RAM cache with dynamic btrfs swap files
+- **Zram + SwapFC**: Alternative mode with zram as primary swap
+- **Zram writeback**: Move idle pages from zram to disk (kernel 5.4+)
+- **Btrfs optimized**: Sparse files with optional compression
+- **Lightweight**: ~250 KB binary vs ~10 MB Python version
 
-## How It Works
+## Swap Modes
 
-| Filesystem | Strategy | Description |
-|------------|----------|-------------|
-| **btrfs** | zswap + swapfc | Compressed RAM cache with dynamic swap files |
-| **other** | zram only | Compressed RAM disk |
+| Mode | Description | Best For |
+|------|-------------|----------|
+| `auto` | Auto-detect: btrfs → zswap+swapfc, other → zram | Most users |
+| `zswap+swapfc` | Zswap cache + dynamic swap files | **Desktop (btrfs)** |
+| `zram+swapfc` | Zram primary + swap files overflow | Memory-constrained |
+| `zram` | Zram only (no disk swap) | Non-btrfs systems |
+| `manual` | Use explicit settings | Advanced users |
 
-### Why This Choice?
+### How Each Mode Works
 
-**btrfs systems**: zswap compresses pages in RAM before writing to disk. Combined with dynamic swap files (swapfc), this provides efficient memory management with disk backing when needed.
+**zswap + swapfc (default for btrfs)**:
+- Zswap compresses pages in RAM before writing to swap
+- SwapFC creates swap files dynamically as memory pressure increases
+- Best desktop performance with efficient memory usage
 
-**non-btrfs systems**: zram creates a compressed swap device entirely in RAM. This is ideal when swap files aren't supported or practical.
+**zram + swapfc**:
+- Zram creates compressed block device in RAM (highest priority)
+- SwapFC provides overflow to disk when zram is full
+- Optional: zram writeback moves idle pages to disk
+
+**zram only**:
+- All swap in compressed RAM
+- No disk I/O, ideal for Live USB
 
 ## Installation
 
 ```bash
-# Arch Linux / BigLinux
+# Build (requires Rust 1.70+)
+cargo build --release
+
+# Install
+sudo make install
+
+# Enable
+sudo systemctl enable --now systemd-swap
+```
+
+### Arch Linux / BigLinux
+
+```bash
 cd pkgbuild
 makepkg -si
 ```
@@ -33,14 +60,17 @@ makepkg -si
 ## Usage
 
 ```bash
-# Enable and start
-sudo systemctl enable --now systemd-swap
-
 # Check status
 systemd-swap status
 
-# View compression algorithms
+# View available compression algorithms
 systemd-swap compression
+
+# Restart after config changes
+sudo systemctl restart systemd-swap
+
+# View logs
+journalctl -u systemd-swap -f
 ```
 
 ## Configuration
@@ -48,39 +78,68 @@ systemd-swap compression
 Edit `/etc/systemd/swap.conf`:
 
 ```ini
-# Swap mode (default: auto)
-# auto         - Auto-detect filesystem
-# zswap+swapfc - Force zswap with swap files
-# zram         - Force zram only  
-# manual       - Use explicit settings
+################################################################################
+# Swap Mode
+################################################################################
 swap_mode=auto
 
-# Zswap settings (for btrfs mode)
-zswap_compressor=zstd
-zswap_max_pool_percent=35
-zswap_zpool=zsmalloc
+################################################################################
+# Zswap (used in zswap+swapfc mode)
+################################################################################
+zswap_compressor=zstd            # lzo lz4 zstd lzo-rle lz4hc
+zswap_max_pool_percent=45        # Max % of RAM for pool
+zswap_zpool=zsmalloc             # Memory allocator
+zswap_shrinker_enabled=1         # Move cold pages to disk
+zswap_accept_threshold=80        # Accept threshold after pool full
 
-# Zram settings (for non-btrfs mode)
-zram_size=$RAM_SIZE
-zram_alg=zstd
-zram_prio=32767
+################################################################################
+# Zram (used in zram modes)
+################################################################################
+zram_size=50%                    # 50%, 1G, 512M, 100%
+zram_alg=zstd                    # Compression algorithm
+zram_prio=32767                  # Swap priority
 
-# SwapFC settings (for btrfs mode)
-swapfc_chunk_size=512M
-swapfc_max_count=32
-swapfc_path=/swapfc/swapfile  # Can be on different partition
+# Zram writeback (requires CONFIG_ZRAM_WRITEBACK)
+zram_writeback=0                 # 0=disabled, 1=enabled
+zram_writeback_dev=              # Partition or empty for auto loop
+zram_writeback_size=1G           # Auto backing file size
+
+################################################################################
+# SwapFC - Dynamic swap files (btrfs)
+################################################################################
+swapfc_chunk_size=512M           # Size of each swap file
+swapfc_max_count=32              # Maximum swap files
+swapfc_free_ram_perc=35          # Create when free RAM < this %
+swapfc_free_swap_perc=25         # Create more when free swap < this %
+swapfc_path=/swapfc/swapfile     # Path (must be btrfs)
+
+# Btrfs compression (experimental)
+swapfc_use_btrfs_compression=0   # Uses loop device over sparse file
 ```
 
 ## Custom Swap Location
 
-You can create swap files on a different partition by setting `swapfc_path`:
+You can place swap files on a different btrfs partition:
 
 ```ini
-# Use swap on separate btrfs partition
 swapfc_path=/mnt/swap-drive/swapfile
 ```
 
-The path must be on a btrfs filesystem.
+## Zram Writeback
+
+Move idle/incompressible pages from zram to disk:
+
+```ini
+# Enable with auto loop device
+zram_writeback=1
+zram_writeback_size=2G
+
+# Or use dedicated partition
+zram_writeback=1
+zram_writeback_dev=/dev/sda5
+```
+
+Requires kernel compiled with `CONFIG_ZRAM_WRITEBACK`.
 
 ## File Locations
 
@@ -89,7 +148,15 @@ The path must be on a btrfs filesystem.
 | `/usr/bin/systemd-swap` | Main binary |
 | `/etc/systemd/swap.conf` | User configuration |
 | `/usr/share/systemd-swap/swap-default.conf` | Default configuration |
-| `/run/systemd/swap/` | Runtime data |
+| `/run/systemd-swap/` | Runtime data |
+| `/swapfc/` | Swap files (default) |
+
+## Requirements
+
+- Linux kernel 5.0+
+- Rust 1.70+ (build only)
+- btrfs-progs (for btrfs features)
+- util-linux (zramctl, losetup)
 
 ## License
 
