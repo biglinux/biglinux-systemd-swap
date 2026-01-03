@@ -32,8 +32,6 @@ enum Commands {
     Stop,
     /// Show swap status information
     Status,
-    /// List available compression algorithms
-    Compression,
 }
 
 /// Swap strategy based on filesystem detection
@@ -49,11 +47,17 @@ enum SwapMode {
 fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command.unwrap_or(Commands::Status) {
-        Commands::Start => start(),
-        Commands::Stop => stop(false),
-        Commands::Status => status(),
-        Commands::Compression => compression(),
+    let result = match cli.command {
+        Some(Commands::Start) => start(),
+        Some(Commands::Stop) => stop(false),
+        Some(Commands::Status) => status(),
+        None => {
+            // No subcommand provided, show help
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+            println!();
+            return;
+        }
     };
 
     if let Err(e) = result {
@@ -368,7 +372,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let swap_stats = get_mem_stats(&["MemTotal", "SwapTotal", "SwapFree"])?;
-    let mem_total = swap_stats["MemTotal"];
+    let _mem_total = swap_stats["MemTotal"];
     let swap_total = swap_stats["SwapTotal"];
     let swap_used = swap_total - swap_stats["SwapFree"];
 
@@ -380,59 +384,50 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         println!("  zpool: {}", zswap.zpool);
         println!("  max_pool_percent: {}%", zswap.max_pool_percent);
 
-        if is_root && (zswap.pool_size > 0 || zswap.stored_pages > 0) {
-            let page_size = get_page_size();
-            let stored_bytes = zswap.stored_pages * page_size;
-            let ratio = zswap.compression_ratio(page_size);
-            let pool_util = zswap.pool_utilization_percent(mem_total);
-
-            println!();
-            println!("  === Pool Statistics (debugfs) ===");
-            println!("  pool_size: {} ({:.1} MiB)", zswap.pool_size, zswap.pool_size as f64 / 1024.0 / 1024.0);
-            println!("  stored_pages: {} ({:.1} MiB uncompressed)", zswap.stored_pages, stored_bytes as f64 / 1024.0 / 1024.0);
-            println!("  pool_utilization: {}%", pool_util);
-            println!("  compress_ratio: {:.0}%", ratio * 100.0);
-            println!("  same_filled_pages: {}", zswap.same_filled_pages);
-            println!();
-            println!("  === Writeback Statistics ===");
-            println!("  written_back_pages: {} ({:.1} MiB)", 
-                     zswap.written_back_pages, 
-                     (zswap.written_back_pages * page_size) as f64 / 1024.0 / 1024.0);
-            println!("  pool_limit_hit: {}", zswap.pool_limit_hit);
-            println!("  reject_reclaim_fail: {}", zswap.reject_reclaim_fail);
-
-            // Show effective swap usage
-            if swap_used > 0 {
-                let disk_used = swap_used.saturating_sub(stored_bytes);
-                println!();
-                println!("  === Effective Swap Usage ===");
-                println!("  kernel_reported_used: {:.1} MiB", swap_used as f64 / 1024.0 / 1024.0);
-                println!("  in_zswap_pool (RAM): {:.1} MiB", stored_bytes as f64 / 1024.0 / 1024.0);
-                println!("  actual_disk_used: {:.1} MiB", disk_used as f64 / 1024.0 / 1024.0);
-                let percent_in_ram = if swap_used > 0 {
-                    (stored_bytes as f64 / swap_used as f64) * 100.0
+        // Try to get basic stats from /proc/meminfo (works without root!)
+        if let Ok(usage) = systemd_swap::meminfo::get_effective_swap_usage() {
+            if usage.zswap_active {
+                let zswap_original = swap_used.saturating_sub(usage.swap_used_disk);
+                let zswap_compressed = usage.zswap_pool_bytes;
+                
+                let ratio = if zswap_original > 0 {
+                    (zswap_compressed as f64 / zswap_original as f64) * 100.0
                 } else {
                     0.0
                 };
-                println!("  swap_in_ram: {:.0}%", percent_in_ram);
-            }
-        } else if zswap.pool_size > 0 || zswap.stored_pages > 0 {
-            // Non-root, basic info only
-            let page_size = get_page_size();
-            let stored_bytes = zswap.stored_pages * page_size;
-            let ratio = if zswap.stored_pages > 0 {
-                (zswap.pool_size as f64 / stored_bytes as f64) * 100.0
-            } else {
-                0.0
-            };
 
-            println!("  pool_size: {} bytes", zswap.pool_size);
-            println!("  stored_pages: {}", zswap.stored_pages);
-            println!("  compress_ratio: {:.0}%", ratio);
+                println!();
+                println!("  === Pool Statistics ===");
+                println!("  pool_size: {:.1} MiB (compressed)", zswap_compressed as f64 / 1024.0 / 1024.0);
+                println!("  stored_data: {:.1} MiB (original)", zswap_original as f64 / 1024.0 / 1024.0);
+                println!("  pool_utilization: {}%", usage.zswap_pool_percent);
+                println!("  compress_ratio: {:.0}%", ratio);
 
-            if swap_used > 0 {
-                let percent = (stored_bytes as f64 / swap_used as f64) * 100.0;
-                println!("  zswap_store/swap_store: {}/{} ({:.0}%)", stored_bytes, swap_used, percent);
+                // If running as root, show additional debugfs stats
+                if is_root && (zswap.stored_pages > 0 || zswap.written_back_pages > 0) {
+                    let page_size = get_page_size();
+                    
+                    println!();
+                    println!("  === Writeback Statistics (debugfs) ===");
+                    println!("  stored_pages: {}", zswap.stored_pages);
+                    println!("  same_filled_pages: {}", zswap.same_filled_pages);
+                    println!("  written_back_pages: {} ({:.1} MiB)", 
+                             zswap.written_back_pages, 
+                             (zswap.written_back_pages * page_size) as f64 / 1024.0 / 1024.0);
+                    println!("  pool_limit_hit: {}", zswap.pool_limit_hit);
+                    println!("  reject_reclaim_fail: {}", zswap.reject_reclaim_fail);
+                }
+
+                // Show effective swap usage
+                if swap_used > 0 {
+                    println!();
+                    println!("  === Effective Swap Usage ===");
+                    println!("  kernel_reported_used: {:.1} MiB", swap_used as f64 / 1024.0 / 1024.0);
+                    println!("  in_zswap_pool (RAM): {:.1} MiB", zswap_original as f64 / 1024.0 / 1024.0);
+                    println!("  actual_disk_used: {:.1} MiB", usage.swap_used_disk as f64 / 1024.0 / 1024.0);
+                    let percent_in_ram = (zswap_original as f64 / swap_used as f64) * 100.0;
+                    println!("  swap_in_ram: {:.0}%", percent_in_ram);
+                }
             }
         }
     }
@@ -473,33 +468,3 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Show available compression algorithms
-fn compression() -> Result<(), Box<dyn std::error::Error>> {
-    let crypto = fs::read_to_string("/proc/crypto")?;
-
-    print!("Found loaded compression algorithms: ");
-
-    let mut first = true;
-    let mut current_name = String::new();
-
-    for line in crypto.lines() {
-        let line = line.trim();
-        if let Some(name) = line.strip_prefix("name") {
-            current_name = name.trim_start_matches(':').trim().to_string();
-        } else if let Some(typ) = line.strip_prefix("type") {
-            let current_type = typ.trim_start_matches(':').trim();
-
-            if current_type == "compression" && !current_name.is_empty() {
-                if first {
-                    first = false;
-                } else {
-                    print!(", ");
-                }
-                print!("{}", current_name);
-            }
-        }
-    }
-
-    println!();
-    Ok(())
-}

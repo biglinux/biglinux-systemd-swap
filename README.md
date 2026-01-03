@@ -62,11 +62,11 @@ makepkg -si
 ## Usage
 
 ```bash
-# Check status (run as root for detailed zswap stats)
-sudo systemd-swap status
+# Check status (works without root, extra stats when root)
+systemd-swap status
 
-# View available compression algorithms
-systemd-swap compression
+# Show help
+systemd-swap --help
 
 # Restart after config changes
 sudo systemctl restart systemd-swap
@@ -135,7 +135,7 @@ zram_writeback_size=1G           # Auto backing file size
 ################################################################################
 # SwapFC - Dynamic swap files
 ################################################################################
-swapfc_chunk_size=512M           # Size of each swap file
+swapfc_chunk_size=512M           # Size: 512M, 1G, 10% (of RAM)
 swapfc_max_count=32              # Maximum swap files
 swapfc_free_ram_perc=35          # Create when free RAM < this %
 swapfc_free_swap_perc=25         # Create more when free swap < this %

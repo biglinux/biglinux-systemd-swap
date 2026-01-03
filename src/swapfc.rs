@@ -90,9 +90,22 @@ impl SwapFcConfig {
     }
 }
 
-/// Parse size string like "512M" or "1G" to bytes
+/// Parse size string like "512M", "1G", or "10%" (percentage of RAM) to bytes
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
+    
+    // Check for percentage (e.g., "10%", "50%")
+    if let Some(percent_str) = s.strip_suffix('%') {
+        let percent: u64 = percent_str.parse().map_err(|_| SwapFcError::InvalidPath)?;
+        if percent > 100 {
+            return Err(SwapFcError::InvalidPath);
+        }
+        
+        // Get total RAM and calculate percentage
+        let ram_size = crate::meminfo::get_ram_size().map_err(|_| SwapFcError::InvalidPath)?;
+        return Ok(ram_size * percent / 100);
+    }
+    
     let (num, suffix) = s.split_at(s.len().saturating_sub(1));
     
     let multiplier = match suffix.to_uppercase().as_str() {
@@ -101,7 +114,7 @@ fn parse_size(s: &str) -> Result<u64> {
         "G" => 1024 * 1024 * 1024,
         "T" => 1024 * 1024 * 1024 * 1024,
         _ => {
-            // No suffix, try parsing whole string
+            // No suffix, try parsing whole string as bytes
             return s.parse().map_err(|_| SwapFcError::InvalidPath);
         }
     };

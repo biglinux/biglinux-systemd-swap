@@ -175,7 +175,21 @@ pub struct EffectiveSwapUsage {
 /// When zswap is active, the kernel reports swap usage based on allocated slots,
 /// but most of those pages may still be in zswap's RAM pool and not written to disk.
 /// This function calculates the actual disk pressure.
+/// 
+/// Uses /proc/meminfo (Zswap, Zswapped) for basic stats - works without root!
+/// Optionally uses debugfs for additional statistics when running as root.
 pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
+    // Try to get zswap stats from /proc/meminfo (available without root!)
+    // These fields were added in kernel 5.x
+    let zswap_fields = get_mem_stats_optional(&["Zswap", "Zswapped"]);
+    let (zswap_compressed, zswap_original) = match zswap_fields {
+        Ok(fields) => (
+            fields.get("Zswap").copied().unwrap_or(0),
+            fields.get("Zswapped").copied().unwrap_or(0),
+        ),
+        Err(_) => (0, 0),
+    };
+
     let stats = get_mem_stats(&["MemTotal", "SwapTotal", "SwapFree"])?;
     let swap_total = stats["SwapTotal"];
     let swap_free = stats["SwapFree"];
@@ -186,43 +200,70 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
         swap_total,
         swap_free,
         swap_used_kernel,
-        zswap_pool_bytes: 0,
-        swap_used_disk: swap_used_kernel, // Default: assume all on disk
+        zswap_pool_bytes: zswap_compressed,
+        swap_used_disk: swap_used_kernel.saturating_sub(zswap_original),
         zswap_pool_percent: 0,
-        zswap_active: false,
+        zswap_active: zswap_original > 0 || zswap_compressed > 0,
     };
 
-    // Check zswap status
-    if let Some(zswap_stats) = get_zswap_stats() {
-        let page_size = get_page_size();
-        let stored_bytes = zswap_stats.stored_pages * page_size;
+    // Calculate pool utilization if zswap is active
+    if result.zswap_active {
+        let max_pool_percent: u64 = std::fs::read_to_string(
+            "/sys/module/zswap/parameters/max_pool_percent"
+        )
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(20);
 
-        if stored_bytes > 0 {
-            result.zswap_active = true;
-            result.zswap_pool_bytes = zswap_stats.pool_total_size;
-
-            // Actual disk usage = kernel reported usage - pages in zswap pool
-            // Pages in zswap pool are still in RAM, not written to disk
-            result.swap_used_disk = swap_used_kernel.saturating_sub(stored_bytes);
-
-            // Calculate zswap pool utilization
-            // Read max_pool_percent from sysfs
-            let max_pool_percent: u64 = std::fs::read_to_string(
-                "/sys/module/zswap/parameters/max_pool_percent"
-            )
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(20);
-
-            let max_pool_size = mem_total * max_pool_percent / 100;
-            if max_pool_size > 0 {
-                result.zswap_pool_percent = 
-                    ((zswap_stats.pool_total_size * 100) / max_pool_size).min(100) as u8;
-            }
+        let max_pool_size = mem_total * max_pool_percent / 100;
+        if max_pool_size > 0 {
+            result.zswap_pool_percent = 
+                ((zswap_compressed * 100) / max_pool_size).min(100) as u8;
         }
     }
 
     Ok(result)
+}
+
+/// Read memory stats from /proc/meminfo, ignoring missing fields
+fn get_mem_stats_optional(fields: &[&str]) -> Result<HashMap<String, u64>> {
+    let mut stats = HashMap::new();
+    let mut remaining: HashSet<&str> = fields.iter().copied().collect();
+
+    let file = File::open("/proc/meminfo")?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+
+        if let Some(colon_pos) = line.find(':') {
+            let key = &line[..colon_pos];
+
+            if remaining.contains(key) {
+                let value_part = line[colon_pos + 1..].trim();
+                let parts: Vec<&str> = value_part.split_whitespace().collect();
+
+                let value = if parts.len() >= 2 && parts[1] == "kB" {
+                    parts[0].parse::<u64>().ok().map(|v| v * 1024)
+                } else if !parts.is_empty() {
+                    parts[0].parse::<u64>().ok()
+                } else {
+                    None
+                };
+
+                if let Some(v) = value {
+                    stats.insert(key.to_string(), v);
+                    remaining.remove(key);
+
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 /// Get effective free swap percentage accounting for zswap
