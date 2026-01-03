@@ -8,7 +8,8 @@ Smart dynamic swap management for Linux, written in Rust.
 - **Zswap + SwapFC**: Compressed RAM cache with dynamic btrfs swap files
 - **Zram + SwapFC**: Alternative mode with zram as primary swap
 - **Zram writeback**: Move idle pages from zram to disk (kernel 5.4+)
-- **Btrfs optimized**: Sparse files with optional compression
+- **Sparse files (thin provisioning)**: Swap files don't pre-allocate disk space
+- **Btrfs optimized**: Optional compression mode for swap data
 - **Lightweight**: ~250 KB binary vs ~10 MB Python version
 
 ## Swap Modes
@@ -25,8 +26,9 @@ Smart dynamic swap management for Linux, written in Rust.
 
 **zswap + swapfc (default for btrfs)**:
 - Zswap compresses pages in RAM before writing to swap
-- SwapFC creates swap files dynamically as memory pressure increases
-- Best desktop performance with efficient memory usage
+- SwapFC creates swap files as sparse files (thin provisioning)
+- Disk space is only used when zswap pool is full
+- Best desktop performance with efficient disk usage
 
 **zram + swapfc**:
 - Zram creates compressed block device in RAM (highest priority)
@@ -60,8 +62,8 @@ makepkg -si
 ## Usage
 
 ```bash
-# Check status
-systemd-swap status
+# Check status (run as root for detailed zswap stats)
+sudo systemd-swap status
 
 # View available compression algorithms
 systemd-swap compression
@@ -71,6 +73,32 @@ sudo systemctl restart systemd-swap
 
 # View logs
 journalctl -u systemd-swap -f
+```
+
+### Status Output (as root)
+
+```
+Zswap:
+  enabled: true
+  compressor: zstd
+  zpool: zsmalloc
+  max_pool_percent: 45%
+
+  === Pool Statistics (debugfs) ===
+  pool_size: 234567890 (223.7 MiB)
+  stored_pages: 58432 (228.2 MiB uncompressed)
+  pool_utilization: 48%
+  compress_ratio: 98%
+  
+  === Writeback Statistics ===
+  written_back_pages: 1234 (4.8 MiB)
+  pool_limit_hit: 0
+
+  === Effective Swap Usage ===
+  kernel_reported_used: 300.0 MiB
+  in_zswap_pool (RAM): 228.2 MiB
+  actual_disk_used: 71.8 MiB
+  swap_in_ram: 76%
 ```
 
 ## Configuration
@@ -105,16 +133,21 @@ zram_writeback_dev=              # Partition or empty for auto loop
 zram_writeback_size=1G           # Auto backing file size
 
 ################################################################################
-# SwapFC - Dynamic swap files (btrfs)
+# SwapFC - Dynamic swap files
 ################################################################################
 swapfc_chunk_size=512M           # Size of each swap file
 swapfc_max_count=32              # Maximum swap files
 swapfc_free_ram_perc=35          # Create when free RAM < this %
 swapfc_free_swap_perc=25         # Create more when free swap < this %
-swapfc_path=/swapfc/swapfile     # Path (must be btrfs)
+swapfc_path=/swapfc/swapfile     # Path for swap files
 
-# Btrfs compression (experimental)
-swapfc_use_btrfs_compression=0   # Uses loop device over sparse file
+# Sparse files (thin provisioning) - ENABLED BY DEFAULT
+# Swap files appear full size but only allocate disk space when written.
+# Ideal with zswap: pages stay in RAM, disk is only used on writeback.
+# swapfc_use_sparse_disable=1    # Uncomment to pre-allocate disk space
+
+# Btrfs compression mode (experimental)
+swapfc_use_btrfs_compression=0   # Double compression: zswap + btrfs
 ```
 
 ## Custom Swap Location
@@ -141,6 +174,21 @@ zram_writeback_dev=/dev/sda5
 
 Requires kernel compiled with `CONFIG_ZRAM_WRITEBACK`.
 
+## Sparse Files (Thin Provisioning)
+
+By default, swap files are created as sparse files:
+
+- Files appear as 512M but start with 0 bytes on disk
+- Disk blocks are allocated only when data is actually written
+- With zswap, most pages stay compressed in RAM
+- Disk is only used when zswap pool is full (writeback)
+
+To disable and pre-allocate all disk space:
+
+```ini
+swapfc_use_sparse_disable=1
+```
+
 ## File Locations
 
 | Path | Description |
@@ -161,3 +209,4 @@ Requires kernel compiled with `CONFIG_ZRAM_WRITEBACK`.
 ## License
 
 GPL-3.0-or-later
+
