@@ -180,15 +180,32 @@ pub fn get_status() -> Option<ZswapStatus> {
     if let Ok(v) = read_file(params_dir.join("zpool")) {
         status.zpool = v.trim().to_string();
     }
+    if let Ok(v) = read_file(params_dir.join("max_pool_percent")) {
+        status.max_pool_percent = v.trim().parse().unwrap_or(20);
+    }
+    if let Ok(v) = read_file(params_dir.join("shrinker_enabled")) {
+        status.shrinker_enabled = v.trim() == "Y" || v.trim() == "1";
+    }
+    if let Ok(v) = read_file(params_dir.join("accept_threshold_percent")) {
+        status.accept_threshold_percent = v.trim().parse().unwrap_or(90);
+    }
 
-    // Read debug stats (may require root)
+    // Read debug stats (requires root)
     if debug_dir.is_dir() {
-        if let Ok(v) = read_file(debug_dir.join("pool_total_size")) {
-            status.pool_size = v.trim().parse().unwrap_or(0);
-        }
-        if let Ok(v) = read_file(debug_dir.join("stored_pages")) {
-            status.stored_pages = v.trim().parse().unwrap_or(0);
-        }
+        let read_stat = |name: &str| -> u64 {
+            read_file(debug_dir.join(name))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        };
+
+        status.pool_size = read_stat("pool_total_size");
+        status.stored_pages = read_stat("stored_pages");
+        status.written_back_pages = read_stat("written_back_pages");
+        status.reject_reclaim_fail = read_stat("reject_reclaim_fail");
+        status.same_filled_pages = read_stat("same_filled_pages");
+        status.pool_limit_hit = read_stat("pool_limit_hit");
+        status.duplicate_entry = read_stat("duplicate_entry");
     }
 
     Some(status)
@@ -197,9 +214,51 @@ pub fn get_status() -> Option<ZswapStatus> {
 /// Zswap status information
 #[derive(Debug, Default)]
 pub struct ZswapStatus {
+    // Configuration parameters
     pub enabled: bool,
     pub compressor: String,
     pub zpool: String,
+    pub max_pool_percent: u8,
+    pub shrinker_enabled: bool,
+    pub accept_threshold_percent: u8,
+
+    // Runtime statistics (from debugfs, requires root)
+    /// Total bytes used by zswap pool in RAM
     pub pool_size: u64,
+    /// Pages currently stored in zswap pool
     pub stored_pages: u64,
+    /// Pages written back to backing swap device
+    pub written_back_pages: u64,
+    /// Pages rejected due to reclaim failure
+    pub reject_reclaim_fail: u64,
+    /// Same-value filled pages (zeros, etc)
+    pub same_filled_pages: u64,
+    /// Number of times pool limit was hit
+    pub pool_limit_hit: u64,
+    /// Duplicate entries found
+    pub duplicate_entry: u64,
 }
+
+impl ZswapStatus {
+    /// Calculate pool utilization percentage
+    pub fn pool_utilization_percent(&self, mem_total: u64) -> u8 {
+        if mem_total == 0 || self.max_pool_percent == 0 {
+            return 0;
+        }
+        let max_pool_size = mem_total * self.max_pool_percent as u64 / 100;
+        if max_pool_size == 0 {
+            return 0;
+        }
+        ((self.pool_size * 100) / max_pool_size).min(100) as u8
+    }
+
+    /// Calculate compression ratio (compressed/uncompressed)
+    pub fn compression_ratio(&self, page_size: u64) -> f64 {
+        let uncompressed = self.stored_pages * page_size;
+        if uncompressed == 0 {
+            return 0.0;
+        }
+        self.pool_size as f64 / uncompressed as f64
+    }
+}
+

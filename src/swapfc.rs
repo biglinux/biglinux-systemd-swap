@@ -49,6 +49,8 @@ pub struct SwapFcConfig {
     pub force_use_loop: bool,
     pub directio: bool,
     pub use_btrfs_compression: bool,
+    /// Use sparse files (thin provisioning) - only allocate disk space when needed
+    pub use_sparse: bool,
 }
 
 impl SwapFcConfig {
@@ -80,6 +82,10 @@ impl SwapFcConfig {
             force_use_loop: config.get_bool("swapfc_force_use_loop"),
             directio: config.get_bool("swapfc_directio"),
             use_btrfs_compression: config.get_bool("swapfc_use_btrfs_compression"),
+            // Sparse files (thin provisioning) - enabled by default for all
+            // Disk space is only allocated when data is actually written (zswap writeback)
+            // Disable with swapfc_use_sparse_disable=1 to pre-allocate disk space
+            use_sparse: !config.get_bool("swapfc_use_sparse_disable"),
         })
     }
 }
@@ -200,12 +206,15 @@ impl SwapFc {
 
             let free_swap = get_free_swap_percent().unwrap_or(100);
 
+            // Allocate more swap chunks when free swap is low
+            // With sparse files, this is fine - disk space is only used when zswap writes back
             if free_swap < self.config.free_swap_perc && self.allocated < self.config.max_count {
                 info!("swapFC: swap {}% < {}% - allocating chunk #{}", free_swap, self.config.free_swap_perc, self.allocated + 1);
                 let _ = self.create_swapfile();
                 continue;
             }
 
+            // Free swap chunks when swap usage is low
             if self.allocated > self.config.min_count.max(2) && free_swap > self.config.remove_free_swap_perc {
                 info!("swapFC: swap {}% > {}% - freeing chunk #{}", free_swap, self.config.remove_free_swap_perc, self.allocated);
                 let _ = self.destroy_swapfile();
@@ -267,24 +276,38 @@ impl SwapFc {
                 .open(&swapfile_path)?;
         }
 
-        // Determine if we're using btrfs compression mode
+        // Determine allocation mode:
+        // - Sparse: use truncate, only allocate disk space when data is written
+        // - Preallocated: use fallocate, reserve all disk space upfront
         let use_compression = self.config.use_btrfs_compression;
-        let use_loop = self.config.force_use_loop || use_compression;
+        let use_sparse = self.config.use_sparse || use_compression;
+        
+        // Sparse files require loop device for safe swap operation
+        // Direct swap on sparse files can cause issues when kernel tries to write
+        let use_loop = self.config.force_use_loop || use_sparse;
 
-        if use_compression {
-            // For btrfs compression: use sparse file with truncate
-            // This allows btrfs to compress the data and only allocate used blocks
-            info!("swapFC: creating sparse file for btrfs compression");
+        if use_sparse {
+            // Create sparse file (thin provisioning)
+            // Disk space is only allocated when zswap/kernel actually writes data
+            info!("swapFC: creating sparse file (thin provisioning)");
             Command::new("truncate")
                 .args(["--size", &self.config.chunk_size.to_string()])
                 .arg(&swapfile_path)
                 .status()?;
-            // Do NOT use chattr +C - we want compression!
+            
+            if !use_compression {
+                // Disable COW for btrfs when not using compression
+                // This improves performance for swap workloads
+                let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
+            }
+            // When using compression, do NOT set +C - we want compression!
         } else {
-            // Disable COW for btrfs (normal mode)
+            // Preallocated mode: reserve all disk space upfront
+            // Disable COW for btrfs
             let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
 
             // Allocate space with fallocate
+            info!("swapFC: creating preallocated file");
             Command::new("fallocate")
                 .args(["-l", &self.config.chunk_size.to_string()])
                 .arg(&swapfile_path)
@@ -293,7 +316,8 @@ impl SwapFc {
 
         let (swapfile, loop_device) = if use_loop {
             // Create loop device
-            let directio = if self.config.directio && !use_compression { "on" } else { "off" };
+            // For sparse files, disable direct-io to allow proper thin provisioning
+            let directio = if self.config.directio && !use_sparse { "on" } else { "off" };
             let loop_dev = run_cmd_output(&[
                 "losetup", "-f", "--show",
                 &format!("--direct-io={}", directio),

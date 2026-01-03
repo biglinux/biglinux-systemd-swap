@@ -362,12 +362,15 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Show swap status
 fn status() -> Result<(), Box<dyn std::error::Error>> {
-    if am_i_root().is_err() {
+    let is_root = am_i_root().is_ok();
+    if !is_root {
         warn!("Not root! Some output might be missing.");
     }
 
-    let swap_stats = get_mem_stats(&["SwapTotal", "SwapFree"])?;
-    let swap_used = swap_stats["SwapTotal"] - swap_stats["SwapFree"];
+    let swap_stats = get_mem_stats(&["MemTotal", "SwapTotal", "SwapFree"])?;
+    let mem_total = swap_stats["MemTotal"];
+    let swap_total = swap_stats["SwapTotal"];
+    let swap_used = swap_total - swap_stats["SwapFree"];
 
     // Zswap status
     if let Some(zswap) = systemd_swap::zswap::get_status() {
@@ -375,8 +378,46 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         println!("  enabled: {}", zswap.enabled);
         println!("  compressor: {}", zswap.compressor);
         println!("  zpool: {}", zswap.zpool);
+        println!("  max_pool_percent: {}%", zswap.max_pool_percent);
 
-        if zswap.pool_size > 0 || zswap.stored_pages > 0 {
+        if is_root && (zswap.pool_size > 0 || zswap.stored_pages > 0) {
+            let page_size = get_page_size();
+            let stored_bytes = zswap.stored_pages * page_size;
+            let ratio = zswap.compression_ratio(page_size);
+            let pool_util = zswap.pool_utilization_percent(mem_total);
+
+            println!();
+            println!("  === Pool Statistics (debugfs) ===");
+            println!("  pool_size: {} ({:.1} MiB)", zswap.pool_size, zswap.pool_size as f64 / 1024.0 / 1024.0);
+            println!("  stored_pages: {} ({:.1} MiB uncompressed)", zswap.stored_pages, stored_bytes as f64 / 1024.0 / 1024.0);
+            println!("  pool_utilization: {}%", pool_util);
+            println!("  compress_ratio: {:.0}%", ratio * 100.0);
+            println!("  same_filled_pages: {}", zswap.same_filled_pages);
+            println!();
+            println!("  === Writeback Statistics ===");
+            println!("  written_back_pages: {} ({:.1} MiB)", 
+                     zswap.written_back_pages, 
+                     (zswap.written_back_pages * page_size) as f64 / 1024.0 / 1024.0);
+            println!("  pool_limit_hit: {}", zswap.pool_limit_hit);
+            println!("  reject_reclaim_fail: {}", zswap.reject_reclaim_fail);
+
+            // Show effective swap usage
+            if swap_used > 0 {
+                let disk_used = swap_used.saturating_sub(stored_bytes);
+                println!();
+                println!("  === Effective Swap Usage ===");
+                println!("  kernel_reported_used: {:.1} MiB", swap_used as f64 / 1024.0 / 1024.0);
+                println!("  in_zswap_pool (RAM): {:.1} MiB", stored_bytes as f64 / 1024.0 / 1024.0);
+                println!("  actual_disk_used: {:.1} MiB", disk_used as f64 / 1024.0 / 1024.0);
+                let percent_in_ram = if swap_used > 0 {
+                    (stored_bytes as f64 / swap_used as f64) * 100.0
+                } else {
+                    0.0
+                };
+                println!("  swap_in_ram: {:.0}%", percent_in_ram);
+            }
+        } else if zswap.pool_size > 0 || zswap.stored_pages > 0 {
+            // Non-root, basic info only
             let page_size = get_page_size();
             let stored_bytes = zswap.stored_pages * page_size;
             let ratio = if zswap.stored_pages > 0 {
