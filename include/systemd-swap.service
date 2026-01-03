@@ -5,7 +5,6 @@ After=pre-systemd-swap.service
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/bin/auto-hugepages
 ExecStart=/usr/bin/systemd-swap start
 # ExecStop=/usr/bin/systemd-swap stop
 ExecStop=/usr/bin/swapoff -a
