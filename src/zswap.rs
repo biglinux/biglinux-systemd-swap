@@ -96,7 +96,8 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     info!("Zswap: backup current configuration: complete");
 
     // Get config values
-    let enabled = config.get("zswap_enabled").unwrap_or("0");
+    // Default to "1" because if start() is called, zswap should be enabled
+    let enabled = config.get("zswap_enabled").unwrap_or("1");
     let compressor = config.get("zswap_compressor").unwrap_or("lzo");
     let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("20");
     let zpool = config.get("zswap_zpool").unwrap_or("zbud");
