@@ -20,24 +20,98 @@ import sys
 import threading
 import time
 import types
-from typing import List, Dict, Type, Optional, Tuple, NoReturn
+from typing import NoReturn
 
 import systemd.daemon
 import sysv_ipc
 
+# =============================================================================
+# Subprocess Helpers - Reduce code duplication for command execution
+# =============================================================================
 
-def get_mem_stats(fields: List[str]) -> Dict[str, int]:
+
+def run_cmd(
+    cmd: list[str],
+    check: bool = False,
+    capture: bool = False,
+    quiet: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a command with common options.
+
+    Args:
+        cmd: Command and arguments as a list.
+        check: If True, raise on non-zero exit.
+        capture: If True, capture stdout.
+        quiet: If True, suppress stdout/stderr.
+
+    Returns:
+        CompletedProcess instance.
+    """
+    kwargs = {"check": check, "text": True}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    return subprocess.run(cmd, **kwargs)
+
+
+def run_cmd_output(cmd: list[str], check: bool = True) -> str:
+    """Run a command and return stripped stdout.
+
+    Args:
+        cmd: Command and arguments as a list.
+        check: If True, raise on non-zero exit.
+
+    Returns:
+        Stripped stdout string.
+    """
+    result = subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE)
+    return result.stdout.rstrip()
+
+
+def systemctl(action: str, unit: str, check: bool = True) -> int:
+    """Execute a systemctl action on a unit.
+
+    Args:
+        action: systemctl action (start, stop, daemon-reload, etc.)
+        unit: Unit name (ignored for daemon-reload).
+        check: If True, raise on failure.
+
+    Returns:
+        Return code of the command.
+    """
+    if action == "daemon-reload":
+        return run_cmd(["systemctl", "daemon-reload"], check=check).returncode
+    return run_cmd(["systemctl", action, unit], check=check).returncode
+
+
+def get_mem_stats(fields: list[str]) -> dict[str, int]:
+    """Read memory stats from /proc/meminfo efficiently.
+
+    Reads only until all requested fields are found, then stops.
+    Uses a set for O(1) lookup instead of list removal.
+    """
     stats = {}
+    fields_set = set(fields)
     with open("/proc/meminfo") as meminfo:
         for line in meminfo:
-            items = line.split()
-            key = items[0][:-1]
-            if items[2] == "kB" and key in fields:
-                fields.remove(key)
-                stats[key] = int(items[1]) * 1024
-            if not fields:
-                break
-    assert len(fields) == 0
+            # Fast parsing: split only first two parts initially
+            colon_pos = line.find(":")
+            if colon_pos == -1:
+                continue
+            key = line[:colon_pos]
+            if key in fields_set:
+                # Parse value - format is "key:   value kB"
+                parts = line[colon_pos + 1 :].split()
+                if len(parts) >= 2 and parts[1] == "kB":
+                    stats[key] = int(parts[0]) * 1024
+                elif parts:
+                    stats[key] = int(parts[0])
+                fields_set.discard(key)
+                if not fields_set:
+                    break
+    assert len(fields_set) == 0, f"Missing fields: {fields_set}"
     return stats
 
 
@@ -59,9 +133,12 @@ WORK_DIR = "/run/systemd/swap"
 LOCK_STARTED = f"{WORK_DIR}/.started"
 ZSWAP_M = "/sys/module/zswap"
 ZSWAP_M_P = "/sys/module/zswap/parameters"
-KMAJOR, KMINOR = [int(v) for v in os.uname().release.split(".")[0:2]]
+# Kernel version check removed - BigLinux only supports kernel 5+
 IS_DEBUG = False
 sigterm_event = threading.Event()
+
+# Status messages for systemd notifications
+STATUS_MONITORING = "STATUS=Monitoring memory status..."
 
 # Should not be a global variable, rework necessary
 zswap_parameters = {}
@@ -102,13 +179,14 @@ class Config:
             info(f"Load: {config_file}")
             self.config.update(Config.parse_config(config_file))
 
-    def get(self, key: str, as_type: Type = str) -> as_type:
+    def get(self, key: str, as_type: type = str):
+        """Get configuration value, optionally converting to specified type."""
         if as_type is bool:
             return self.config[key].lower() in ["yes", "y", "1", "true"]
         return as_type(self.config[key])
 
     @staticmethod
-    def parse_config(file: str) -> Dict[str, str]:
+    def parse_config(file: str) -> dict[str, str]:
         config = {}
         lines = None
         with open(file) as f:
@@ -131,10 +209,10 @@ class Config:
 class DestroyInfo:
     pickle_path = f"{WORK_DIR}/destroy_info.pickle"
 
-    def __init__(self, zswap_parameters: Dict[str, str]):
+    def __init__(self, zswap_parameters: dict[str, str]):
         self.zswap_parameters = zswap_parameters
 
-    def get_zswap_parameters(self) -> Dict[str, str]:
+    def get_zswap_parameters(self) -> dict[str, str]:
         return self.zswap_parameters
 
     def save(self) -> None:
@@ -142,11 +220,17 @@ class DestroyInfo:
             pickle.dump(self, f)
 
     @classmethod
-    def load(cls) -> Optional[cls]:
+    def load(cls) -> DestroyInfo | None:
+        """Load DestroyInfo from pickle file.
+
+        Returns:
+            DestroyInfo instance or None if loading fails.
+        """
         try:
             with open(cls.pickle_path, "rb") as f:
                 return pickle.load(f)
-        except:
+        except (OSError, pickle.PickleError, EOFError) as e:
+            debug(f"Failed to load destroy info: {e}")
             return None
 
 
@@ -162,7 +246,7 @@ class SwapFc:
             )
             self.swapfc_frequency = 1
         self.polling_rate = self.swapfc_frequency
-        systemd.daemon.notify("STATUS=Monitoring memory status...")
+        systemd.daemon.notify(STATUS_MONITORING)
         # Create parent directories for swapfc_path.
         makedirs(os.path.dirname(self.swapfc_path))
         self.fs_type, subvolume = self.get_fs_type()
@@ -195,20 +279,15 @@ class SwapFc:
         )
         self.block_size = os.statvfs(self.swapfc_path).f_bsize
         if self.fs_type == "btrfs":
-            # If btrfs supports regular swap files (kernel version 5+), force disable
-            # COW to avoid data corruption. If it doesn't, use the old swap-through-loop
-            # workaround.
-            if KMAJOR >= 5:
-                self.swapfc_nocow = True
-            else:
-                self.swapfc_force_use_loop = True
+            # Btrfs supports regular swap files on kernel 5+, force disable COW
+            self.swapfc_nocow = True
         if not 1 <= self.swapfc_max_count <= 32:
             warn("swapfc_max_count must be in range 1..32, reset to 1")
             self.swapfc_max_count = 1
         makedirs(f"{WORK_DIR}/swapfc")
         self.allocated = 0
-        for _ in range(self.swapfc_min_count):
-            self.create_swapfile()
+        # Note: Swap files are now created on-demand only, not pre-allocated at startup.
+        # This prevents unnecessary swap file creation when the system has sufficient RAM.
 
     def run(self) -> None:
         systemd.daemon.notify("READY=1")
@@ -222,7 +301,9 @@ class SwapFc:
         signal.signal(signal.SIGTERM, sigterm_handler)
         while True:
             self.sem.release()
-            sigterm_event.wait(self.polling_rate)
+            # Use adaptive polling interval based on current RAM pressure
+            poll_interval = self._get_adaptive_poll_interval()
+            sigterm_event.wait(poll_interval)
             if sigterm_event.is_set():
                 break
             try:
@@ -261,7 +342,37 @@ class SwapFc:
                 )
                 self.destroy_swapfile()
 
-    def get_fs_type(self) -> Tuple[str, bool]:
+    def _get_adaptive_poll_interval(self) -> int:
+        """Calculate adaptive polling interval based on RAM pressure.
+
+        When RAM is abundant, poll less frequently to save CPU.
+        When RAM is low, poll more frequently for quick response.
+
+        Returns:
+            Polling interval in seconds.
+        """
+        if self.allocated > 0:
+            # Swap is already allocated, check swap levels at base frequency
+            return self.swapfc_frequency
+
+        # Check RAM to determine pressure level
+        free_ram_perc = self.get_free_ram_perc()
+
+        # Tiered polling:
+        # - Very low pressure (>70% free): poll every 10 seconds
+        # - Low pressure (>50% free): poll every 5 seconds
+        # - Medium pressure (>threshold): poll every 2 seconds
+        # - High pressure: poll at base frequency
+        if free_ram_perc > 70:
+            return min(10, self.swapfc_frequency * 10)
+        elif free_ram_perc > 50:
+            return min(5, self.swapfc_frequency * 5)
+        elif free_ram_perc > self.swapfc_free_ram_perc:
+            return min(2, self.swapfc_frequency * 2)
+        else:
+            return self.swapfc_frequency
+
+    def get_fs_type(self) -> tuple[str, bool]:
         subvolume = False
         path = None
         if os.path.isdir(self.swapfc_path):
@@ -292,7 +403,9 @@ class SwapFc:
         return fs_type, subvolume
 
     def assign_config(self, config: Config) -> None:
-        yn = lambda x: config.get(x, bool)
+        def yn(x):
+            return config.get(x, bool)
+
         self.swapfc_chunk_size = config.get("swapfc_chunk_size")
         self.swapfc_directio = yn("swapfc_directio")
         self.swapfc_force_preallocated = yn("swapfc_force_preallocated")
@@ -345,7 +458,7 @@ class SwapFc:
         mode = os.stat(swapfile).st_mode
         if stat.S_ISBLK(mode):
             subprocess.run(["losetup", "-d", swapfile])
-        systemd.daemon.notify("STATUS=Monitoring memory status...")
+        systemd.daemon.notify(STATUS_MONITORING)
 
     def has_enough_space(self, path: str) -> bool:
         # Check free space to avoid problems on swap IO + ENOSPC.
@@ -374,20 +487,7 @@ class SwapFc:
         os.mknod(path)
         if self.fs_type == "btrfs" and self.swapfc_nocow:
             subprocess.run(["chattr", "+C", path], check=True)
-        zeros = b"\x00" * 1024 * 1024
-        subprocess.run (["fallocate", "-l", str(self.chunk_size), path], check=True)
-        # with open(path, "wb") as swapfile:
-        #     for _ in range(round(self.chunk_size / (1024 * 1024))):
-        #         swapfile.write(zeros)
-        #         swapfile.flush()
-        #     remaining_bytes_to_zero_out = self.chunk_size % (1024 * 1024)
-        #     if remaining_bytes_to_zero_out:
-        #         warn(
-        #             "swapFC: chunk size not set to multiple of 1 MiB, current chunk "
-        #             f"size = {self.chunk_size} byte(s)"
-        #         )
-        #         swapfile.write(b"\x00" * remaining_bytes_to_zero_out)
-        #         swapfile.flush()
+        subprocess.run(["fallocate", "-l", str(self.chunk_size), path], check=True)
         return path if not self.swapfc_force_use_loop else self.losetup_w(path)
 
     def losetup_w(self, path: str) -> str:
@@ -420,7 +520,7 @@ class SwapFc:
                     force_remove(dev)
                 break
         self.allocated -= 1
-        systemd.daemon.notify("STATUS=Monitoring memory status...")
+        systemd.daemon.notify(STATUS_MONITORING)
 
     @staticmethod
     def get_free_ram_perc() -> int:
@@ -487,7 +587,7 @@ def am_i_root(exit_on_error: bool = True) -> bool:
         return False
 
 
-def find_swap_units() -> List[str]:
+def find_swap_units() -> list[str]:
     swap_units = []
     for path in ["/run/systemd/system", "/run/systemd/generator"]:
         for file_path in glob.glob(f"{path}/**/*.swap", recursive=True):
@@ -504,7 +604,7 @@ def get_what_from_swap_unit(file: str) -> str:
 
 
 def gen_swap_unit(
-    what: str, tag: str, priority: Optional[int] = None, options: Optional[str] = None
+    what: str, tag: str, priority: int | None = None, options: str | None = None
 ) -> str:
     what = os.path.realpath(what)
     # Assume it's a file by default.
@@ -562,7 +662,7 @@ def makedirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def sigterm_handler(signum: int, frame: Optional[types.FrameType]) -> None:
+def sigterm_handler(signum: int, frame: types.FrameType | None) -> None:
     sigterm_event.set()
 
 
@@ -636,12 +736,17 @@ def start() -> None:
         info("Zswap: backup current configuration: complete")
         info("Zswap: set new parameters: start")
         info(
-            f'Zswap: Enable: {config.get("zswap_enabled")}, Comp: '
-            f'{config.get("zswap_compressor")}, Max pool %: '
-            f'{config.get("zswap_max_pool_percent")}, Zpool: '
-            f'{config.get("zswap_zpool")}'
+            f"Zswap: Enable: {config.get('zswap_enabled')}, Comp: "
+            f"{config.get('zswap_compressor')}, Max pool %: "
+            f"{config.get('zswap_max_pool_percent')}, Zpool: "
+            f"{config.get('zswap_zpool')}"
         )
-        keys = ["zswap_enabled", "zswap_compressor", "zswap_max_pool_percent", "zswap_zpool"]
+        keys = [
+            "zswap_enabled",
+            "zswap_compressor",
+            "zswap_max_pool_percent",
+            "zswap_zpool",
+        ]
         paths = ["enabled", "compressor", "max_pool_percent", "zpool"]
 
         for key, path in zip(keys, paths):
@@ -649,7 +754,6 @@ def start() -> None:
                 write(config.get(key), f"{ZSWAP_M_P}/{path}")
             except Exception as e:
                 print(f"Fail to write '{key}': {e}")
-
 
         info("Zswap: set new parameters: complete")
 
@@ -732,15 +836,8 @@ def start() -> None:
             else:
                 warn("Zram: can't get free zram device")
 
-        if KMAJOR <= 4 and KMINOR <= 7:
-            zram_size = round(
-                config.get("zram_size", int) / config.get("zram_count", int)
-            )
-            for _ in range(config.get("zram_count", int)):
-                zram_init()
-        else:
-            zram_size = config.get("zram_size", int)
-            zram_init()
+        zram_size = config.get("zram_size", int)
+        zram_init()
         systemd.daemon.notify("STATUS=Zram setup finished")
 
     am_i_root()
@@ -755,7 +852,10 @@ def start() -> None:
     except sysv_ipc.ExistentialError:
         error(f"{sys.argv[0]} already started")
     config = Config()
-    yn = lambda x: config.get(x, bool)
+
+    def yn(x):
+        return config.get(x, bool)
+
     if yn("zram_enabled") and (
         yn("zswap_enabled") or yn("swapfc_enabled") or yn("swapd_auto_swapon")
     ):
@@ -843,12 +943,12 @@ def status() -> None:
             zswap_info = ""
             for file in sorted(os.listdir("/sys/module/zswap/parameters")):
                 zswap_info += (
-                    f'. {file} {read(f"/sys/module/zswap/parameters/{file}")}\n'
+                    f". {file} {read(f'/sys/module/zswap/parameters/{file}')}\n"
                 )
             subprocess.run(["column", "-t"], input=zswap_info, text=True)
             zswap_info = ""
             for file in sorted(os.listdir("/sys/kernel/debug/zswap")):
-                zswap_info += f'. . {file} {read(f"/sys/kernel/debug/zswap/{file}")}\n'
+                zswap_info += f". . {file} {read(f'/sys/kernel/debug/zswap/{file}')}\n"
             zswap_info += f". . compress_ratio {round(ratio)}%\n"
             if swap_used > 0:
                 zswap_info += (
@@ -857,8 +957,8 @@ def status() -> None:
                 )
             print("Zswap:")
             subprocess.run(["column", "-t"], input=zswap_info, text=True)
-    except:
-        warn("Zswap info inaccesible")
+    except (OSError, ValueError) as e:
+        warn(f"Zswap info inaccessible: {e}")
     zramctl = subprocess.run(
         ["zramctl"], check=True, text=True, stdout=subprocess.PIPE
     ).stdout

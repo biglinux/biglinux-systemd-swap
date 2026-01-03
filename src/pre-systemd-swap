@@ -1,39 +1,123 @@
 #!/bin/bash
+#
+# Pre-systemd-swap setup script
+# Prepares btrfs subvolumes and disables existing swap partitions
+#
 
-swapfcfolder=$(cat /etc/systemd/swap.conf | grep swapfc_path= | awk -F\/ '{print $2}')
-toplevelid=$(btrfs subvolume show /$swapfcfolder | grep -i "top level id" | awk '{print $4}')
-rootpartion=$(df --output=source / | tail -n 1)
-fstype=$(lsblk -fin $rootpartion | awk '{print $2}')
+set -euo pipefail
 
-if [ "$toplevelid" != "5" -a "$fstype" = "btrfs" ];then
-    #montar partição atual em /mnt
-    mount $rootpartion /mnt
-    #criar subvolume dentro da partição root
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
-    if [ ! -e "/mnt/@${swapfcfolder}" ]; then
-        #criar pasta local para montagem do subvolume
-        btrfs subvolume create /mnt/@${swapfcfolder}
-    fi
+die() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
 
-    if [ -z "$(grep @${swapfcfolder} /etc/fstab )" ];then
-        #adicionar ao fstab
-        echo $(blkid $rootpartion | awk '{print $2}' | sed 's/\"//g')" /${swapfcfolder} btrfs subvol=/@${swapfcfolder},defaults 0 0" | tee -a /etc/fstab
-    fi
-    #desmontar partição root
-    sudo umount /mnt
+log_info() {
+    echo "INFO: $1"
+}
 
-    #reload /etc/fstab
-    sudo systemctl daemon-reload
+# =============================================================================
+# Configuration Parsing
+# =============================================================================
 
-    if [ ! -e "/${swapfcfolder}" ]; then
-        sudo mkdir /$swapfcfolder
-    fi
-    #montar subvolume na pasta local
-    sudo mount /${swapfcfolder}
+CONFIG_FILE="/etc/systemd/swap.conf"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    die "Configuration file not found: $CONFIG_FILE"
 fi
 
-#se tiver partição swap, desligar
-partswap=$(lsblk -lI 8 | grep SWAP | awk '{print $1}')
-if [ -n "$partswap" ]; then
-    swapoff /dev/$partswap
+# Extract swapfc_path folder name (second component of path)
+# Using grep with anchored pattern to avoid partial matches
+swapfcfolder=$(grep "^swapfc_path=" "$CONFIG_FILE" | cut -d'/' -f2)
+
+if [[ -z "$swapfcfolder" ]]; then
+    die "Could not determine swapfc_path from $CONFIG_FILE"
 fi
+
+# =============================================================================
+# System Detection
+# =============================================================================
+
+# Get root partition device
+rootpartition=$(df --output=source / | tail -n 1)
+
+if [[ -z "$rootpartition" ]]; then
+    die "Could not determine root partition"
+fi
+
+# Get filesystem type
+fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || echo "unknown")
+
+# Check if path is a btrfs subvolume and get top level id
+toplevelid=""
+if [[ "$fstype" == "btrfs" ]] && [[ -d "/$swapfcfolder" ]]; then
+    toplevelid=$(btrfs subvolume show "/$swapfcfolder" 2>/dev/null | grep -i "top level id" | awk '{print $4}' || echo "")
+fi
+
+# =============================================================================
+# Btrfs Subvolume Setup
+# =============================================================================
+
+if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
+    log_info "Setting up btrfs subvolume for swap files"
+
+    # Mount root partition on /mnt
+    if ! mount "$rootpartition" /mnt; then
+        die "Failed to mount $rootpartition on /mnt"
+    fi
+
+    # Create subvolume if it doesn't exist
+    if [[ ! -e "/mnt/@${swapfcfolder}" ]]; then
+        log_info "Creating subvolume @$swapfcfolder"
+        if ! btrfs subvolume create "/mnt/@$swapfcfolder"; then
+            umount /mnt
+            die "Failed to create btrfs subvolume"
+        fi
+    fi
+
+    # Add to fstab if not already present
+    if ! grep -q "@${swapfcfolder}" /etc/fstab; then
+        log_info "Adding subvolume to /etc/fstab"
+        uuid=$(blkid -s UUID -o value "$rootpartition")
+        if [[ -n "$uuid" ]]; then
+            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults 0 0" >>/etc/fstab
+        else
+            die "Could not get UUID for $rootpartition"
+        fi
+    fi
+
+    # Unmount root partition
+    umount /mnt
+
+    # Reload systemd to pick up fstab changes
+    systemctl daemon-reload
+
+    # Create mount point if needed
+    if [[ ! -e "/$swapfcfolder" ]]; then
+        mkdir -p "/$swapfcfolder"
+    fi
+
+    # Mount the subvolume
+    if ! mount "/$swapfcfolder"; then
+        die "Failed to mount /$swapfcfolder"
+    fi
+
+    log_info "Btrfs subvolume setup complete"
+fi
+
+# =============================================================================
+# Disable Existing Swap Partitions
+# =============================================================================
+
+# Find swap partitions (type 8x devices with SWAP)
+while IFS= read -r partswap; do
+    if [[ -n "$partswap" ]]; then
+        log_info "Disabling swap partition: /dev/$partswap"
+        swapoff "/dev/$partswap" 2>/dev/null || true
+    fi
+done < <(lsblk -lno NAME,FSTYPE | awk '$2 == "swap" {print $1}')
+
+log_info "Pre-systemd-swap setup complete"

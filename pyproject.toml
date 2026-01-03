@@ -1,12 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "biglinux-systemd-swap"
+version = "0.1.0"
+description = "Script for creating hybrid swap space from zram swaps, swap files and swap partitions"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.7"
+authors = [
+    {name = "Timofey Titovets"},
+    {name = "BigLinux Team"}
+]
+keywords = ["swap", "zram", "zswap", "systemd", "memory"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Operating System Kernels :: Linux",
+]
+dependencies = [
+    "systemd-python",
+    "sysv-ipc",
+]
+
+[project.urls]
+Homepage = "https://github.com/biglinux/biglinux-systemd-swap"
+Repository = "https://github.com/biglinux/biglinux-systemd-swap.git"
+Issues = "https://github.com/biglinux/biglinux-systemd-swap/issues"
+
+[project.scripts]
+systemd-swap = "systemd_swap:main"
+
 [tool.black]
 line-length = 88
-target-version = ['py37', 'py38']
-include = 'systemd-swap.py$'
+target-version = ['py37', 'py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.py$'
 
-[tool.pylint.test]
+[tool.ruff]
+line-length = 88
+target-version = "py37"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.pylint.main]
 max-line-length = 88
 disable = [
-    "C0114",
-    "C0115",
-    "C0116"
+    "C0114",  # missing-module-docstring
+    "C0115",  # missing-class-docstring
+    "C0116",  # missing-function-docstring
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
