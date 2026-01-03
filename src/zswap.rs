@@ -46,9 +46,28 @@ impl ZswapBackup {
     }
 }
 
-/// Check if zswap is available
+/// Check if zswap is available (module loaded)
 pub fn is_available() -> bool {
     Path::new(ZSWAP_MODULE).is_dir()
+}
+
+/// Check if zswap is currently enabled
+pub fn is_enabled() -> bool {
+    let enabled_path = format!("{}/enabled", ZSWAP_PARAMS);
+    if let Ok(content) = read_file(&enabled_path) {
+        let value = content.trim();
+        return value == "Y" || value == "1";
+    }
+    false
+}
+
+/// Enable or disable zswap
+fn set_enabled(enable: bool) -> Result<()> {
+    let enabled_path = format!("{}/enabled", ZSWAP_PARAMS);
+    let value = if enable { "1" } else { "0" };
+    write_file(&enabled_path, value)?;
+    info!("Zswap: {} zswap", if enable { "enabled" } else { "disabled" });
+    Ok(())
 }
 
 /// Start and configure zswap
@@ -89,12 +108,22 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
 
     info!("Zswap: set new parameters: start");
 
-    // Write new parameters
+    // IMPORTANT: Some parameters (compressor, zpool) cannot be changed while zswap is enabled.
+    // We must disable zswap first, configure parameters, then re-enable.
+    let was_enabled = is_enabled();
+    if was_enabled {
+        info!("Zswap: temporarily disabling to change parameters");
+        if let Err(e) = set_enabled(false) {
+            warn!("Zswap: failed to disable temporarily: {}", e);
+        }
+    }
+
+    // Write parameters (except enabled) - order matters for some kernels
+    // Configure zpool and compressor first, then max_pool_percent
     let params = [
-        ("enabled", enabled),
+        ("zpool", zpool),
         ("compressor", compressor),
         ("max_pool_percent", max_pool_percent),
-        ("zpool", zpool),
     ];
 
     for (name, value) in params {
@@ -102,6 +131,17 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
         if let Err(e) = write_file(&path, value) {
             error!("Failed to write zswap_{}: {}", name, e);
         }
+    }
+
+    // Now enable zswap if requested
+    let should_enable = enabled == "1" || enabled.to_lowercase() == "y" || enabled.to_lowercase() == "yes";
+    if should_enable {
+        if let Err(e) = set_enabled(true) {
+            error!("Failed to enable zswap: {}", e);
+        }
+    } else if was_enabled {
+        // If it was enabled before but config says disabled, keep it disabled
+        info!("Zswap: keeping disabled as per configuration");
     }
 
     info!("Zswap: set new parameters: complete");

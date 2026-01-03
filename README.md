@@ -7,7 +7,7 @@ Smart dynamic swap management for Linux, written in Rust.
 - **Auto-detection**: Automatically chooses best swap strategy for your system
 - **btrfs optimized**: Uses zswap + swap files on btrfs
 - **Universal fallback**: Uses zram on non-btrfs systems
-- **Low memory**: ~800 KB binary (vs ~10 MB Python version)
+- **Low memory**: ~250 KB vs ~10 MB Python version
 
 ## How It Works
 
