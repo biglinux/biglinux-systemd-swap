@@ -11,7 +11,7 @@ use systemd_swap::config::{Config, WORK_DIR};
 use systemd_swap::helpers::{am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file};
 use systemd_swap::meminfo::{get_mem_stats, get_page_size};
 use systemd_swap::swapfc::SwapFc;
-use systemd_swap::systemd::{notify_ready, notify_status, notify_stopping, swapoff, systemctl};
+use systemd_swap::systemd::{notify_ready, notify_stopping, swapoff};
 use systemd_swap::zswap::ZswapBackup;
 use systemd_swap::{error, info, request_shutdown, warn};
 
@@ -36,6 +36,15 @@ enum Commands {
     Compression,
 }
 
+/// Swap strategy based on filesystem detection
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SwapMode {
+    Auto,
+    ZswapSwapfc,  // zswap + swap files (for btrfs)
+    ZramOnly,     // zram only (for non-btrfs)
+    Manual,       // Use explicit config values
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -52,6 +61,57 @@ fn main() {
     }
 }
 
+/// Detect if root filesystem is btrfs
+fn is_root_btrfs() -> bool {
+    let output = Command::new("df")
+        .args(["--output=fstype", "/"])
+        .stdout(Stdio::piped())
+        .output();
+
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(fstype) = stdout.lines().nth(1) {
+            return fstype.trim() == "btrfs";
+        }
+    }
+    false
+}
+
+/// Detect if swapfc_path is on btrfs
+fn is_path_btrfs(path: &str) -> bool {
+    // Check the parent directory or the path itself
+    let check_path = if Path::new(path).exists() {
+        path.to_string()
+    } else if let Some(parent) = Path::new(path).parent() {
+        parent.to_string_lossy().to_string()
+    } else {
+        "/".to_string()
+    };
+
+    let output = Command::new("df")
+        .args(["--output=fstype", &check_path])
+        .stdout(Stdio::piped())
+        .output();
+
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(fstype) = stdout.lines().nth(1) {
+            return fstype.trim() == "btrfs";
+        }
+    }
+    false
+}
+
+/// Parse swap_mode from config
+fn get_swap_mode(config: &Config) -> SwapMode {
+    match config.get("swap_mode").unwrap_or("auto").to_lowercase().as_str() {
+        "zswap+swapfc" | "zswap" => SwapMode::ZswapSwapfc,
+        "zram" | "zram_only" => SwapMode::ZramOnly,
+        "manual" => SwapMode::Manual,
+        _ => SwapMode::Auto,
+    }
+}
+
 /// Start the swap daemon
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     am_i_root()?;
@@ -65,39 +125,132 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     makedirs(format!("{}/system/swap.target.wants", systemd_swap::config::RUN_SYSD))?;
 
     let config = Config::load()?;
+    let swap_mode = get_swap_mode(&config);
 
-    // Warn about incompatible configurations
-    if config.get_bool("zram_enabled")
-        && (config.get_bool("zswap_enabled")
-            || config.get_bool("swapfc_enabled")
-            || config.get_bool("swapd_auto_swapon"))
-    {
-        warn!(
-            "Combining zram with zswap/swapfc/swapd_auto_swapon can lead to LRU \
-             inversion and is strongly recommended against"
-        );
-    }
+    // Determine effective mode
+    let effective_mode = match swap_mode {
+        SwapMode::Auto => {
+            let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
+            if is_path_btrfs(swapfc_path) || is_root_btrfs() {
+                info!("Auto-detected btrfs: using zswap + swapfc");
+                SwapMode::ZswapSwapfc
+            } else {
+                info!("Auto-detected non-btrfs: using zram only");
+                SwapMode::ZramOnly
+            }
+        }
+        mode => mode,
+    };
 
-    // Store zswap backup for restoration
+    #[allow(unused_assignments)]
     let mut zswap_backup: Option<ZswapBackup> = None;
 
-    // Start zswap
-    if config.get_bool("zswap_enabled") {
-        match systemd_swap::zswap::start(&config) {
-            Ok(backup) => zswap_backup = Some(backup),
-            Err(e) => error!("Zswap: {}", e),
+    match effective_mode {
+        SwapMode::ZswapSwapfc => {
+            // For zswap: create swap file FIRST, then enable zswap
+            // zswap needs a backing swap device to work
+            
+            // Set up signal handler
+            signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            ctrlc::set_handler(move || {
+                request_shutdown();
+            })?;
+
+            // Create initial swap file and start monitoring
+            let mut swapfc = SwapFc::new(&config)?;
+            
+            // Force create first swap chunk immediately (zswap needs backing swap)
+            info!("Creating initial swap file for zswap backing...");
+            swapfc.create_initial_swap()?;
+
+            // Now configure zswap (after swap is available)
+            match systemd_swap::zswap::start(&config) {
+                Ok(backup) => {
+                    zswap_backup = Some(backup);
+                    save_zswap_backup(&zswap_backup)?;
+                }
+                Err(e) => error!("Zswap: {}", e),
+            }
+
+            // Run swapfc monitoring loop
+            swapfc.run()?;
         }
+
+        SwapMode::ZramOnly => {
+            // For zram: just set up zram, no swap files needed
+            if let Err(e) = systemd_swap::zram::start(&config) {
+                error!("Zram: {}", e);
+            }
+            notify_ready();
+            info!("Zram setup complete");
+            
+            // Keep running to respond to signals
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                if systemd_swap::is_shutdown() {
+                    break;
+                }
+            }
+        }
+
+        SwapMode::Manual => {
+            // Legacy mode: use explicit config values
+            
+            // Warn about incompatible configurations
+            if config.get_bool("zram_enabled")
+                && (config.get_bool("zswap_enabled") || config.get_bool("swapfc_enabled"))
+            {
+                warn!("Combining zram with zswap/swapfc can lead to LRU inversion");
+            }
+
+            // Start zswap if enabled
+            if config.get_bool("zswap_enabled") {
+                match systemd_swap::zswap::start(&config) {
+                    Ok(backup) => {
+                        zswap_backup = Some(backup);
+                        save_zswap_backup(&zswap_backup)?;
+                    }
+                    Err(e) => error!("Zswap: {}", e),
+                }
+            }
+
+            // Start zram if enabled
+            if config.get_bool("zram_enabled") {
+                if let Err(e) = systemd_swap::zram::start(&config) {
+                    error!("Zram: {}", e);
+                }
+            }
+
+            // Start swapfc if enabled
+            if config.get_bool("swapfc_enabled") {
+                signal_hook::flag::register(
+                    signal_hook::consts::SIGTERM,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )?;
+                ctrlc::set_handler(move || {
+                    request_shutdown();
+                })?;
+
+                let mut swapfc = SwapFc::new(&config)?;
+                swapfc.run()?;
+            } else {
+                notify_ready();
+                info!("Swap setup complete");
+            }
+        }
+
+        SwapMode::Auto => unreachable!("Auto mode should be resolved before this point"),
     }
 
-    // Start zram
-    if config.get_bool("zram_enabled") {
-        if let Err(e) = systemd_swap::zram::start(&config) {
-            error!("Zram: {}", e);
-        }
-    }
+    Ok(())
+}
 
-    // Save destroy info (simplified - just zswap backup)
-    if let Some(ref backup) = zswap_backup {
+/// Save zswap backup for later restoration
+fn save_zswap_backup(backup: &Option<ZswapBackup>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref backup) = backup {
         let backup_path = format!("{}/zswap_backup", WORK_DIR);
         makedirs(&backup_path)?;
         for (path, value) in &backup.parameters {
@@ -106,80 +259,6 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             fs::write(&save_path, format!("{}={}", path, value))?;
         }
     }
-
-    // Start swapd (auto swapon)
-    if config.get_bool("swapd_auto_swapon") {
-        start_swapd(&config)?;
-    }
-
-    // Start swapfc (dynamic swap files)
-    if config.get_bool("swapfc_enabled") {
-        // Set up signal handler
-        signal_hook::flag::register(signal_hook::consts::SIGTERM, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))?;
-        
-        ctrlc::set_handler(move || {
-            request_shutdown();
-        })?;
-
-        let mut swapfc = SwapFc::new(&config)?;
-        swapfc.run()?;
-    } else {
-        notify_ready();
-        info!("Swap setup complete, no monitoring needed");
-    }
-
-    Ok(())
-}
-
-/// Start swapd (auto-enable swap partitions)
-fn start_swapd(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    notify_status("Activating swap units...");
-    info!("swapD: searching swap devices");
-
-    makedirs(format!("{}/swapd", WORK_DIR))?;
-
-    let prio: i32 = config.get_as("swapd_prio").unwrap_or(1024);
-
-    // Find swap partitions
-    let output = Command::new("blkid")
-        .args(["-t", "TYPE=swap", "-o", "device"])
-        .stdout(Stdio::piped())
-        .output()?;
-
-    let devices = String::from_utf8_lossy(&output.stdout);
-
-    for device in devices.lines() {
-        let device = device.trim();
-        if device.is_empty() || device.contains("zram") || device.contains("loop") {
-            continue;
-        }
-
-        // Check if already in use
-        let swapon_output = Command::new("swapon")
-            .args(["--show=NAME", "--noheadings"])
-            .stdout(Stdio::piped())
-            .output()?;
-
-        let used_devices = String::from_utf8_lossy(&swapon_output.stdout);
-        if used_devices.lines().any(|d| d.trim() == device) {
-            continue;
-        }
-
-        // Generate and start swap unit
-        let unit_name = systemd_swap::systemd::gen_swap_unit(
-            Path::new(device),
-            Some(prio),
-            Some("discard"),
-            "swapd",
-        )?;
-
-        systemctl("daemon-reload", "")?;
-        if systemctl("start", &unit_name).is_ok() {
-            info!("swapD: enabled device: {}", device);
-        }
-    }
-
-    notify_status("Swap unit activation finished");
     Ok(())
 }
 
@@ -194,7 +273,7 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
     // Stop all managed swap units
-    for subsystem in ["swapd", "swapfc", "zram"] {
+    for subsystem in ["swapfc", "zram"] {
         for unit_path in find_swap_units() {
             if let Ok(content) = read_file(&unit_path) {
                 if content.to_lowercase().contains(subsystem) {
@@ -298,21 +377,6 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
                     let line = line.trim_end_matches("[SWAP]").trim_end_matches("MOUNTPOINT").trim();
                     println!("  {}", line);
                 }
-            }
-        }
-    }
-
-    // SwapD status
-    if Path::new(&format!("{}/swapd", WORK_DIR)).is_dir() {
-        println!("\nswapD:");
-        let swapon_output = Command::new("swapon")
-            .arg("--raw")
-            .stdout(Stdio::piped())
-            .output()?;
-
-        for line in String::from_utf8_lossy(&swapon_output.stdout).lines() {
-            if !line.contains("zram") && !line.contains("file") && !line.contains("loop") {
-                println!("  {}", line);
             }
         }
     }

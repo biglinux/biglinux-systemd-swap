@@ -160,6 +160,14 @@ impl SwapFc {
         })
     }
 
+    /// Create initial swap file (needed for zswap backing)
+    pub fn create_initial_swap(&mut self) -> Result<()> {
+        if self.allocated == 0 {
+            self.create_swapfile()?;
+        }
+        Ok(())
+    }
+
     /// Run the swap monitoring loop
     pub fn run(&mut self) -> Result<()> {
         notify_ready();

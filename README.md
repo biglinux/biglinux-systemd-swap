@@ -1,28 +1,33 @@
 # systemd-swap
 
-Dynamic swap management daemon for Linux, written in Rust.
+Smart dynamic swap management for Linux, written in Rust.
 
-Manages:
-- **Zswap** - Compressed swap cache in RAM
-- **Zram** - Compressed RAM disk for swap
-- **SwapFC** - Dynamic swap file allocation on btrfs
+## Features
+
+- **Auto-detection**: Automatically chooses best swap strategy for your system
+- **btrfs optimized**: Uses zswap + swap files on btrfs
+- **Universal fallback**: Uses zram on non-btrfs systems
+- **Low memory**: ~800 KB binary (vs ~10 MB Python version)
+
+## How It Works
+
+| Filesystem | Strategy | Description |
+|------------|----------|-------------|
+| **btrfs** | zswap + swapfc | Compressed RAM cache with dynamic swap files |
+| **other** | zram only | Compressed RAM disk |
+
+### Why This Choice?
+
+**btrfs systems**: zswap compresses pages in RAM before writing to disk. Combined with dynamic swap files (swapfc), this provides efficient memory management with disk backing when needed.
+
+**non-btrfs systems**: zram creates a compressed swap device entirely in RAM. This is ideal when swap files aren't supported or practical.
 
 ## Installation
 
-### Arch Linux / BigLinux
-
 ```bash
+# Arch Linux / BigLinux
 cd pkgbuild
 makepkg -si
-```
-
-### Manual
-
-Requires: `rust`, `cargo`, `systemd`
-
-```bash
-cargo build --release
-sudo make install
 ```
 
 ## Usage
@@ -43,45 +48,48 @@ systemd-swap compression
 Edit `/etc/systemd/swap.conf`:
 
 ```ini
-# Zswap (compressed RAM cache)
-zswap_enabled=1
+# Swap mode (default: auto)
+# auto         - Auto-detect filesystem
+# zswap+swapfc - Force zswap with swap files
+# zram         - Force zram only  
+# manual       - Use explicit settings
+swap_mode=auto
+
+# Zswap settings (for btrfs mode)
 zswap_compressor=zstd
-zswap_max_pool_percent=1
+zswap_max_pool_percent=35
 zswap_zpool=zsmalloc
 
-# Zram (RAM disk swap)
-zram_enabled=1
+# Zram settings (for non-btrfs mode)
 zram_size=$RAM_SIZE
 zram_alg=zstd
 zram_prio=32767
 
-# SwapFC (dynamic swap files on btrfs)
-swapfc_enabled=1
+# SwapFC settings (for btrfs mode)
 swapfc_chunk_size=512M
 swapfc_max_count=32
-swapfc_free_ram_perc=35
-swapfc_path=/swapfc/swapfile
+swapfc_path=/swapfc/swapfile  # Can be on different partition
 ```
 
-## FAQ
+## Custom Swap Location
 
-**Q: Should I use zram AND zswap?**  
-A: No. Use one or the other. Both together can cause LRU inversion.
+You can create swap files on a different partition by setting `swapfc_path`:
 
-**Q: What filesystem does SwapFC support?**  
-A: Btrfs only. Swap files are created as subvolumes with COW disabled.
+```ini
+# Use swap on separate btrfs partition
+swapfc_path=/mnt/swap-drive/swapfile
+```
 
-**Q: Does this work with hibernation?**  
-A: No. Dynamic swap files are not compatible with hibernation.
+The path must be on a btrfs filesystem.
 
 ## File Locations
 
-```
-/usr/bin/systemd-swap          # Main binary
-/etc/systemd/swap.conf         # Configuration
-/usr/lib/systemd/system/       # Service files
-/run/systemd/swap/             # Runtime data
-```
+| Path | Description |
+|------|-------------|
+| `/usr/bin/systemd-swap` | Main binary |
+| `/etc/systemd/swap.conf` | User configuration |
+| `/usr/share/systemd-swap/swap-default.conf` | Default configuration |
+| `/run/systemd/swap/` | Runtime data |
 
 ## License
 
