@@ -101,10 +101,12 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     let compressor = config.get("zswap_compressor").unwrap_or("lzo");
     let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("20");
     let zpool = config.get("zswap_zpool").unwrap_or("zbud");
+    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("0");
+    let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
 
     info!(
-        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Zpool: {}",
-        enabled, compressor, max_pool_percent, zpool
+        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Zpool: {}, Shrinker: {}, Accept threshold: {}%",
+        enabled, compressor, max_pool_percent, zpool, shrinker_enabled, accept_threshold
     );
 
     info!("Zswap: set new parameters: start");
@@ -125,12 +127,19 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
         ("zpool", zpool),
         ("compressor", compressor),
         ("max_pool_percent", max_pool_percent),
+        ("shrinker_enabled", shrinker_enabled),
+        ("accept_threshold_percent", accept_threshold),
     ];
 
     for (name, value) in params {
         let path = format!("{}/{}", ZSWAP_PARAMS, name);
         if let Err(e) = write_file(&path, value) {
-            error!("Failed to write zswap_{}: {}", name, e);
+            // shrinker_enabled may not exist on older kernels, just warn
+            if name == "shrinker_enabled" || name == "accept_threshold_percent" {
+                warn!("Zswap: {} not supported on this kernel", name);
+            } else {
+                error!("Failed to write zswap_{}: {}", name, e);
+            }
         }
     }
 

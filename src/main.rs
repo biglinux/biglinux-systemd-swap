@@ -40,7 +40,8 @@ enum Commands {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SwapMode {
     Auto,
-    ZswapSwapfc,  // zswap + swap files (for btrfs)
+    ZramSwapfc,   // zram + writeback to swap files (best for desktop!)
+    ZswapSwapfc,  // zswap + swap files (alternative)
     ZramOnly,     // zram only (for non-btrfs)
     Manual,       // Use explicit config values
 }
@@ -105,6 +106,7 @@ fn is_path_btrfs(path: &str) -> bool {
 /// Parse swap_mode from config
 fn get_swap_mode(config: &Config) -> SwapMode {
     match config.get("swap_mode").unwrap_or("auto").to_lowercase().as_str() {
+        "zram+swapfc" | "zram_swapfc" => SwapMode::ZramSwapfc,
         "zswap+swapfc" | "zswap" => SwapMode::ZswapSwapfc,
         "zram" | "zram_only" => SwapMode::ZramOnly,
         "manual" => SwapMode::Manual,
@@ -132,6 +134,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         SwapMode::Auto => {
             let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
             if is_path_btrfs(swapfc_path) || is_root_btrfs() {
+                // Desktop optimization: zswap + swapfc - tested to be faster
                 info!("Auto-detected btrfs: using zswap + swapfc");
                 SwapMode::ZswapSwapfc
             } else {
@@ -146,6 +149,36 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let mut zswap_backup: Option<ZswapBackup> = None;
 
     match effective_mode {
+        SwapMode::ZramSwapfc => {
+            // Desktop-optimized mode: zram for speed + swapfc for overflow
+            // zram is faster than zswap because it's a dedicated block device
+            
+            // Set up signal handler
+            signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            ctrlc::set_handler(move || {
+                request_shutdown();
+            })?;
+
+            // Start zram first (primary high-priority swap)
+            info!("Setting up zram as primary swap...");
+            if let Err(e) = systemd_swap::zram::start(&config) {
+                error!("Zram: {}", e);
+            }
+
+            // Create swapfc for overflow/writeback (lower priority)
+            info!("Setting up swapfc as secondary swap for overflow...");
+            let mut swapfc = SwapFc::new(&config)?;
+            
+            // Create initial swap file
+            swapfc.create_initial_swap()?;
+
+            // Run swapfc monitoring loop
+            swapfc.run()?;
+        }
+
         SwapMode::ZswapSwapfc => {
             // For zswap: create swap file FIRST, then enable zswap
             // zswap needs a backing swap device to work

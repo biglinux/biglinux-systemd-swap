@@ -48,6 +48,7 @@ pub struct SwapFcConfig {
     pub priority: i32,
     pub force_use_loop: bool,
     pub directio: bool,
+    pub use_btrfs_compression: bool,
 }
 
 impl SwapFcConfig {
@@ -78,6 +79,7 @@ impl SwapFcConfig {
             priority: config.get_as("swapfc_priority").unwrap_or(50),
             force_use_loop: config.get_bool("swapfc_force_use_loop"),
             directio: config.get_bool("swapfc_directio"),
+            use_btrfs_compression: config.get_bool("swapfc_use_btrfs_compression"),
         })
     }
 }
@@ -265,26 +267,42 @@ impl SwapFc {
                 .open(&swapfile_path)?;
         }
 
-        // Disable COW for btrfs
-        let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
+        // Determine if we're using btrfs compression mode
+        let use_compression = self.config.use_btrfs_compression;
+        let use_loop = self.config.force_use_loop || use_compression;
 
-        // Allocate space
-        Command::new("fallocate")
-            .args(["-l", &self.config.chunk_size.to_string()])
-            .arg(&swapfile_path)
-            .status()?;
+        if use_compression {
+            // For btrfs compression: use sparse file with truncate
+            // This allows btrfs to compress the data and only allocate used blocks
+            info!("swapFC: creating sparse file for btrfs compression");
+            Command::new("truncate")
+                .args(["--size", &self.config.chunk_size.to_string()])
+                .arg(&swapfile_path)
+                .status()?;
+            // Do NOT use chattr +C - we want compression!
+        } else {
+            // Disable COW for btrfs (normal mode)
+            let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
 
-        let swapfile = if self.config.force_use_loop {
-            let directio = if self.config.directio { "on" } else { "off" };
+            // Allocate space with fallocate
+            Command::new("fallocate")
+                .args(["-l", &self.config.chunk_size.to_string()])
+                .arg(&swapfile_path)
+                .status()?;
+        }
+
+        let (swapfile, loop_device) = if use_loop {
+            // Create loop device
+            let directio = if self.config.directio && !use_compression { "on" } else { "off" };
             let loop_dev = run_cmd_output(&[
                 "losetup", "-f", "--show",
                 &format!("--direct-io={}", directio),
                 &swapfile_path.to_string_lossy(),
             ])?;
-            fs::remove_file(&swapfile_path)?;
-            loop_dev
+            let loop_dev = loop_dev.trim().to_string();
+            (loop_dev.clone(), Some(loop_dev))
         } else {
-            swapfile_path.to_string_lossy().to_string()
+            (swapfile_path.to_string_lossy().to_string(), None)
         };
 
         // mkswap
@@ -295,12 +313,20 @@ impl SwapFc {
             .status()?;
 
         // Generate and start swap unit
+        // Use discard=pages for compressed mode to release space when pages are freed
+        let discard_option = if use_compression { "pages" } else { "discard" };
         let unit_name = gen_swap_unit(
             Path::new(&swapfile),
             Some(self.priority),
-            Some("discard"),
+            Some(discard_option),
             &format!("swapfc_{}", self.allocated),
         )?;
+
+        // Store loop device info for cleanup
+        if let Some(ref loop_dev) = loop_device {
+            let loop_info_path = format!("{}/swapfc/loop_{}", WORK_DIR, self.allocated);
+            let _ = fs::write(&loop_info_path, format!("{}\n{}", loop_dev, swapfile_path.display()));
+        }
 
         self.priority -= 1;
 
@@ -315,6 +341,10 @@ impl SwapFc {
         notify_status("Deallocating swap file...");
 
         let tag = format!("swapfc_{}", self.allocated);
+
+        // Check if we have loop device info for this swap
+        let loop_info_path = format!("{}/swapfc/loop_{}", WORK_DIR, self.allocated);
+        let loop_info = fs::read_to_string(&loop_info_path).ok();
 
         for unit_path in crate::helpers::find_swap_units() {
             if let Ok(content) = crate::helpers::read_file(&unit_path) {
@@ -331,7 +361,24 @@ impl SwapFc {
 
                         force_remove(&unit_path, true);
 
-                        if Path::new(&dev).is_file() {
+                        // Clean up loop device and backing file if applicable
+                        if let Some(ref info) = loop_info {
+                            let lines: Vec<&str> = info.lines().collect();
+                            if lines.len() >= 2 {
+                                let loop_dev = lines[0];
+                                let backing_file = lines[1];
+                                
+                                // Detach loop device
+                                let _ = Command::new("losetup")
+                                    .args(["-d", loop_dev])
+                                    .status();
+                                
+                                // Remove backing file
+                                force_remove(backing_file, false);
+                            }
+                            // Remove loop info file
+                            force_remove(&loop_info_path, false);
+                        } else if Path::new(&dev).is_file() {
                             force_remove(&dev, false);
                         }
                     }
