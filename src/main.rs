@@ -66,24 +66,8 @@ fn main() {
     }
 }
 
-/// Detect if root filesystem is btrfs
-fn is_root_btrfs() -> bool {
-    let output = Command::new("df")
-        .args(["--output=fstype", "/"])
-        .stdout(Stdio::piped())
-        .output();
-
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(fstype) = stdout.lines().nth(1) {
-            return fstype.trim() == "btrfs";
-        }
-    }
-    false
-}
-
-/// Detect if swapfc_path is on btrfs
-fn is_path_btrfs(path: &str) -> bool {
+/// Detect filesystem type for a path
+fn get_path_fstype(path: &str) -> Option<String> {
     // Check the parent directory or the path itself
     let check_path = if Path::new(path).exists() {
         path.to_string()
@@ -96,15 +80,20 @@ fn is_path_btrfs(path: &str) -> bool {
     let output = Command::new("df")
         .args(["--output=fstype", &check_path])
         .stdout(Stdio::piped())
-        .output();
+        .output()
+        .ok()?;
 
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(fstype) = stdout.lines().nth(1) {
-            return fstype.trim() == "btrfs";
-        }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().nth(1).map(|s| s.trim().to_string())
+}
+
+/// Check if filesystem supports swap files (btrfs, ext4, xfs)
+fn is_swapfc_supported(path: &str) -> bool {
+    if let Some(fstype) = get_path_fstype(path) {
+        matches!(fstype.as_str(), "btrfs" | "ext4" | "xfs")
+    } else {
+        false
     }
-    false
 }
 
 /// Parse swap_mode from config
@@ -116,6 +105,26 @@ fn get_swap_mode(config: &Config) -> SwapMode {
         "manual" => SwapMode::Manual,
         _ => SwapMode::Auto,
     }
+}
+
+/// Run zram-only mode (used as fallback when swapfc fails)
+fn run_zram_only(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Running in zram-only mode");
+    if let Err(e) = systemd_swap::zram::start(config) {
+        error!("Zram: {}", e);
+        return Err(Box::new(e));
+    }
+    notify_ready();
+    info!("Zram setup complete (fallback mode)");
+    
+    // Keep running to respond to signals
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if systemd_swap::is_shutdown() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Start the swap daemon
@@ -137,12 +146,13 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let effective_mode = match swap_mode {
         SwapMode::Auto => {
             let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
-            if is_path_btrfs(swapfc_path) || is_root_btrfs() {
-                // Desktop optimization: zswap + swapfc - tested to be faster
-                info!("Auto-detected btrfs: using zswap + swapfc");
+            if is_swapfc_supported(swapfc_path) {
+                let fstype = get_path_fstype(swapfc_path).unwrap_or_default();
+                info!("Auto-detected {}: using zswap + swapfc", fstype);
                 SwapMode::ZswapSwapfc
             } else {
-                info!("Auto-detected non-btrfs: using zram only");
+                let fstype = get_path_fstype(swapfc_path).unwrap_or_else(|| "unknown".to_string());
+                info!("Filesystem '{}' not supported for swap files: using zram only", fstype);
                 SwapMode::ZramOnly
             }
         }
@@ -172,15 +182,40 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Zram: {}", e);
             }
 
-            // Create swapfc for overflow/writeback (lower priority)
+            // Try to create swapfc for overflow/writeback (lower priority)
             info!("Setting up swapfc as secondary swap for overflow...");
-            let mut swapfc = SwapFc::new(&config)?;
-            
-            // Create initial swap file
-            swapfc.create_initial_swap()?;
-
-            // Run swapfc monitoring loop
-            swapfc.run()?;
+            match SwapFc::new(&config) {
+                Ok(mut swapfc) => {
+                    match swapfc.create_initial_swap() {
+                        Ok(()) => {
+                            // Run swapfc monitoring loop
+                            swapfc.run()?;
+                        }
+                        Err(e) => {
+                            // swapfc failed but zram is already running - continue in zram-only mode
+                            warn!("swapFC: failed to create swap file: {} - continuing with zram-only", e);
+                            notify_ready();
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(60));
+                                if systemd_swap::is_shutdown() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // swapfc failed but zram is already running - continue in zram-only mode
+                    warn!("swapFC: initialization failed: {} - continuing with zram-only", e);
+                    notify_ready();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        if systemd_swap::is_shutdown() {
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         SwapMode::ZswapSwapfc => {
@@ -196,24 +231,35 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 request_shutdown();
             })?;
 
-            // Create initial swap file and start monitoring
-            let mut swapfc = SwapFc::new(&config)?;
-            
-            // Force create first swap chunk immediately (zswap needs backing swap)
-            info!("Creating initial swap file for zswap backing...");
-            swapfc.create_initial_swap()?;
-
-            // Now configure zswap (after swap is available)
-            match systemd_swap::zswap::start(&config) {
-                Ok(backup) => {
-                    zswap_backup = Some(backup);
-                    save_zswap_backup(&zswap_backup)?;
+            // Try to create swapfc - if it fails, fallback to zram-only
+            match SwapFc::new(&config) {
+                Ok(mut swapfc) => {
+                    // Force create first swap chunk immediately (zswap needs backing swap)
+                    info!("Creating initial swap file for zswap backing...");
+                    match swapfc.create_initial_swap() {
+                        Ok(()) => {
+                            // Now configure zswap (after swap is available)
+                            match systemd_swap::zswap::start(&config) {
+                                Ok(backup) => {
+                                    zswap_backup = Some(backup);
+                                    save_zswap_backup(&zswap_backup)?;
+                                }
+                                Err(e) => error!("Zswap: {}", e),
+                            }
+                            // Run swapfc monitoring loop
+                            swapfc.run()?;
+                        }
+                        Err(e) => {
+                            warn!("swapFC: failed to create swap file: {} - falling back to zram-only", e);
+                            run_zram_only(&config)?;
+                        }
+                    }
                 }
-                Err(e) => error!("Zswap: {}", e),
+                Err(e) => {
+                    warn!("swapFC: initialization failed: {} - falling back to zram-only", e);
+                    run_zram_only(&config)?;
+                }
             }
-
-            // Run swapfc monitoring loop
-            swapfc.run()?;
         }
 
         SwapMode::ZramOnly => {

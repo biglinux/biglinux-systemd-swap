@@ -78,10 +78,12 @@ pub fn get_ram_size() -> Result<u64> {
     Ok(stats["MemTotal"])
 }
 
-/// Get free RAM percentage (0-100)
+/// Get available RAM percentage (0-100)
+/// Uses MemAvailable which gives a better estimate of memory available
+/// for starting new applications without swapping.
 pub fn get_free_ram_percent() -> Result<u8> {
-    let stats = get_mem_stats(&["MemTotal", "MemFree"])?;
-    let percent = (stats["MemFree"] * 100) / stats["MemTotal"];
+    let stats = get_mem_stats(&["MemTotal", "MemAvailable"])?;
+    let percent = (stats["MemAvailable"] * 100) / stats["MemTotal"];
     Ok(percent as u8)
 }
 
@@ -213,7 +215,7 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
         )
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(20);
+            .unwrap_or(35);
 
         let max_pool_size = mem_total * max_pool_percent / 100;
         if max_pool_size > 0 {
