@@ -26,8 +26,8 @@ pub enum SwapFcError {
     Systemd(#[from] crate::systemd::SystemdError),
     #[error("Invalid swapfc_path")]
     InvalidPath,
-    #[error("Not btrfs filesystem")]
-    NotBtrfs,
+    #[error("Unsupported filesystem (requires btrfs, ext4, or xfs)")]
+    UnsupportedFs,
     #[error("Not enough space")]
     NoSpace,
 }
@@ -49,7 +49,8 @@ pub struct SwapFcConfig {
     pub force_use_loop: bool,
     pub directio: bool,
     pub use_btrfs_compression: bool,
-    /// Use sparse files (thin provisioning) - only allocate disk space when needed
+    /// Use sparse files (thin provisioning) - opt-in, NOT default
+    /// Pre-allocated files with fallocate are more stable under memory pressure
     pub use_sparse: bool,
 }
 
@@ -82,10 +83,10 @@ impl SwapFcConfig {
             force_use_loop: config.get_bool("swapfc_force_use_loop"),
             directio: config.get_bool("swapfc_directio"),
             use_btrfs_compression: config.get_bool("swapfc_use_btrfs_compression"),
-            // Sparse files (thin provisioning) - enabled by default for all
-            // Disk space is only allocated when data is actually written (zswap writeback)
-            // Disable with swapfc_use_sparse_disable=1 to pre-allocate disk space
-            use_sparse: !config.get_bool("swapfc_use_sparse_disable"),
+            // Pre-allocated files (fallocate) are default for stability
+            // Sparse files (thin provisioning) can be enabled with swapfc_use_sparse=1
+            // but are less stable under memory pressure (can cause deadlocks)
+            use_sparse: config.get_bool("swapfc_use_sparse"),
         })
     }
 }
@@ -124,12 +125,14 @@ fn parse_size(s: &str) -> Result<u64> {
         .map_err(|_| SwapFcError::InvalidPath)
 }
 
-/// SwapFC manager (btrfs only)
+/// SwapFC manager - supports btrfs, ext4, and xfs
 pub struct SwapFc {
     config: SwapFcConfig,
     allocated: u32,
     block_size: u64,
     priority: i32,
+    /// True if path is on btrfs (for subvolume/nodatacow handling)
+    is_btrfs: bool,
 }
 
 impl SwapFc {
@@ -142,29 +145,54 @@ impl SwapFc {
         // Create parent directories
         makedirs(swapfc_config.path.parent().unwrap_or(Path::new("/")))?;
 
-        // Verify btrfs and setup subvolume
-        let is_subvolume = is_btrfs_subvolume(&swapfc_config.path);
+        // Detect filesystem type
+        let fstype = get_path_fstype(&swapfc_config.path);
+        let is_btrfs = fstype.as_deref() == Some("btrfs");
         
-        if !is_subvolume {
-            // Create btrfs subvolume
-            if swapfc_config.path.exists() {
-                warn!("swapFC: path exists but not a subvolume, removing...");
-                if swapfc_config.path.is_dir() {
-                    fs::remove_dir_all(&swapfc_config.path)?;
-                } else {
-                    fs::remove_file(&swapfc_config.path)?;
-                }
+        // Verify supported filesystem
+        match fstype.as_deref() {
+            Some("btrfs") | Some("ext4") | Some("xfs") => {},
+            Some(fs) => {
+                warn!("swapFC: unsupported filesystem '{}', swap files may not work correctly", fs);
+            },
+            None => {
+                warn!("swapFC: could not detect filesystem type");
             }
+        }
 
-            let status = Command::new("btrfs")
-                .args(["subvolume", "create"])
-                .arg(&swapfc_config.path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()?;
+        // Setup swap directory based on filesystem type
+        if is_btrfs {
+            // For btrfs: create subvolume with nodatacow for swap
+            let is_subvolume = is_btrfs_subvolume(&swapfc_config.path);
+            
+            if !is_subvolume {
+                if swapfc_config.path.exists() {
+                    warn!("swapFC: path exists but not a subvolume, removing...");
+                    if swapfc_config.path.is_dir() {
+                        fs::remove_dir_all(&swapfc_config.path)?;
+                    } else {
+                        fs::remove_file(&swapfc_config.path)?;
+                    }
+                }
 
-            if !status.success() {
-                return Err(SwapFcError::NotBtrfs);
+                let status = Command::new("btrfs")
+                    .args(["subvolume", "create"])
+                    .arg(&swapfc_config.path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?;
+
+                if !status.success() {
+                    return Err(SwapFcError::UnsupportedFs);
+                }
+                
+                info!("swapFC: created btrfs subvolume at {:?}", swapfc_config.path);
+            }
+        } else {
+            // For ext4/xfs: just create directory
+            if !swapfc_config.path.exists() {
+                fs::create_dir_all(&swapfc_config.path)?;
+                info!("swapFC: created swap directory at {:?}", swapfc_config.path);
             }
         }
 
@@ -178,6 +206,7 @@ impl SwapFc {
             allocated: 0,
             block_size,
             priority,
+            is_btrfs,
         })
     }
 
@@ -292,7 +321,8 @@ impl SwapFc {
         // Determine allocation mode:
         // - Sparse: use truncate, only allocate disk space when data is written
         // - Preallocated: use fallocate, reserve all disk space upfront
-        let use_compression = self.config.use_btrfs_compression;
+        // Note: btrfs compression mode only makes sense on btrfs
+        let use_compression = self.is_btrfs && self.config.use_btrfs_compression;
         let use_sparse = self.config.use_sparse || use_compression;
         
         // Sparse files require loop device for safe swap operation
@@ -308,7 +338,7 @@ impl SwapFc {
                 .arg(&swapfile_path)
                 .status()?;
             
-            if !use_compression {
+            if self.is_btrfs && !use_compression {
                 // Disable COW for btrfs when not using compression
                 // This improves performance for swap workloads
                 let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
@@ -316,8 +346,10 @@ impl SwapFc {
             // When using compression, do NOT set +C - we want compression!
         } else {
             // Preallocated mode: reserve all disk space upfront
-            // Disable COW for btrfs
-            let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
+            if self.is_btrfs {
+                // Disable COW for btrfs
+                let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
+            }
 
             // Allocate space with fallocate
             info!("swapFC: creating preallocated file");
@@ -444,4 +476,44 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Get the filesystem type of a given path
+fn get_path_fstype(path: &Path) -> Option<String> {
+    // Use parent if path doesn't exist
+    let check_path = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|p| p.exists() && *p != Path::new("/"))
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+
+    let output = Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "--target"])
+        .arg(&check_path)
+        .stdout(Stdio::piped())
+        .output()
+        .ok()?;
+
+    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    if fstype.is_empty() {
+        // Fallback to root filesystem
+        if check_path != PathBuf::from("/") {
+            Command::new("findmnt")
+                .args(["-n", "-o", "FSTYPE", "/"])
+                .stdout(Stdio::piped())
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let fs = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+                    if fs.is_empty() { None } else { Some(fs) }
+                })
+        } else {
+            None
+        }
+    } else {
+        Some(fstype)
+    }
 }

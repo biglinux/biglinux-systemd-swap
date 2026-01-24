@@ -4,12 +4,11 @@ Smart dynamic swap management for Linux, written in Rust.
 
 ## Features
 
-- **Auto-detection**: Automatically chooses optimal swap strategy for your filesystem
-- **Multi-filesystem**: Supports btrfs, ext4, and xfs for swap files
+- **Auto-detection**: Automatically chooses optimal swap strategy based on filesystem (btrfs/ext4/xfs)
 - **Zswap + SwapFC**: Compressed RAM cache with dynamic swap files
 - **Zram + SwapFC**: Alternative mode with zram as primary swap
 - **Zram writeback**: Move idle pages from zram to disk (kernel 5.4+)
-- **Fallback support**: Automatically falls back to zram-only if swap files fail
+- **Multi-filesystem**: Supports btrfs, ext4, and xfs
 - **Lightweight**: ~250 KB binary vs ~10 MB Python version
 
 ## Swap Modes
@@ -17,18 +16,19 @@ Smart dynamic swap management for Linux, written in Rust.
 | Mode | Description | Best For |
 |------|-------------|----------|
 | `auto` | Auto-detect: btrfs/ext4/xfs → zswap+swapfc, other → zram | Most users |
-| `zswap+swapfc` | Zswap cache + dynamic swap files | **Desktop** |
+| `zswap+swapfc` | Zswap cache + dynamic swap files | **Desktop (btrfs)** |
 | `zram+swapfc` | Zram primary + swap files overflow | Memory-constrained |
-| `zram` | Zram only (no disk swap) | Unsupported filesystems |
+| `zram` | Zram only (no disk swap) | Non-btrfs systems |
 | `manual` | Use explicit settings | Advanced users |
 
 ### How Each Mode Works
 
 **zswap + swapfc (default for btrfs/ext4/xfs)**:
 - Zswap compresses pages in RAM before writing to swap
-- SwapFC creates pre-allocated swap files (512MB each)
-- Disk space is only used when zswap pool is full
-- Best desktop performance with efficient disk usage
+- Shrinker moves cold pages to disk proactively, freeing RAM
+- SwapFC creates pre-allocated swap files with fallocate
+- Most data stays in RAM; disk is only used for cold pages
+- Best desktop performance with efficient memory usage
 
 **zram + swapfc**:
 - Zram creates compressed block device in RAM (highest priority)
@@ -113,13 +113,12 @@ swap_mode=auto
 
 ################################################################################
 # Zswap (used in zswap+swapfc mode)
-# Modern defaults for desktop Linux (kernel 6.x+)
 ################################################################################
-zswap_compressor=zstd            # lzo lz4 zstd lzo-rle lz4hc (zstd = best)
-zswap_max_pool_percent=45        # Max % of RAM for pool (20-50 typical)
-zswap_zpool=zsmalloc             # Memory allocator (default upstream)
-zswap_shrinker_enabled=1         # Evict cold pages to disk (default since 6.8)
-zswap_accept_threshold=90        # Accept threshold after pool full
+zswap_compressor=zstd            # lzo lz4 zstd lzo-rle lz4hc
+zswap_max_pool_percent=45        # Max % of RAM for pool
+zswap_zpool=zsmalloc             # Memory allocator
+zswap_shrinker_enabled=1         # Move cold pages to disk
+zswap_accept_threshold=80        # Accept threshold after pool full
 
 ################################################################################
 # Zram (used in zram modes)
@@ -142,10 +141,12 @@ swapfc_free_ram_perc=35          # Create when free RAM < this %
 swapfc_free_swap_perc=25         # Create more when free swap < this %
 swapfc_path=/swapfc/swapfile     # Path for swap files
 
-# Pre-allocated files (default) - more stable, no loop device needed
-swapfc_use_sparse=0              # 0=pre-allocate (default), 1=sparse
+# Sparse files (thin provisioning) - ENABLED BY DEFAULT
+# Swap files appear full size but only allocate disk space when written.
+# Ideal with zswap: pages stay in RAM, disk is only used on writeback.
+# swapfc_use_sparse_disable=1    # Uncomment to pre-allocate disk space
 
-# Btrfs compression mode (experimental) and need use loop device
+# Btrfs compression mode (experimental)
 swapfc_use_btrfs_compression=0   # Double compression: zswap + btrfs
 ```
 
@@ -173,21 +174,20 @@ zram_writeback_dev=/dev/sda5
 
 Requires kernel compiled with `CONFIG_ZRAM_WRITEBACK`.
 
-## File Allocation Mode
+## Sparse Files (Thin Provisioning)
 
-By default, swap files are **pre-allocated** using `fallocate`:
+By default, swap files are created as sparse files:
 
-- Files reserve 512M on disk immediately
-- More stable under memory pressure (no loop device needed)
-- Better for most desktop and server workloads
+- Files appear as 512M but start with 0 bytes on disk
+- Disk blocks are allocated only when data is actually written
+- With zswap, most pages stay compressed in RAM
+- Disk is only used when zswap pool is full (writeback)
 
-To use sparse files (thin provisioning) instead:
+To disable and pre-allocate all disk space:
 
 ```ini
-swapfc_use_sparse=1
+swapfc_use_sparse_disable=1
 ```
-
-Sparse mode creates files that only allocate disk space when written, but requires a loop device which can cause issues under extreme memory pressure.
 
 ## File Locations
 

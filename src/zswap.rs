@@ -97,12 +97,11 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
 
     // Get config values
     // Default to "1" because if start() is called, zswap should be enabled
-    // Defaults reflect modern best practices for desktop Linux (kernel 6.x+)
     let enabled = config.get("zswap_enabled").unwrap_or("1");
-    let compressor = config.get("zswap_compressor").unwrap_or("zstd");
-    let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("35");
-    let zpool = config.get("zswap_zpool").unwrap_or("zsmalloc");
-    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("1");
+    let compressor = config.get("zswap_compressor").unwrap_or("lzo");
+    let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("20");
+    let zpool = config.get("zswap_zpool").unwrap_or("zbud");
+    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("0");
     let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
 
     info!(
@@ -182,7 +181,7 @@ pub fn get_status() -> Option<ZswapStatus> {
         status.zpool = v.trim().to_string();
     }
     if let Ok(v) = read_file(params_dir.join("max_pool_percent")) {
-        status.max_pool_percent = v.trim().parse().unwrap_or(35);
+        status.max_pool_percent = v.trim().parse().unwrap_or(20);
     }
     if let Ok(v) = read_file(params_dir.join("shrinker_enabled")) {
         status.shrinker_enabled = v.trim() == "Y" || v.trim() == "1";
