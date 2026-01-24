@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 use clap::{Parser, Subcommand};
 
 use systemd_swap::config::{Config, WORK_DIR};
-use systemd_swap::helpers::{am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file};
+use systemd_swap::helpers::{
+    am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file,
+};
 use systemd_swap::meminfo::{get_mem_stats, get_page_size};
 use systemd_swap::swapfc::SwapFc;
 use systemd_swap::systemd::{notify_ready, notify_stopping, swapoff};
@@ -38,10 +40,10 @@ enum Commands {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SwapMode {
     Auto,
-    ZramSwapfc,   // zram + writeback to swap files (best for desktop!)
-    ZswapSwapfc,  // zswap + swap files (alternative)
-    ZramOnly,     // zram only (for non-btrfs)
-    Manual,       // Use explicit config values
+    ZramSwapfc,  // zram + writeback to swap files (legacy option)
+    ZswapSwapfc, // zswap + swap files (BEST for installed desktops: btrfs, ext4, xfs)
+    ZramOnly,    // zram only (for LiveCD or unsupported filesystems)
+    Manual,      // Use explicit config values
 }
 
 fn main() {
@@ -67,19 +69,33 @@ fn main() {
 }
 
 /// Detect filesystem type for a path
+/// Falls back to root filesystem if path doesn't exist yet
 fn get_path_fstype(path: &str) -> Option<String> {
-    // Check the parent directory or the path itself
-    let check_path = if Path::new(path).exists() {
-        path.to_string()
-    } else if let Some(parent) = Path::new(path).parent() {
-        parent.to_string_lossy().to_string()
+    // Build list of paths to check: path itself, parent, grandparent, ..., root
+    let mut check_path = None;
+    let mut current = Path::new(path);
+
+    // First check if the path itself exists
+    if current.exists() {
+        check_path = Some(path.to_string());
     } else {
-        "/".to_string()
-    };
+        // Walk up the directory tree to find an existing parent
+        while let Some(parent) = current.parent() {
+            if parent.exists() && parent.to_string_lossy() != "" {
+                check_path = Some(parent.to_string_lossy().to_string());
+                break;
+            }
+            current = parent;
+        }
+    }
+
+    // Fall back to root if nothing found
+    let check_path = check_path.unwrap_or_else(|| "/".to_string());
 
     let output = Command::new("df")
         .args(["--output=fstype", &check_path])
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
         .ok()?;
 
@@ -98,7 +114,12 @@ fn is_swapfc_supported(path: &str) -> bool {
 
 /// Parse swap_mode from config
 fn get_swap_mode(config: &Config) -> SwapMode {
-    match config.get("swap_mode").unwrap_or("auto").to_lowercase().as_str() {
+    match config
+        .get("swap_mode")
+        .unwrap_or("auto")
+        .to_lowercase()
+        .as_str()
+    {
         "zram+swapfc" | "zram_swapfc" => SwapMode::ZramSwapfc,
         "zswap+swapfc" | "zswap" => SwapMode::ZswapSwapfc,
         "zram" | "zram_only" => SwapMode::ZramOnly,
@@ -116,7 +137,7 @@ fn run_zram_only(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     notify_ready();
     info!("Zram setup complete (fallback mode)");
-    
+
     // Keep running to respond to signals
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -136,23 +157,34 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize directories
     makedirs(WORK_DIR)?;
-    makedirs(format!("{}/system/local-fs.target.wants", systemd_swap::config::RUN_SYSD))?;
-    makedirs(format!("{}/system/swap.target.wants", systemd_swap::config::RUN_SYSD))?;
+    makedirs(format!(
+        "{}/system/local-fs.target.wants",
+        systemd_swap::config::RUN_SYSD
+    ))?;
+    makedirs(format!(
+        "{}/system/swap.target.wants",
+        systemd_swap::config::RUN_SYSD
+    ))?;
 
     let config = Config::load()?;
     let swap_mode = get_swap_mode(&config);
 
     // Determine effective mode
+    // For installed systems (btrfs, ext4, xfs): use zswap + swapfc (best performance)
+    // For LiveCD or unsupported filesystems: use zram only
     let effective_mode = match swap_mode {
         SwapMode::Auto => {
             let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
             if is_swapfc_supported(swapfc_path) {
                 let fstype = get_path_fstype(swapfc_path).unwrap_or_default();
-                info!("Auto-detected {}: using zswap + swapfc", fstype);
+                info!("Auto-detected {} filesystem: using zswap + swapfc (best for installed systems)", fstype);
                 SwapMode::ZswapSwapfc
             } else {
                 let fstype = get_path_fstype(swapfc_path).unwrap_or_else(|| "unknown".to_string());
-                info!("Filesystem '{}' not supported for swap files: using zram only", fstype);
+                info!(
+                    "Filesystem '{}' not supported for swap files: using zram only (LiveCD mode)",
+                    fstype
+                );
                 SwapMode::ZramOnly
             }
         }
@@ -164,9 +196,9 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
     match effective_mode {
         SwapMode::ZramSwapfc => {
-            // Desktop-optimized mode: zram for speed + swapfc for overflow
-            // zram is faster than zswap because it's a dedicated block device
-            
+            // Legacy mode: zram for speed + swapfc for overflow
+            // Note: zswap+swapfc is now preferred for installed systems
+
             // Set up signal handler
             signal_hook::flag::register(
                 signal_hook::consts::SIGTERM,
@@ -206,7 +238,10 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     // swapfc failed but zram is already running - continue in zram-only mode
-                    warn!("swapFC: initialization failed: {} - continuing with zram-only", e);
+                    warn!(
+                        "swapFC: initialization failed: {} - continuing with zram-only",
+                        e
+                    );
                     notify_ready();
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -219,9 +254,10 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         SwapMode::ZswapSwapfc => {
-            // For zswap: create swap file FIRST, then enable zswap
-            // zswap needs a backing swap device to work
-            
+            // RECOMMENDED for installed desktops (btrfs, ext4, xfs)
+            // zswap compresses pages in RAM before writing to swap files
+            // Create swap file FIRST, then enable zswap (zswap needs backing swap)
+
             // Set up signal handler
             signal_hook::flag::register(
                 signal_hook::consts::SIGTERM,
@@ -256,20 +292,23 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    warn!("swapFC: initialization failed: {} - falling back to zram-only", e);
+                    warn!(
+                        "swapFC: initialization failed: {} - falling back to zram-only",
+                        e
+                    );
                     run_zram_only(&config)?;
                 }
             }
         }
 
         SwapMode::ZramOnly => {
-            // For zram: just set up zram, no swap files needed
+            // For LiveCD or unsupported filesystems: zram only, no swap files
             if let Err(e) = systemd_swap::zram::start(&config) {
                 error!("Zram: {}", e);
             }
             notify_ready();
             info!("Zram setup complete");
-            
+
             // Keep running to respond to signals
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
@@ -281,7 +320,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
         SwapMode::Manual => {
             // Legacy mode: use explicit config values
-            
+
             // Warn about incompatible configurations
             if config.get_bool("zram_enabled")
                 && (config.get_bool("zswap_enabled") || config.get_bool("swapfc_enabled"))
@@ -435,7 +474,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
             if usage.zswap_active {
                 let zswap_original = swap_used.saturating_sub(usage.swap_used_disk);
                 let zswap_compressed = usage.zswap_pool_bytes;
-                
+
                 let ratio = if zswap_original > 0 {
                     (zswap_compressed as f64 / zswap_original as f64) * 100.0
                 } else {
@@ -444,22 +483,30 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!();
                 println!("  === Pool Statistics ===");
-                println!("  pool_size: {:.1} MiB (compressed)", zswap_compressed as f64 / 1024.0 / 1024.0);
-                println!("  stored_data: {:.1} MiB (original)", zswap_original as f64 / 1024.0 / 1024.0);
+                println!(
+                    "  pool_size: {:.1} MiB (compressed)",
+                    zswap_compressed as f64 / 1024.0 / 1024.0
+                );
+                println!(
+                    "  stored_data: {:.1} MiB (original)",
+                    zswap_original as f64 / 1024.0 / 1024.0
+                );
                 println!("  pool_utilization: {}%", usage.zswap_pool_percent);
                 println!("  compress_ratio: {:.0}%", ratio);
 
                 // If running as root, show additional debugfs stats
                 if is_root && (zswap.stored_pages > 0 || zswap.written_back_pages > 0) {
                     let page_size = get_page_size();
-                    
+
                     println!();
                     println!("  === Writeback Statistics (debugfs) ===");
                     println!("  stored_pages: {}", zswap.stored_pages);
                     println!("  same_filled_pages: {}", zswap.same_filled_pages);
-                    println!("  written_back_pages: {} ({:.1} MiB)", 
-                             zswap.written_back_pages, 
-                             (zswap.written_back_pages * page_size) as f64 / 1024.0 / 1024.0);
+                    println!(
+                        "  written_back_pages: {} ({:.1} MiB)",
+                        zswap.written_back_pages,
+                        (zswap.written_back_pages * page_size) as f64 / 1024.0 / 1024.0
+                    );
                     println!("  pool_limit_hit: {}", zswap.pool_limit_hit);
                     println!("  reject_reclaim_fail: {}", zswap.reject_reclaim_fail);
                 }
@@ -468,9 +515,18 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
                 if swap_used > 0 {
                     println!();
                     println!("  === Effective Swap Usage ===");
-                    println!("  kernel_reported_used: {:.1} MiB", swap_used as f64 / 1024.0 / 1024.0);
-                    println!("  in_zswap_pool (RAM): {:.1} MiB", zswap_original as f64 / 1024.0 / 1024.0);
-                    println!("  actual_disk_used: {:.1} MiB", usage.swap_used_disk as f64 / 1024.0 / 1024.0);
+                    println!(
+                        "  kernel_reported_used: {:.1} MiB",
+                        swap_used as f64 / 1024.0 / 1024.0
+                    );
+                    println!(
+                        "  in_zswap_pool (RAM): {:.1} MiB",
+                        zswap_original as f64 / 1024.0 / 1024.0
+                    );
+                    println!(
+                        "  actual_disk_used: {:.1} MiB",
+                        usage.swap_used_disk as f64 / 1024.0 / 1024.0
+                    );
                     let percent_in_ram = (zswap_original as f64 / swap_used as f64) * 100.0;
                     println!("  swap_in_ram: {:.0}%", percent_in_ram);
                 }
@@ -479,9 +535,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Zram status
-    let zramctl_output = Command::new("zramctl")
-        .stdout(Stdio::piped())
-        .output();
+    let zramctl_output = Command::new("zramctl").stdout(Stdio::piped()).output();
 
     if let Ok(output) = zramctl_output {
         let output_str = String::from_utf8_lossy(&output.stdout);
@@ -489,7 +543,10 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nZram:");
             for line in output_str.lines() {
                 if line.starts_with("NAME") || line.contains("[SWAP]") {
-                    let line = line.trim_end_matches("[SWAP]").trim_end_matches("MOUNTPOINT").trim();
+                    let line = line
+                        .trim_end_matches("[SWAP]")
+                        .trim_end_matches("MOUNTPOINT")
+                        .trim();
                     println!("  {}", line);
                 }
             }
@@ -513,4 +570,3 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
