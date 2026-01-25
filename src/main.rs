@@ -7,8 +7,11 @@ use std::process::{Command, Stdio};
 
 use clap::{Parser, Subcommand};
 
+use systemd_swap::autoconfig::{RecommendedConfig, SystemCapabilities};
 use systemd_swap::config::{Config, WORK_DIR};
-use systemd_swap::helpers::{am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file};
+use systemd_swap::helpers::{
+    am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file,
+};
 use systemd_swap::meminfo::{get_mem_stats, get_page_size};
 use systemd_swap::swapfc::SwapFc;
 use systemd_swap::systemd::{notify_ready, notify_stopping, swapoff};
@@ -32,6 +35,8 @@ enum Commands {
     Stop,
     /// Show swap status information
     Status,
+    /// Show recommended configuration for this system
+    Autoconfig,
 }
 
 /// Swap strategy based on filesystem detection
@@ -51,6 +56,7 @@ fn main() {
         Some(Commands::Start) => start(),
         Some(Commands::Stop) => stop(false),
         Some(Commands::Status) => status(),
+        Some(Commands::Autoconfig) => autoconfig(),
         None => {
             // No subcommand provided, show help
             use clap::CommandFactory;
@@ -66,55 +72,7 @@ fn main() {
     }
 }
 
-/// Filesystems that support swap files well (zswap + swapfc mode)
-const SWAPFILE_SUPPORTED_FS: &[&str] = &["btrfs", "ext4", "xfs"];
 
-/// Get the filesystem type of the root partition
-fn get_root_fstype() -> Option<String> {
-    let output = Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "/"])
-        .stdout(Stdio::piped())
-        .output()
-        .ok()?;
-
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-    if fstype.is_empty() { None } else { Some(fstype) }
-}
-
-/// Get the filesystem type of a given path
-fn get_path_fstype(path: &str) -> Option<String> {
-    // Use parent if path doesn't exist
-    let check_path = if Path::new(path).exists() {
-        path.to_string()
-    } else {
-        Path::new(path).parent()
-            .filter(|p| p.exists() && *p != Path::new("/"))
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string())
-    };
-
-    let output = Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "--target", &check_path])
-        .stdout(Stdio::piped())
-        .output()
-        .ok()?;
-
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-    if fstype.is_empty() {
-        // Fallback to root filesystem
-        if check_path != "/" { get_root_fstype() } else { None }
-    } else {
-        Some(fstype)
-    }
-}
-
-/// Check if a filesystem supports swap files (btrfs, ext4, xfs)
-fn supports_swapfiles(fstype: &Option<String>) -> bool {
-    match fstype {
-        Some(fs) => SWAPFILE_SUPPORTED_FS.contains(&fs.as_str()),
-        None => false,
-    }
-}
 
 /// Parse swap_mode from config
 fn get_swap_mode(config: &Config) -> SwapMode {
@@ -159,7 +117,7 @@ fn configure_mglru(config: &Config) {
     
     // Get configured value (0 = disabled, default kernel behavior)
     let min_ttl_ms: u32 = config.get_opt("mglru_min_ttl_ms")
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     
     if min_ttl_ms == 0 {
@@ -185,7 +143,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     makedirs(format!("{}/system/local-fs.target.wants", systemd_swap::config::RUN_SYSD))?;
     makedirs(format!("{}/system/swap.target.wants", systemd_swap::config::RUN_SYSD))?;
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     let swap_mode = get_swap_mode(&config);
     
     // Configure MGLRU early (protects working set during swap operations)
@@ -194,18 +152,15 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     // Determine effective mode based on filesystem type
     let effective_mode = match swap_mode {
         SwapMode::Auto => {
-            let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
-            let path_fs = get_path_fstype(swapfc_path);
-            let root_fs = get_root_fstype();
+            let caps = SystemCapabilities::detect();
+            let recommended = RecommendedConfig::from_capabilities(&caps);
+            config.apply_autoconfig(&recommended);
             
-            // Use zswap+swapfc for filesystems that support swap files well
-            if supports_swapfiles(&path_fs) || supports_swapfiles(&root_fs) {
-                let detected_fs = path_fs.or(root_fs).unwrap_or_else(|| "unknown".to_string());
-                info!("Auto-detected {}: using zswap + swapfc", detected_fs);
+            if recommended.use_zswap {
+                info!("Auto-detected: using zswap + swapfc");
                 SwapMode::ZswapSwapfc
             } else {
-                let detected_fs = root_fs.unwrap_or_else(|| "unknown".to_string());
-                info!("Auto-detected {}: using zram only (no swapfile support)", detected_fs);
+                info!("Auto-detected: using zram only");
                 SwapMode::ZramOnly
             }
         }
@@ -238,6 +193,19 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Zram: {}", e);
             }
 
+            // Start smart writeback manager if writeback is enabled
+            if config.get_bool("zram_writeback") {
+                let wb_config = systemd_swap::zram::ZramWritebackConfig::from_config(&config);
+                let mut wb_manager = systemd_swap::zram::ZramWritebackManager::new(wb_config);
+                
+                // Run writeback manager in background thread
+                std::thread::spawn(move || {
+                    if let Err(e) = wb_manager.run() {
+                        warn!("Zram writeback manager error: {}", e);
+                    }
+                });
+            }
+
             // Create swapfc for overflow/writeback (lower priority)
             info!("Setting up swapfc as secondary swap for overflow...");
             let mut swapfc = SwapFc::new(&config)?;
@@ -263,7 +231,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
             // Create initial swap file and start monitoring
-            let mut swapfc = SwapFc::new(&config)?;
+            // Use zswap_mode=true to enable sparse files by default (disk efficiency!)
+            let mut swapfc = SwapFc::new_with_mode(&config, true)?;
             
             // Force create first swap chunk immediately (zswap needs backing swap)
             info!("Creating initial swap file for zswap backing...");
@@ -288,17 +257,37 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             // Disable zswap when using zram (per kernel documentation)
             disable_zswap_for_zram();
             
+            // Set up signal handler for clean shutdown
+            signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            ctrlc::set_handler(move || {
+                request_shutdown();
+            })?;
+            
             if let Err(e) = systemd_swap::zram::start(&config) {
                 error!("Zram: {}", e);
             }
             notify_ready();
             info!("Zram setup complete");
             
-            // Keep running to respond to signals
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                if systemd_swap::is_shutdown() {
-                    break;
+            // If writeback is enabled, run the smart writeback manager
+            if config.get_bool("zram_writeback") {
+                let wb_config = systemd_swap::zram::ZramWritebackConfig::from_config(&config);
+                let mut wb_manager = systemd_swap::zram::ZramWritebackManager::new(wb_config);
+                
+                // This blocks and monitors zram writeback
+                if let Err(e) = wb_manager.run() {
+                    warn!("Zram writeback manager error: {}", e);
+                }
+            } else {
+                // Keep running to respond to signals
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    if systemd_swap::is_shutdown() {
+                        break;
+                    }
                 }
             }
         }
@@ -535,6 +524,29 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+/// Show recommended configuration based on system hardware
+fn autoconfig() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Detecting system capabilities...\n");
+    
+    let caps = SystemCapabilities::detect();
+    let recommended = RecommendedConfig::from_capabilities(&caps);
+    
+    println!("=== System Information ===");
+    println!("Swap path filesystem: {:?}", caps.swap_path_fstype);
+    
+    println!("\n=== Recommended Configuration ===");
+    
+    if recommended.use_zswap {
+        println!("Mode: zswap + swapfc (best for desktop with supported filesystem)");
+    } else {
+        println!("Mode: zram only (fallback for unsupported filesystem)");
+    }
+    
+    println!("\nNOTE: Specific parameters (compressor, sizes, etc.) are controlled via /etc/systemd/swap.conf");
+    
     Ok(())
 }
 
