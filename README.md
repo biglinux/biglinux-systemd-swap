@@ -13,7 +13,7 @@ Smart dynamic swap management for Linux, written in Rust.
 
 ## Installation
 
-### Arch Linux / BigLinux
+### Arch Linux / BigLinux / Manjaro...
 ```bash
 cd pkgbuild
 makepkg -si
