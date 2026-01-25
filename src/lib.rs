@@ -1,6 +1,7 @@
 // systemd-swap - Dynamic swap management for Linux
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod autoconfig;
 pub mod config;
 pub mod helpers;
 pub mod meminfo;

@@ -97,6 +97,21 @@ impl Config {
         Ok(Self { values })
     }
 
+    /// Apply optimized values from autoconfig (only if not explicitly set)
+    /// This allows hardware-based auto-tuning while respecting user overrides
+    /// Apply optimized values from autoconfig
+    /// Currently this only logs the detection result, as specific parameters are static
+    pub fn apply_autoconfig(&mut self, _recommended: &crate::autoconfig::RecommendedConfig) {
+        // We no longer override specific parameters dynamically.
+        // The mode selection happens in main.rs based on recommendations.
+        debug!("Autoconfig applied (mode selection only)");
+    }
+
+    /// Check if a key has been explicitly set (vs default)
+    pub fn has_explicit(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
     /// Parse a single config file
     fn parse_config<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>> {
         let mut config = HashMap::new();

@@ -11,7 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::{Config, WORK_DIR};
-use crate::helpers::{force_remove, makedirs, run_cmd_output};
+use crate::helpers::{force_remove, get_fstype, makedirs, run_cmd_output};
 use crate::meminfo::{get_free_ram_percent, get_free_swap_percent};
 use crate::systemd::{gen_swap_unit, notify_ready, notify_status, systemctl};
 use crate::{info, is_shutdown, warn};
@@ -38,6 +38,8 @@ pub type Result<T> = std::result::Result<T, SwapFcError>;
 #[derive(Debug)]
 pub struct SwapFcConfig {
     pub path: PathBuf,
+    /// Base chunk size (initial allocation size)
+    /// With progressive scaling, this is the starting size that doubles every N files
     pub chunk_size: u64,
     pub max_count: u32,
     pub min_count: u32,
@@ -47,28 +49,84 @@ pub struct SwapFcConfig {
     pub frequency: u64,
     pub priority: i32,
     pub force_use_loop: bool,
-    pub directio: bool,
+    /// Force disable direct I/O (direct I/O is now ON by default for preallocated files)
+    pub directio_disable: bool,
     pub use_btrfs_compression: bool,
-    /// Use sparse files (thin provisioning) - opt-in, NOT default
-    /// Pre-allocated files with fallocate are more stable under memory pressure
+    /// Use sparse files (thin provisioning)
+    /// With zswap, sparse files are ideal: disk space is only used when zswap writes back.
+    /// The swapfc_use_sparse_disable=1 option can force pre-allocation if needed.
     pub use_sparse: bool,
+    /// Whether we're running in zswap mode (affects sparse file defaults)
+    pub zswap_mode: bool,
+    /// Enable progressive chunk scaling (doubles every 4 files)
+    /// This allows efficient use of the 28-32 file limit:
+    /// - Files 1-4: base_size (e.g., 512MB)
+    /// - Files 5-8: 2x base_size (1GB)
+    /// - Files 9-12: 4x base_size (2GB)
+    /// - Files 13-16: 8x base_size (4GB)
+    /// - etc.
+    pub progressive_scaling: bool,
+    /// How many files to create before doubling the size
+    pub scaling_step: u32,
+    /// Maximum chunk size (cap for progressive scaling)
+    pub max_chunk_size: u64,
 }
 
 impl SwapFcConfig {
+    /// Create config from parsed Config file
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with_mode(config, false)
+    }
+
+    /// Create config with explicit zswap mode
+    /// When zswap_mode is true, sparse files are enabled by default for disk efficiency
+    pub fn from_config_with_mode(config: &Config, zswap_mode: bool) -> Result<Self> {
         let path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
         let path = PathBuf::from(path.trim_end_matches('/'));
 
         // Parse chunk size (e.g., "512M")
-        let chunk_size_str = config.get("swapfc_chunk_size").unwrap_or("512M");
+        let chunk_size_str = config.get("swapfc_chunk_size").unwrap_or("256M");
         let chunk_size = parse_size(chunk_size_str)?;
 
-        let max_count: u32 = config.get_as("swapfc_max_count").unwrap_or(32);
-        let max_count = max_count.clamp(1, 32);
+        let max_count: u32 = config.get_as("swapfc_max_count").unwrap_or(28);
+        let max_count = max_count.clamp(1, 28);  // Practical limit is ~28 files
 
         let min_count: u32 = config.get_as("swapfc_min_count").unwrap_or(0);
         let frequency: u64 = config.get_as("swapfc_frequency").unwrap_or(1);
         let frequency = frequency.clamp(1, 86400);
+
+        // Sparse files decision:
+        // - Default is sparse when using zswap mode (most data stays in RAM)
+        // - User can force pre-allocation with swapfc_use_sparse_disable=1 or swapfc_preallocate=1
+        // - User can force sparse with swapfc_use_sparse=1 (overrides zswap_mode default)
+        let user_force_sparse = config.get_bool("swapfc_use_sparse");
+        let user_force_preallocate = config.get_bool("swapfc_use_sparse_disable")
+            || config.get_bool("swapfc_preallocate");
+        
+        let use_sparse = if user_force_preallocate {
+            false  // User explicitly wants pre-allocation
+        } else if user_force_sparse {
+            true   // User explicitly wants sparse
+        } else {
+            zswap_mode  // Default: sparse when using zswap for disk efficiency
+        };
+
+        // Progressive scaling: enabled by default for efficient use of file limit
+        // With 28 max files and 4-file steps:
+        // Files 1-4: 512MB = 2GB total
+        // Files 5-8: 1GB = 4GB total (6GB cumulative)
+        // Files 9-12: 2GB = 8GB total (14GB cumulative)
+        // Files 13-16: 4GB = 16GB total (30GB cumulative)
+        // Files 17-20: 8GB = 32GB total (62GB cumulative)
+        // Files 21-24: 16GB = 64GB total (126GB cumulative)
+        // Files 25-28: 32GB = 128GB total (254GB cumulative)
+        let progressive_scaling = !config.get_bool("swapfc_progressive_disable");
+        let scaling_step: u32 = config.get_as("swapfc_scaling_step").unwrap_or(4);
+        let scaling_step = scaling_step.clamp(2, 8);
+        
+        // Maximum chunk size: 32GB default, or user-specified
+        let max_chunk_size_str = config.get("swapfc_max_chunk_size").unwrap_or("32G");
+        let max_chunk_size = parse_size(max_chunk_size_str).unwrap_or(32 * 1024 * 1024 * 1024);
 
         Ok(Self {
             path,
@@ -81,12 +139,13 @@ impl SwapFcConfig {
             frequency,
             priority: config.get_as("swapfc_priority").unwrap_or(50),
             force_use_loop: config.get_bool("swapfc_force_use_loop"),
-            directio: config.get_bool("swapfc_directio"),
+            directio_disable: config.get_bool("swapfc_directio_disable"),
             use_btrfs_compression: config.get_bool("swapfc_use_btrfs_compression"),
-            // Pre-allocated files (fallocate) are default for stability
-            // Sparse files (thin provisioning) can be enabled with swapfc_use_sparse=1
-            // but are less stable under memory pressure (can cause deadlocks)
-            use_sparse: config.get_bool("swapfc_use_sparse"),
+            use_sparse,
+            zswap_mode,
+            progressive_scaling,
+            scaling_step,
+            max_chunk_size,
         })
     }
 }
@@ -133,12 +192,32 @@ pub struct SwapFc {
     priority: i32,
     /// True if path is on btrfs (for subvolume/nodatacow handling)
     is_btrfs: bool,
+    /// Track the size of each allocated file (for proper cleanup and stats)
+    file_sizes: Vec<u64>,
 }
 
 impl SwapFc {
-    /// Create new SwapFC manager
+    /// Create new SwapFC manager (defaults to non-zswap mode for backwards compatibility)
     pub fn new(config: &Config) -> Result<Self> {
-        let swapfc_config = SwapFcConfig::from_config(config)?;
+        Self::new_with_mode(config, false)
+    }
+
+    /// Create new SwapFC manager with explicit zswap mode
+    /// When zswap_mode is true, sparse files are used by default for disk efficiency
+    pub fn new_with_mode(config: &Config, zswap_mode: bool) -> Result<Self> {
+        let swapfc_config = SwapFcConfig::from_config_with_mode(config, zswap_mode)?;
+
+        if zswap_mode && swapfc_config.use_sparse {
+            info!("swapFC: zswap mode - using sparse files (thin provisioning)");
+            info!("swapFC: disk space only used when zswap writes back cold pages");
+        }
+
+        if swapfc_config.progressive_scaling {
+            info!("swapFC: progressive scaling enabled (step={})", swapfc_config.scaling_step);
+            info!("swapFC: base={}MB, max={}GB", 
+                swapfc_config.chunk_size / (1024 * 1024),
+                swapfc_config.max_chunk_size / (1024 * 1024 * 1024));
+        }
 
         notify_status("Monitoring memory status...");
 
@@ -146,7 +225,7 @@ impl SwapFc {
         makedirs(swapfc_config.path.parent().unwrap_or(Path::new("/")))?;
 
         // Detect filesystem type
-        let fstype = get_path_fstype(&swapfc_config.path);
+        let fstype = get_fstype(&swapfc_config.path);
         let is_btrfs = fstype.as_deref() == Some("btrfs");
         
         // Verify supported filesystem
@@ -207,7 +286,85 @@ impl SwapFc {
             block_size,
             priority,
             is_btrfs,
+            file_sizes: Vec::new(),
         })
+    }
+
+    /// Calculate the chunk size for a given file number using progressive scaling
+    /// 
+    /// With scaling_step=4 and base_size=512MB:
+    /// - Files 1-4: 512MB each (tier 0)
+    /// - Files 5-8: 1GB each (tier 1)
+    /// - Files 9-12: 2GB each (tier 2)
+    /// - Files 13-16: 4GB each (tier 3)
+    /// - Files 17-20: 8GB each (tier 4)
+    /// - Files 21-24: 16GB each (tier 5)
+    /// - Files 25-28: 32GB each (tier 6)
+    /// 
+    /// This allows up to 254GB of swap with only 28 files!
+    fn get_chunk_size_for_file(&self, file_num: u32) -> u64 {
+        if !self.config.progressive_scaling {
+            return self.config.chunk_size;
+        }
+
+        // Calculate tier: (file_num - 1) / scaling_step
+        // file_num is 1-based, so file 1-4 = tier 0, 5-8 = tier 1, etc.
+        let tier = (file_num.saturating_sub(1)) / self.config.scaling_step;
+        
+        // Size = base_size * 2^tier, capped at max_chunk_size
+        let size = self.config.chunk_size.saturating_mul(1u64 << tier);
+        
+        size.min(self.config.max_chunk_size)
+    }
+
+    /// Get total configured swap capacity (virtual, with progressive scaling)
+    pub fn total_capacity(&self) -> u64 {
+        (1..=self.config.max_count)
+            .map(|n| self.get_chunk_size_for_file(n))
+            .sum()
+    }
+
+    /// Get currently allocated swap size
+    pub fn allocated_size(&self) -> u64 {
+        self.file_sizes.iter().sum()
+    }
+
+    /// Print scaling plan for debugging
+    pub fn print_scaling_plan(&self) {
+        if !self.config.progressive_scaling {
+            info!("swapFC: fixed chunk size {}MB x {} = {}GB total",
+                self.config.chunk_size / (1024 * 1024),
+                self.config.max_count,
+                (self.config.chunk_size * self.config.max_count as u64) / (1024 * 1024 * 1024));
+            return;
+        }
+
+        info!("swapFC: Progressive scaling plan:");
+        let mut cumulative: u64 = 0;
+        let mut current_tier = 0u32;
+        let mut tier_start = 1u32;
+
+        for file_num in 1..=self.config.max_count {
+            let size = self.get_chunk_size_for_file(file_num);
+            cumulative += size;
+            
+            let tier = (file_num.saturating_sub(1)) / self.config.scaling_step;
+            if tier != current_tier || file_num == self.config.max_count {
+                let tier_end = if tier != current_tier { file_num - 1 } else { file_num };
+                let tier_size = self.get_chunk_size_for_file(tier_start);
+                info!("  Files {}-{}: {}MB each, cumulative: {}GB",
+                    tier_start, tier_end,
+                    tier_size / (1024 * 1024),
+                    cumulative / (1024 * 1024 * 1024));
+                
+                current_tier = tier;
+                tier_start = file_num;
+            }
+        }
+        
+        info!("swapFC: Total potential capacity: {}GB with {} files",
+            self.total_capacity() / (1024 * 1024 * 1024),
+            self.config.max_count);
     }
 
     /// Create initial swap file (needed for zswap backing)
@@ -284,24 +441,31 @@ impl SwapFc {
         }
     }
 
-    fn has_enough_space(&self) -> bool {
+    fn has_enough_space(&self, required_size: u64) -> bool {
         if let Ok(stat) = nix::sys::statvfs::statvfs(&self.config.path) {
             let free_bytes = stat.blocks_available() as u64 * self.block_size;
-            free_bytes >= self.config.chunk_size * 2
+            // Need at least 2x the required size (safety margin)
+            free_bytes >= required_size * 2
         } else {
             false
         }
     }
 
     fn create_swapfile(&mut self) -> Result<()> {
-        if !self.has_enough_space() {
-            warn!("swapFC: ENOSPC");
+        // Calculate size for the next file using progressive scaling
+        let next_file_num = self.allocated + 1;
+        let chunk_size = self.get_chunk_size_for_file(next_file_num);
+        
+        if !self.has_enough_space(chunk_size) {
+            warn!("swapFC: ENOSPC (need {}MB)", chunk_size / (1024 * 1024));
             notify_status("Not enough space");
             return Err(SwapFcError::NoSpace);
         }
 
-        notify_status("Allocating swap file...");
+        notify_status(&format!("Allocating swap file #{} ({}MB)...", 
+            next_file_num, chunk_size / (1024 * 1024)));
         self.allocated += 1;
+        self.file_sizes.push(chunk_size);
 
         let swapfile_path = self.config.path.join(self.allocated.to_string());
 
@@ -332,9 +496,10 @@ impl SwapFc {
         if use_sparse {
             // Create sparse file (thin provisioning)
             // Disk space is only allocated when zswap/kernel actually writes data
-            info!("swapFC: creating sparse file (thin provisioning)");
+            info!("swapFC: creating sparse file #{} ({}MB, thin provisioning)", 
+                self.allocated, chunk_size / (1024 * 1024));
             Command::new("truncate")
-                .args(["--size", &self.config.chunk_size.to_string()])
+                .args(["--size", &chunk_size.to_string()])
                 .arg(&swapfile_path)
                 .status()?;
             
@@ -352,17 +517,20 @@ impl SwapFc {
             }
 
             // Allocate space with fallocate
-            info!("swapFC: creating preallocated file");
+            info!("swapFC: creating preallocated file #{} ({}MB)",
+                self.allocated, chunk_size / (1024 * 1024));
             Command::new("fallocate")
-                .args(["-l", &self.config.chunk_size.to_string()])
+                .args(["-l", &chunk_size.to_string()])
                 .arg(&swapfile_path)
                 .status()?;
         }
 
         let (swapfile, loop_device) = if use_loop {
             // Create loop device
-            // For sparse files, disable direct-io to allow proper thin provisioning
-            let directio = if self.config.directio && !use_sparse { "on" } else { "off" };
+            // Direct I/O: enabled by default for preallocated files (avoids double caching)
+            // Disabled for sparse files as it can interfere with thin provisioning
+            // User can force disable with swapfc_directio_disable=1
+            let directio = if use_sparse || self.config.directio_disable { "off" } else { "on" };
             let loop_dev = run_cmd_output(&[
                 "losetup", "-f", "--show",
                 &format!("--direct-io={}", directio),
@@ -407,7 +575,9 @@ impl SwapFc {
     }
 
     fn destroy_swapfile(&mut self) -> Result<()> {
-        notify_status("Deallocating swap file...");
+        let freed_size = self.file_sizes.pop().unwrap_or(0);
+        notify_status(&format!("Deallocating swap file #{} ({}MB)...", 
+            self.allocated, freed_size / (1024 * 1024)));
 
         let tag = format!("swapfc_{}", self.allocated);
 
@@ -457,6 +627,10 @@ impl SwapFc {
         }
 
         self.allocated -= 1;
+        info!("swapFC: freed {}MB, now {} files ({:.1}GB total)",
+            freed_size / (1024 * 1024),
+            self.allocated,
+            self.allocated_size() as f64 / (1024.0 * 1024.0 * 1024.0));
         notify_status("Monitoring memory status...");
         Ok(())
     }
@@ -478,42 +652,4 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Get the filesystem type of a given path
-fn get_path_fstype(path: &Path) -> Option<String> {
-    // Use parent if path doesn't exist
-    let check_path = if path.exists() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .filter(|p| p.exists() && *p != Path::new("/"))
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/"))
-    };
 
-    let output = Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "--target"])
-        .arg(&check_path)
-        .stdout(Stdio::piped())
-        .output()
-        .ok()?;
-
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-    if fstype.is_empty() {
-        // Fallback to root filesystem
-        if check_path != PathBuf::from("/") {
-            Command::new("findmnt")
-                .args(["-n", "-o", "FSTYPE", "/"])
-                .stdout(Stdio::piped())
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let fs = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
-                    if fs.is_empty() { None } else { Some(fs) }
-                })
-        } else {
-            None
-        }
-    } else {
-        Some(fstype)
-    }
-}

@@ -153,6 +153,7 @@ pub fn find_swap_units() -> Vec<String> {
     units
 }
 
+
 /// Get What= value from swap unit file
 pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
     let content = read_file(path).ok()?;
@@ -163,6 +164,51 @@ pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
     }
     None
 }
+
+/// Get the filesystem type of a given path
+pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
+    let path = path.as_ref();
+    // Use parent if path doesn't exist
+    let check_path = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|p| p.exists() && *p != Path::new("/"))
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| Path::new("/").to_path_buf())
+    };
+
+    let output = Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "--target", &check_path.to_string_lossy()])
+        .stdout(Stdio::piped())
+        .output()
+        .ok()?;
+
+    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    if fstype.is_empty() {
+        // Fallback to root filesystem
+        if check_path != Path::new("/") {
+            get_fstype("/")
+        } else {
+            None
+        }
+    } else {
+        Some(fstype)
+    }
+}
+
+/// Filesystems that support swap files well
+pub const SWAPFILE_SUPPORTED_FS: &[&str] = &["btrfs", "ext4", "xfs"];
+
+/// Check if a filesystem supports swap files
+pub fn supports_swapfiles(fstype: &Option<String>) -> bool {
+    match fstype {
+        Some(fs) => SWAPFILE_SUPPORTED_FS.contains(&fs.as_str()),
+        None => false,
+    }
+}
+
+
 
 // Logging macros
 #[macro_export]
