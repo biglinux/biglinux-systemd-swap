@@ -98,10 +98,10 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     // Get config values
     // Default to "1" because if start() is called, zswap should be enabled
     let enabled = config.get("zswap_enabled").unwrap_or("1");
-    let compressor = config.get("zswap_compressor").unwrap_or("zstd");
-    let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("20");
-    let zpool = config.get("zswap_zpool").unwrap_or("zbud");
-    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("0");
+    let compressor = config.get("zswap_compressor").unwrap_or("lz4");  // LZ4 for speed
+    let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("50");  // Unified 50%
+    let zpool = config.get("zswap_zpool").unwrap_or("zsmalloc");  // zsmalloc (z3fold removed in newer kernels)
+    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("1");  // Enable shrinker
     let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
 
     info!(

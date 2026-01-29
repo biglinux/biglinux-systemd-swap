@@ -177,8 +177,6 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_parse_simple_config() {
         // This would need a temp file for proper testing
