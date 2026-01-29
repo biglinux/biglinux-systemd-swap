@@ -13,7 +13,7 @@ use systemd_swap::helpers::{
     am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file,
 };
 use systemd_swap::meminfo::{get_mem_stats, get_page_size};
-use systemd_swap::swapfc::SwapFc;
+use systemd_swap::swapfile::SwapFile;
 use systemd_swap::systemd::{notify_ready, notify_stopping, swapoff};
 use systemd_swap::zswap::ZswapBackup;
 use systemd_swap::{error, info, request_shutdown, warn};
@@ -46,7 +46,7 @@ enum SwapMode {
     ZramSwapfc,   // zram + writeback to swap files (best for desktop!)
     ZswapSwapfc,  // zswap + swap files (alternative)
     ZramOnly,     // zram only (for non-btrfs)
-    Manual,       // Use explicit config values
+    Disabled,     // Swap management disabled (service exits cleanly)
 }
 
 fn main() {
@@ -78,9 +78,10 @@ fn main() {
 fn get_swap_mode(config: &Config) -> SwapMode {
     match config.get("swap_mode").unwrap_or("auto").to_lowercase().as_str() {
         "zram+swapfc" | "zram_swapfc" => SwapMode::ZramSwapfc,
-        "zswap+swapfc" | "zswap" => SwapMode::ZswapSwapfc,
+        "zswap+swapfc" | "zswap" | "zswap+swapfile" => SwapMode::ZswapSwapfc,
         "zram" | "zram_only" => SwapMode::ZramOnly,
-        "manual" => SwapMode::Manual,
+        "zram+swapfile" => SwapMode::ZramSwapfc,
+        "disabled" => SwapMode::Disabled,
         _ => SwapMode::Auto,
     }
 }
@@ -218,7 +219,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 
             // Create swapfc for overflow/writeback (lower priority)
             info!("Setting up swapfc as secondary swap for overflow...");
-            let mut swapfc = SwapFc::new(&config)?;
+            let mut swapfc = SwapFile::new(&config)?;
             
             // Create initial swap file
             swapfc.create_initial_swap()?;
@@ -241,8 +242,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
             // Create initial swap file and start monitoring
-            // Use zswap_mode=true to enable sparse files by default (disk efficiency!)
-            let mut swapfc = SwapFc::new_with_mode(&config, true)?;
+            let mut swapfc = SwapFile::new(&config)?;
             
             // Force create first swap chunk immediately (zswap needs backing swap)
             info!("Creating initial swap file for zswap backing...");
@@ -302,50 +302,11 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        SwapMode::Manual => {
-            // Legacy mode: use explicit config values
-            
-            // Warn about incompatible configurations
-            if config.get_bool("zram_enabled")
-                && (config.get_bool("zswap_enabled") || config.get_bool("swapfc_enabled"))
-            {
-                warn!("Combining zram with zswap/swapfc can lead to LRU inversion");
-            }
-
-            // Start zswap if enabled
-            if config.get_bool("zswap_enabled") {
-                match systemd_swap::zswap::start(&config) {
-                    Ok(backup) => {
-                        zswap_backup = Some(backup);
-                        save_zswap_backup(&zswap_backup)?;
-                    }
-                    Err(e) => error!("Zswap: {}", e),
-                }
-            }
-
-            // Start zram if enabled
-            if config.get_bool("zram_enabled") {
-                if let Err(e) = systemd_swap::zram::start(&config) {
-                    error!("Zram: {}", e);
-                }
-            }
-
-            // Start swapfc if enabled
-            if config.get_bool("swapfc_enabled") {
-                signal_hook::flag::register(
-                    signal_hook::consts::SIGTERM,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                )?;
-                ctrlc::set_handler(move || {
-                    request_shutdown();
-                })?;
-
-                let mut swapfc = SwapFc::new(&config)?;
-                swapfc.run()?;
-            } else {
-                notify_ready();
-                info!("Swap setup complete");
-            }
+        SwapMode::Disabled => {
+            // Swap management is disabled - exit cleanly
+            info!("Swap management disabled, service will exit");
+            notify_ready();
+            return Ok(());
         }
 
         SwapMode::Auto => unreachable!("Auto mode should be resolved before this point"),
@@ -422,9 +383,10 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(WORK_DIR);
 
     // Remove swap files
-    let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
-    info!("Removing files in {}...", swapfc_path);
-    if let Ok(entries) = fs::read_dir(swapfc_path) {
+    let swapfile_path = config.get("swapfile_path")
+        .unwrap_or("/swapfile");
+    info!("Removing files in {}...", swapfile_path);
+    if let Ok(entries) = fs::read_dir(swapfile_path) {
         for entry in entries.flatten() {
             force_remove(entry.path(), true);
         }
@@ -450,7 +412,6 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         println!("Zswap:");
         println!("  enabled: {}", zswap.enabled);
         println!("  compressor: {}", zswap.compressor);
-        println!("  zpool: {}", zswap.zpool);
         println!("  max_pool_percent: {}%", zswap.max_pool_percent);
 
         // Try to get basic stats from /proc/meminfo (works without root!)
