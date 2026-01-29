@@ -128,6 +128,7 @@ fn create_writeback_backing(config: &Config) -> Result<String> {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&backing_file)?;
     }
@@ -174,10 +175,20 @@ pub fn start(config: &Config) -> Result<()> {
 
     // Parse config values
     let zram_size = parse_zram_size(config.get("zram_size").unwrap_or("80%"))?;
-    let zram_alg = config.get("zram_alg").unwrap_or("lzo");
+    let zram_alg = config.get("zram_alg").unwrap_or("lz4");  // LZ4 is faster than LZO
     let zram_prio: i32 = config.get_as("zram_prio").unwrap_or(32767);
     let zram_writeback = config.get_bool("zram_writeback");
     let zram_writeback_dev = config.get("zram_writeback_dev").unwrap_or("");
+    
+    // mem_limit: maximum real RAM that zram can use (including overhead)
+    // This protects against OOM when compression ratio is poor
+    // Default: 70% of total RAM (safe balance between capacity and protection)
+    let zram_mem_limit = config.get_opt("zram_mem_limit")
+        .and_then(|s| parse_zram_size(s).ok())
+        .unwrap_or_else(|| {
+            // Default to 70% of RAM if not specified
+            crate::meminfo::get_ram_size().unwrap_or(0) * 70 / 100
+        });
 
     if zram_size == 0 {
         warn!("Zram: size is 0, skipping");
@@ -249,6 +260,18 @@ pub fn start(config: &Config) -> Result<()> {
             return Err(ZramError::ZramctlFailed("Failed to set disksize".to_string()));
         }
         
+        // Set mem_limit to protect real RAM usage
+        // This is critical for preventing OOM when compression is poor
+        if zram_mem_limit > 0 {
+            let mem_limit_path = format!("{}/mem_limit", zram_sysfs);
+            if Path::new(&mem_limit_path).exists() {
+                match std::fs::write(&mem_limit_path, zram_mem_limit.to_string()) {
+                    Ok(_) => info!("Zram: mem_limit = {} MiB (RAM protection)", zram_mem_limit / (1024 * 1024)),
+                    Err(e) => warn!("Zram: failed to set mem_limit: {}", e),
+                }
+            }
+        }
+        
         // Save loop device info for cleanup
         if let Some(ref loop_dev) = writeback_loop {
             let loop_info_path = format!("{}/zram/writeback_loop", WORK_DIR);
@@ -259,6 +282,18 @@ pub fn start(config: &Config) -> Result<()> {
         info!("Zram: trying to initialize free device");
         zram_dev = get_zram_device(zram_alg, zram_size)?;
         info!("Zram: initialized: {}", zram_dev);
+        
+        // Set mem_limit for normal mode too
+        if zram_mem_limit > 0 {
+            let zram_id = zram_dev.trim_start_matches("/dev/zram");
+            let mem_limit_path = format!("/sys/block/zram{}/mem_limit", zram_id);
+            if Path::new(&mem_limit_path).exists() {
+                match std::fs::write(&mem_limit_path, zram_mem_limit.to_string()) {
+                    Ok(_) => info!("Zram: mem_limit = {} MiB (RAM protection)", zram_mem_limit / (1024 * 1024)),
+                    Err(e) => warn!("Zram: failed to set mem_limit: {}", e),
+                }
+            }
+        }
     }
 
     // Run mkswap

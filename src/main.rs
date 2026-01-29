@@ -107,7 +107,7 @@ fn disable_zswap_for_zram() {
 
 /// Configure MGLRU anti-thrashing protection
 /// Sets min_ttl_ms which protects the working set from premature eviction
-fn configure_mglru(config: &Config) {
+fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
     const MGLRU_MIN_TTL_PATH: &str = "/sys/kernel/mm/lru_gen/min_ttl_ms";
     
     // Check if MGLRU is available
@@ -115,10 +115,18 @@ fn configure_mglru(config: &Config) {
         return;
     }
     
-    // Get configured value (0 = disabled, default kernel behavior)
+    // Get configured value, or use recommended value from autoconfig
     let min_ttl_ms: u32 = config.get_opt("mglru_min_ttl_ms")
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            // Use recommended value if available, otherwise default based on RAM
+            recommended.map(|r| r.mglru_min_ttl_ms)
+                .unwrap_or_else(|| {
+                    // Fallback: detect RAM and use appropriate value
+                    use systemd_swap::autoconfig::RamProfile;
+                    RamProfile::detect().recommended_mglru_min_ttl()
+                })
+        });
     
     if min_ttl_ms == 0 {
         return;
@@ -126,7 +134,7 @@ fn configure_mglru(config: &Config) {
     
     // Apply the setting
     match fs::write(MGLRU_MIN_TTL_PATH, min_ttl_ms.to_string()) {
-        Ok(_) => info!("MGLRU: min_ttl_ms = {} (anti-thrashing protection)", min_ttl_ms),
+        Ok(_) => info!("MGLRU: min_ttl_ms = {} (working set protection)", min_ttl_ms),
         Err(e) => warn!("MGLRU: failed to set min_ttl_ms: {}", e),
     }
 }
@@ -146,14 +154,16 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::load()?;
     let swap_mode = get_swap_mode(&config);
     
+    // Detect system capabilities early for autoconfig
+    let caps = SystemCapabilities::detect();
+    let recommended = RecommendedConfig::from_capabilities(&caps);
+    
     // Configure MGLRU early (protects working set during swap operations)
-    configure_mglru(&config);
+    configure_mglru(&config, Some(&recommended));
 
     // Determine effective mode based on filesystem type
     let effective_mode = match swap_mode {
         SwapMode::Auto => {
-            let caps = SystemCapabilities::detect();
-            let recommended = RecommendedConfig::from_capabilities(&caps);
             config.apply_autoconfig(&recommended);
             
             if recommended.use_zswap {

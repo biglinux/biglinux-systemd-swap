@@ -85,7 +85,7 @@ impl SwapFcConfig {
         let path = PathBuf::from(path.trim_end_matches('/'));
 
         // Parse chunk size (e.g., "512M")
-        let chunk_size_str = config.get("swapfc_chunk_size").unwrap_or("256M");
+        let chunk_size_str = config.get("swapfc_chunk_size").unwrap_or("512M");
         let chunk_size = parse_size(chunk_size_str)?;
 
         let max_count: u32 = config.get_as("swapfc_max_count").unwrap_or(28);
@@ -443,7 +443,7 @@ impl SwapFc {
 
     fn has_enough_space(&self, required_size: u64) -> bool {
         if let Ok(stat) = nix::sys::statvfs::statvfs(&self.config.path) {
-            let free_bytes = stat.blocks_available() as u64 * self.block_size;
+            let free_bytes = stat.blocks_available() * self.block_size;
             // Need at least 2x the required size (safety margin)
             free_bytes >= required_size * 2
         } else {
@@ -478,6 +478,7 @@ impl SwapFc {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .mode(0o600)
                 .open(&swapfile_path)?;
         }
