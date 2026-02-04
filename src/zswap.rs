@@ -100,18 +100,17 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     let enabled = config.get("zswap_enabled").unwrap_or("1");
     let compressor = config.get("zswap_compressor").unwrap_or("lz4");  // LZ4 for speed
     let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("50");  // Unified 50%
-    let zpool = config.get("zswap_zpool").unwrap_or("zsmalloc");  // zsmalloc (z3fold removed in newer kernels)
     let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("1");  // Enable shrinker
     let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
 
     info!(
-        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Zpool: {}, Shrinker: {}, Accept threshold: {}%",
-        enabled, compressor, max_pool_percent, zpool, shrinker_enabled, accept_threshold
+        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Shrinker: {}, Accept threshold: {}%",
+        enabled, compressor, max_pool_percent, shrinker_enabled, accept_threshold
     );
 
     info!("Zswap: set new parameters: start");
 
-    // IMPORTANT: Some parameters (compressor, zpool) cannot be changed while zswap is enabled.
+    // IMPORTANT: Some parameters (compressor) cannot be changed while zswap is enabled.
     // We must disable zswap first, configure parameters, then re-enable.
     let was_enabled = is_enabled();
     if was_enabled {
@@ -122,9 +121,7 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     }
 
     // Write parameters (except enabled) - order matters for some kernels
-    // Configure zpool and compressor first, then max_pool_percent
     let params = [
-        ("zpool", zpool),
         ("compressor", compressor),
         ("max_pool_percent", max_pool_percent),
         ("shrinker_enabled", shrinker_enabled),
@@ -133,10 +130,15 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
 
     for (name, value) in params {
         let path = format!("{}/{}", ZSWAP_PARAMS, name);
+        // Skip if parameter file doesn't exist (varies by kernel version)
+        if !Path::new(&path).exists() {
+            warn!("Zswap: {} not supported on this kernel (file not found)", name);
+            continue;
+        }
         if let Err(e) = write_file(&path, value) {
-            // shrinker_enabled may not exist on older kernels, just warn
+            // Some parameters may not be writable or supported on certain kernels
             if name == "shrinker_enabled" || name == "accept_threshold_percent" {
-                warn!("Zswap: {} not supported on this kernel", name);
+                warn!("Zswap: {} not writable on this kernel: {}", name, e);
             } else {
                 error!("Failed to write zswap_{}: {}", name, e);
             }
@@ -177,9 +179,6 @@ pub fn get_status() -> Option<ZswapStatus> {
     if let Ok(v) = read_file(params_dir.join("compressor")) {
         status.compressor = v.trim().to_string();
     }
-    if let Ok(v) = read_file(params_dir.join("zpool")) {
-        status.zpool = v.trim().to_string();
-    }
     if let Ok(v) = read_file(params_dir.join("max_pool_percent")) {
         status.max_pool_percent = v.trim().parse().unwrap_or(20);
     }
@@ -217,7 +216,6 @@ pub struct ZswapStatus {
     // Configuration parameters
     pub enabled: bool,
     pub compressor: String,
-    pub zpool: String,
     pub max_pool_percent: u8,
     pub shrinker_enabled: bool,
     pub accept_threshold_percent: u8,

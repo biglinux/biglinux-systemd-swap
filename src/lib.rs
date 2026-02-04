@@ -5,7 +5,7 @@ pub mod autoconfig;
 pub mod config;
 pub mod helpers;
 pub mod meminfo;
-pub mod swapfc;
+pub mod swapfile;
 pub mod systemd;
 pub mod zram;
 pub mod zswap;
