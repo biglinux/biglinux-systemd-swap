@@ -351,11 +351,11 @@ impl RamProfile {
     pub fn recommended_mglru_min_ttl(&self) -> u32 {
         match self {
             RamProfile::UltraLow => 5000,   // 5s - maximum protection
-            RamProfile::Low => 4000,        // 4s
-            RamProfile::Medium => 3000,     // 3s
-            RamProfile::Standard => 3000,   // 3s - better desktop protection
-            RamProfile::High => 2000,       // 2s
-            RamProfile::VeryHigh => 2000,   // 2s - workstations can have heavy loads too
+            RamProfile::Low => 3000,        // 3s
+            RamProfile::Medium => 2000,     // 2s
+            RamProfile::Standard => 1000,   // 1s
+            RamProfile::High => 500,        // 0.5s
+            RamProfile::VeryHigh => 250,    // 0.25s - RAM is abundant
         }
     }
 
@@ -364,22 +364,6 @@ impl RamProfile {
         match self {
             RamProfile::UltraLow | RamProfile::Low => "zstd",
             _ => "lz4",
-        }
-    }
-
-    /// Adjust MGLRU based on current memory pressure
-    /// Call this at daemon startup to adapt to real conditions
-    pub fn recommended_mglru_with_pressure(&self, pressure: crate::meminfo::MemoryPressure) -> u32 {
-        use crate::meminfo::MemoryPressure;
-
-        let base = self.recommended_mglru_min_ttl();
-
-        // Increase protection under pressure
-        match pressure {
-            MemoryPressure::Low => base,
-            MemoryPressure::Medium => base * 15 / 10,  // +50%
-            MemoryPressure::High => base * 2,          // +100%
-            MemoryPressure::Critical => base * 3,      // +200%
         }
     }
 }
@@ -612,7 +596,7 @@ impl RecommendedConfig {
             zswap_max_pool_percent: 25,  // Uniform for all RAM profiles
             swapfc_enabled: true,
             swapfc_directio: is_nvme,    // Direct I/O only on NVMe
-            swapfc_chunk_size: if is_nvme { "1G" } else { "512M" }.to_string(),
+            swapfc_chunk_size: if is_nvme { "512M" } else { "256M" }.to_string(),
             mglru_min_ttl_ms: ram.recommended_mglru_min_ttl(),
         }
     }

@@ -128,15 +128,7 @@ fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
             recommended.map(|r| r.mglru_min_ttl_ms).unwrap_or_else(|| {
                 // Fallback: detect RAM and use appropriate value
                 use systemd_swap::autoconfig::RamProfile;
-                let ram_profile = RamProfile::detect();
-
-                // Detect memory pressure and adjust MGLRU accordingly
-                if let Ok(pressure) = systemd_swap::meminfo::get_memory_pressure() {
-                    info!("Memory pressure detected: {:?}, adjusting MGLRU", pressure);
-                    ram_profile.recommended_mglru_with_pressure(pressure)
-                } else {
-                    ram_profile.recommended_mglru_min_ttl()
-                }
+                RamProfile::detect().recommended_mglru_min_ttl()
             })
         });
 

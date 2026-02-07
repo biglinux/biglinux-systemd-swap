@@ -33,7 +33,6 @@ SVC_T := $(DESTDIR)$(libdir)/systemd/system/systemd-swap.service
 PRE_SVC_T := $(DESTDIR)$(libdir)/systemd/system/pre-systemd-swap.service
 DFL_T := $(DESTDIR)$(datadir)/systemd-swap/swap-default.conf
 CNF_T := $(DESTDIR)$(sysconfdir)/systemd/swap.conf
-SYSCTL_T := $(DESTDIR)$(libdir)/sysctl.d/99-systemd-swap.conf
 MAN5_T := $(DESTDIR)$(mandir)/man5/swap.conf.5
 MAN8_T := $(DESTDIR)$(mandir)/man8/systemd-swap.8
 
@@ -67,9 +66,6 @@ $(DFL_T): include/swap-default.conf
 $(CNF_T): swap.conf
 	install -p -bDm644 -S .old $< $@
 
-$(SYSCTL_T): include/99-systemd-swap.conf
-	install -p -Dm644 $< $@
-
 $(MAN5_T): man/swap.conf.5
 	install -p -Dm644 $< $@
 
@@ -87,7 +83,7 @@ swap.conf: include/swap-default.conf ## Generate swap.conf
 
 target/release/systemd-swap: build
 
-files: $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(SYSCTL_T) $(MAN5_T) $(MAN8_T)
+files: $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T)
 
 install: ## Install systemd-swap
 install: build dirs files
@@ -95,7 +91,7 @@ install: build dirs files
 uninstall: ## Delete systemd-swap (stop systemd-swap first)
 uninstall:
 	test ! -f /run/systemd/swap/swap.conf
-	rm -v $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(SYSCTL_T) $(MAN5_T) $(MAN8_T)
+	rm -v $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T)
 	rm -rv $(LIB_T) $(DESTDIR)$(datadir)/systemd-swap
 
 clean: ## Remove generated files

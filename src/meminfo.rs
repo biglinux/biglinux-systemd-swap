@@ -108,39 +108,6 @@ pub fn get_cpu_count() -> usize {
         .unwrap_or(1)
 }
 
-/// Memory pressure levels
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MemoryPressure {
-    Low,      // > 40% available
-    Medium,   // 20-40% available
-    High,     // 10-20% available
-    Critical, // < 10% available
-}
-
-/// Detect current memory pressure based on MemAvailable
-pub fn get_memory_pressure() -> Result<MemoryPressure> {
-    let stats = get_mem_stats(&["MemTotal", "MemAvailable"])?;
-    let percent = (stats["MemAvailable"] * 100) / stats["MemTotal"];
-
-    let pressure = match percent {
-        p if p > 40 => MemoryPressure::Low,
-        p if p > 20 => MemoryPressure::Medium,
-        p if p > 10 => MemoryPressure::High,
-        _ => MemoryPressure::Critical,
-    };
-
-    Ok(pressure)
-}
-
-/// Get percentage of available memory (MemAvailable)
-/// This is more accurate than MemFree for detecting usable memory
-/// as it includes reclaimable cache and buffers
-pub fn get_available_ram_percent() -> Result<u8> {
-    let stats = get_mem_stats(&["MemTotal", "MemAvailable"])?;
-    let percent = (stats["MemAvailable"] * 100) / stats["MemTotal"];
-    Ok(percent as u8)
-}
-
 /// Zswap statistics from debugfs
 #[derive(Debug, Default, Clone)]
 pub struct ZswapStats {
