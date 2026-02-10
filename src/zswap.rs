@@ -32,20 +32,6 @@ pub struct ZswapBackup {
     pub parameters: HashMap<String, String>,
 }
 
-impl ZswapBackup {
-    /// Restore original zswap parameters
-    pub fn restore(&self) -> Result<()> {
-        info!("Zswap: restore configuration: start");
-        for (path, value) in &self.parameters {
-            if let Err(e) = write_file(path, value) {
-                warn!("Failed to restore {}: {}", path, e);
-            }
-        }
-        info!("Zswap: restore configuration: complete");
-        Ok(())
-    }
-}
-
 /// Check if zswap is available (module loaded)
 pub fn is_available() -> bool {
     Path::new(ZSWAP_MODULE).is_dir()
@@ -98,14 +84,15 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     // Get config values
     // Default to "1" because if start() is called, zswap should be enabled
     let enabled = config.get("zswap_enabled").unwrap_or("1");
-    let compressor = config.get("zswap_compressor").unwrap_or("lz4");  // LZ4 for speed
+    let compressor = config.get("zswap_compressor").unwrap_or("zstd");  // zstd: better ratio, less I/O
+    let zpool = config.get("zswap_zpool").unwrap_or("zsmalloc");  // zsmalloc is the only zpool allocator in modern kernels
     let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("50");  // Unified 50%
     let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("1");  // Enable shrinker
-    let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
+    let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("85");
 
     info!(
-        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Shrinker: {}, Accept threshold: {}%",
-        enabled, compressor, max_pool_percent, shrinker_enabled, accept_threshold
+        "Zswap: Enable: {}, Comp: {}, Zpool: {}, Max pool %: {}, Shrinker: {}, Accept threshold: {}%",
+        enabled, compressor, zpool, max_pool_percent, shrinker_enabled, accept_threshold
     );
 
     info!("Zswap: set new parameters: start");
@@ -123,6 +110,7 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     // Write parameters (except enabled) - order matters for some kernels
     let params = [
         ("compressor", compressor),
+        ("zpool", zpool),
         ("max_pool_percent", max_pool_percent),
         ("shrinker_enabled", shrinker_enabled),
         ("accept_threshold_percent", accept_threshold),
@@ -179,6 +167,9 @@ pub fn get_status() -> Option<ZswapStatus> {
     if let Ok(v) = read_file(params_dir.join("compressor")) {
         status.compressor = v.trim().to_string();
     }
+    if let Ok(v) = read_file(params_dir.join("zpool")) {
+        status.zpool = v.trim().to_string();
+    }
     if let Ok(v) = read_file(params_dir.join("max_pool_percent")) {
         status.max_pool_percent = v.trim().parse().unwrap_or(20);
     }
@@ -216,6 +207,7 @@ pub struct ZswapStatus {
     // Configuration parameters
     pub enabled: bool,
     pub compressor: String,
+    pub zpool: String,
     pub max_pool_percent: u8,
     pub shrinker_enabled: bool,
     pub accept_threshold_percent: u8,
@@ -235,28 +227,5 @@ pub struct ZswapStatus {
     pub pool_limit_hit: u64,
     /// Duplicate entries found
     pub duplicate_entry: u64,
-}
-
-impl ZswapStatus {
-    /// Calculate pool utilization percentage
-    pub fn pool_utilization_percent(&self, mem_total: u64) -> u8 {
-        if mem_total == 0 || self.max_pool_percent == 0 {
-            return 0;
-        }
-        let max_pool_size = mem_total * self.max_pool_percent as u64 / 100;
-        if max_pool_size == 0 {
-            return 0;
-        }
-        ((self.pool_size * 100) / max_pool_size).min(100) as u8
-    }
-
-    /// Calculate compression ratio (compressed/uncompressed)
-    pub fn compression_ratio(&self, page_size: u64) -> f64 {
-        let uncompressed = self.stored_pages * page_size;
-        if uncompressed == 0 {
-            return 0.0;
-        }
-        self.pool_size as f64 / uncompressed as f64
-    }
 }
 

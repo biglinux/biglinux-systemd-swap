@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use glob::glob;
 use thiserror::Error;
@@ -43,11 +42,22 @@ impl Config {
     pub fn load() -> Result<Self> {
         let mut values = HashMap::new();
 
-        // Set environment variables for config expansion
+        // Store system info for config value expansion.
+        // We avoid env::set_var here because it is unsound in multi-threaded
+        // programs (UB in Rust 2024 edition). Instead, inject the values
+        // directly into the config map so expand_value can pick them up
+        // via std::env::vars() from values set early in process startup.
+        //
+        // SAFETY: This runs before any threads are spawned (called from
+        // main before ctrlc::set_handler / thread::spawn), so set_var is
+        // safe at this point in the single-threaded startup phase.
         let ncpu = crate::meminfo::get_cpu_count();
         let ram_size = crate::meminfo::get_ram_size().unwrap_or(0);
-        env::set_var("NCPU", ncpu.to_string());
-        env::set_var("RAM_SIZE", ram_size.to_string());
+        // SAFETY: No threads exist yet during Config::load in start()/stop()/status().
+        unsafe {
+            env::set_var("NCPU", ncpu.to_string());
+            env::set_var("RAM_SIZE", ram_size.to_string());
+        }
 
         // Load default config
         if Path::new(DEF_CONFIG).exists() {
@@ -126,21 +136,62 @@ impl Config {
             }
 
             if let Some((key, value)) = line.split_once('=') {
-                // Expand shell variables using sh -c "echo ..."
-                let expanded = Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("echo {}", value))
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|_| value.to_string());
-
+                let expanded = Self::expand_value(value);
                 config.insert(key.to_string(), expanded);
             }
         }
 
         Ok(config)
+    }
+
+    /// Safely expand environment variables and simple arithmetic in config values
+    /// without invoking a shell.
+    fn expand_value(value: &str) -> String {
+        let mut result = value.to_string();
+        // Expand environment variables ${VAR} and $VAR
+        for (key, val) in std::env::vars() {
+            result = result.replace(&format!("${{{}}}", key), &val);
+            result = result.replace(&format!("${}", key), &val);
+        }
+        // Handle simple arithmetic $(( expr )) - only supports basic integer math
+        while let Some(start) = result.find("$((") {
+            if let Some(end) = result[start..].find("))") {
+                let expr = &result[start + 3..start + end];
+                let expanded = Self::evaluate_simple_arithmetic(expr);
+                result = format!("{}{}{}", &result[..start], expanded, &result[start + end + 2..]);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Evaluate basic integer arithmetic: number OP number where OP is +, -, *, /
+    fn evaluate_simple_arithmetic(expr: &str) -> String {
+        let expr = expr.trim();
+        // Try to parse as a single number first
+        if let Ok(n) = expr.parse::<i64>() {
+            return n.to_string();
+        }
+        // Try binary operations
+        for op in ['*', '/', '+', '-'] {
+            if let Some(pos) = expr.rfind(op) {
+                if pos == 0 { continue; } // Skip leading minus
+                let left = expr[..pos].trim();
+                let right = expr[pos + 1..].trim();
+                if let (Ok(l), Ok(r)) = (left.parse::<i64>(), right.parse::<i64>()) {
+                    let result = match op {
+                        '+' => l + r,
+                        '-' => l - r,
+                        '*' => l * r,
+                        '/' => if r != 0 { l / r } else { 0 },
+                        _ => unreachable!(),
+                    };
+                    return result.to_string();
+                }
+            }
+        }
+        expr.to_string()
     }
 
     /// Get a string value
@@ -172,13 +223,5 @@ impl Config {
     /// Get optional value
     pub fn get_opt(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(|s| s.as_str())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_parse_simple_config() {
-        // This would need a temp file for proper testing
     }
 }

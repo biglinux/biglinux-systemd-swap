@@ -92,9 +92,9 @@ fn supports_writeback(fstype: &Option<String>) -> bool {
 
 /// Create backing file and loop device for zram writeback
 fn create_writeback_backing(config: &Config) -> Result<String> {
-    // Use same path as swapfc for consistency
-    let swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
-    let parent = Path::new(swapfc_path).parent().unwrap_or(Path::new("/swapfc"));
+    // Use same path as swapfile for consistency
+    let swapfile_path = config.get("swapfile_path").unwrap_or("/swapfile");
+    let parent = Path::new(swapfile_path).parent().unwrap_or(Path::new("/swapfile"));
     
     // Check filesystem type - don't allow writeback on tmpfs, squashfs (LiveCD), etc.
     let fstype = get_fstype(parent);
@@ -116,7 +116,9 @@ fn create_writeback_backing(config: &Config) -> Result<String> {
         std::fs::remove_file(&backing_file)?;
     }
     
-    // Create sparse file (1GB default) - will grow as needed
+    // Create pre-allocated file (1GB default)
+    // Must use fallocate (not truncate) because sparse files cause I/O errors
+    // when zram tries to write to unallocated holes in the backing device
     let size = config.get("zram_writeback_size").unwrap_or("1G");
     let size_bytes = parse_zram_size(size)?;
     
@@ -133,11 +135,19 @@ fn create_writeback_backing(config: &Config) -> Result<String> {
             .open(&backing_file)?;
     }
     
-    // Use truncate for sparse file
-    Command::new("truncate")
-        .args(["--size", &size_bytes.to_string()])
+    // Use fallocate to pre-allocate the full space (avoids sparse file issues)
+    let falloc_status = Command::new("fallocate")
+        .args(["-l", &size_bytes.to_string()])
         .arg(&backing_file)
         .status()?;
+    if !falloc_status.success() {
+        // Fallback to truncate if fallocate is not supported (e.g., some filesystems)
+        warn!("Zram: fallocate failed, falling back to truncate (sparse file)");
+        Command::new("truncate")
+            .args(["--size", &size_bytes.to_string()])
+            .arg(&backing_file)
+            .status()?;
+    }
     
     // Create loop device with Direct I/O enabled
     // Direct I/O avoids double caching: zram data shouldn't go through page cache
@@ -175,7 +185,7 @@ pub fn start(config: &Config) -> Result<()> {
 
     // Parse config values
     let zram_size = parse_zram_size(config.get("zram_size").unwrap_or("80%"))?;
-    let zram_alg = config.get("zram_alg").unwrap_or("lz4");  // LZ4 is faster than LZO
+    let zram_alg = config.get("zram_alg").unwrap_or("zstd");  // zstd offers best compression with acceptable speed
     let zram_prio: i32 = config.get_as("zram_prio").unwrap_or(32767);
     let zram_writeback = config.get_bool("zram_writeback");
     let zram_writeback_dev = config.get("zram_writeback_dev").unwrap_or("");
@@ -234,6 +244,12 @@ pub fn start(config: &Config) -> Result<()> {
         
         info!("Zram: created new device: {}", zram_dev);
         
+        // Best-effort cleanup closure: release the zram device on setup failure
+        let cleanup_device = |id: &str| {
+            let reset_path = format!("/sys/block/zram{}/reset", id);
+            let _ = std::fs::write(&reset_path, "1");
+        };
+        
         // Configure backing device FIRST (before disksize!)
         if !backing_device.is_empty() {
             let backing_path = format!("{}/backing_dev", zram_sysfs);
@@ -257,6 +273,7 @@ pub fn start(config: &Config) -> Result<()> {
         let disksize_path = format!("{}/disksize", zram_sysfs);
         if let Err(e) = std::fs::write(&disksize_path, zram_size.to_string()) {
             error!("Zram: failed to set disksize: {}", e);
+            cleanup_device(&new_id);
             return Err(ZramError::ZramctlFailed("Failed to set disksize".to_string()));
         }
         
@@ -296,6 +313,21 @@ pub fn start(config: &Config) -> Result<()> {
         }
     }
 
+    // Configure recompression (kernel 6.1+)
+    // Secondary algorithm recompresses idle/huge pages for better ratio
+    {
+        let zram_id = zram_dev.trim_start_matches("/dev/zram");
+        let recomp_alg_path = format!("/sys/block/zram{}/recomp_algorithm", zram_id);
+        if Path::new(&recomp_alg_path).exists() {
+            let recomp_alg = config.get("zram_recomp_alg").unwrap_or("zstd");
+            let recomp_str = format!("algo={} priority=1", recomp_alg);
+            match std::fs::write(&recomp_alg_path, &recomp_str) {
+                Ok(_) => info!("Zram: recompression algorithm = {} (for idle/huge pages)", recomp_alg),
+                Err(e) => warn!("Zram: failed to set recomp_algorithm: {}", e),
+            }
+        }
+    }
+
     // Run mkswap
     let mkswap_status = Command::new("mkswap")
         .arg(&zram_dev)
@@ -304,6 +336,9 @@ pub fn start(config: &Config) -> Result<()> {
         .status()?;
 
     if !mkswap_status.success() {
+        // Clean up the zram device on mkswap failure
+        let zram_id = zram_dev.trim_start_matches("/dev/zram");
+        let _ = std::fs::write(format!("/sys/block/zram{}/reset", zram_id), "1");
         return Err(ZramError::ZramctlFailed("mkswap failed".to_string()));
     }
 
@@ -415,6 +450,75 @@ pub fn writeback_idle() -> Result<()> {
     info!("Zram: triggering writeback of idle pages");
     if let Err(e) = std::fs::write(&writeback_path, "idle") {
         warn!("Zram: writeback failed: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Check if zram recompression is supported (kernel 6.1+)
+pub fn is_recompression_available() -> bool {
+    let device_info = format!("{}/zram/device", WORK_DIR);
+    if let Ok(info) = std::fs::read_to_string(&device_info) {
+        let lines: Vec<&str> = info.lines().collect();
+        if lines.len() >= 2 {
+            let recompress_path = format!("{}/recompress", lines[1]);
+            return Path::new(&recompress_path).exists();
+        }
+    }
+    false
+}
+
+/// Trigger recompression of idle zram pages with secondary algorithm
+/// Kernel 6.1+ feature: pages compressed with primary algo get recompressed
+/// with a secondary (better ratio) algo when idle, saving RAM.
+pub fn recompress_idle(threshold: u32) -> Result<()> {
+    let device_info = format!("{}/zram/device", WORK_DIR);
+    if !Path::new(&device_info).exists() {
+        return Ok(());
+    }
+
+    let info = std::fs::read_to_string(&device_info)?;
+    let lines: Vec<&str> = info.lines().collect();
+    if lines.len() < 2 {
+        return Ok(());
+    }
+
+    let zram_sysfs = lines[1];
+    let idle_path = format!("{}/idle", zram_sysfs);
+    let recompress_path = format!("{}/recompress", zram_sysfs);
+
+    if !Path::new(&recompress_path).exists() {
+        return Ok(());
+    }
+
+    // Mark all pages as idle
+    if let Err(e) = std::fs::write(&idle_path, "all") {
+        warn!("Zram: recompress: failed to mark pages idle: {}", e);
+        return Ok(());
+    }
+
+    // Small delay to let kernel update idle state
+    thread::sleep(Duration::from_millis(50));
+
+    // Recompress huge pages first (poorly compressed, most benefit)
+    if let Err(e) = std::fs::write(&recompress_path, "type=huge") {
+        // EINVAL if no huge pages — normal
+        if !e.to_string().contains("Invalid argument") {
+            warn!("Zram: huge recompression failed: {}", e);
+        }
+    }
+
+    // Recompress idle pages above threshold (in bytes of compressed size)
+    // Pages whose compressed size exceeds threshold get recompressed with
+    // the secondary algorithm for better ratio
+    let cmd = format!("type=idle threshold={}", threshold);
+    match std::fs::write(&recompress_path, &cmd) {
+        Ok(_) => info!("Zram: recompressed idle pages (threshold={}B)", threshold),
+        Err(e) => {
+            if !e.to_string().contains("Invalid argument") {
+                warn!("Zram: idle recompression failed: {}", e);
+            }
+        }
     }
 
     Ok(())
@@ -551,6 +655,13 @@ pub struct ZramWritebackConfig {
     pub expand_step_bytes: u64,
     /// Maximum backing file size
     pub max_backing_size: u64,
+    /// Enable recompression of idle pages (kernel 6.1+)
+    pub recompress_enabled: bool,
+    /// Recompression threshold: recompress idle pages with compressed size above this (bytes)
+    /// Default 3072 = pages that compressed to >75% of page size (poor compression)
+    pub recompress_threshold: u32,
+    /// Interval in seconds between recompression attempts (default: 120)
+    pub recompress_interval: u64,
 }
 
 impl Default for ZramWritebackConfig {
@@ -564,6 +675,9 @@ impl Default for ZramWritebackConfig {
             auto_expand_backing: true,
             expand_step_bytes: 512 * 1024 * 1024,  // 512MB
             max_backing_size: 8 * 1024 * 1024 * 1024,  // 8GB
+            recompress_enabled: true,  // Enable by default on supported kernels
+            recompress_threshold: 3072,  // Recompress pages >3KB compressed (poor ratio)
+            recompress_interval: 120,  // Every 2 minutes
         }
     }
 }
@@ -593,6 +707,17 @@ impl ZramWritebackConfig {
             }
         }
         
+        // Recompression config
+        if config.get_bool("zram_recompress_disabled") {
+            cfg.recompress_enabled = false;
+        }
+        if let Ok(v) = config.get_as::<u32>("zram_recompress_threshold") {
+            cfg.recompress_threshold = v.clamp(512, 4096);
+        }
+        if let Ok(v) = config.get_as::<u64>("zram_recompress_interval") {
+            cfg.recompress_interval = v.clamp(30, 600);
+        }
+        
         cfg
     }
 }
@@ -602,6 +727,7 @@ pub struct ZramWritebackManager {
     config: ZramWritebackConfig,
     backing_file: Option<String>,
     current_backing_size: u64,
+    recompress_counter: u64,
 }
 
 impl ZramWritebackManager {
@@ -620,6 +746,7 @@ impl ZramWritebackManager {
             config,
             backing_file,
             current_backing_size,
+            recompress_counter: 0,
         }
     }
 
@@ -643,7 +770,12 @@ impl ZramWritebackManager {
     /// Run the smart writeback monitoring loop
     pub fn run(&mut self) -> Result<()> {
         if !self.is_available() {
-            info!("Zram: writeback not available, skipping smart writeback");
+            // Even without writeback, we can still do recompression
+            if self.config.recompress_enabled && is_recompression_available() {
+                info!("Zram: writeback not available, running recompression-only mode");
+                return self.run_recompress_only();
+            }
+            info!("Zram: writeback and recompression not available, skipping");
             return Ok(());
         }
 
@@ -652,6 +784,10 @@ impl ZramWritebackManager {
             self.config.writeback_threshold,
             self.config.min_compression_ratio,
             self.config.idle_age_seconds);
+        if self.config.recompress_enabled && is_recompression_available() {
+            info!("Zram:   recompression enabled (threshold={}B, interval={}s)",
+                self.config.recompress_threshold, self.config.recompress_interval);
+        }
         
         loop {
             thread::sleep(Duration::from_secs(self.config.check_interval));
@@ -662,6 +798,29 @@ impl ZramWritebackManager {
 
             if let Some(stats) = get_zram_stats() {
                 self.process_stats(&stats);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run recompression-only loop (when writeback is not available)
+    fn run_recompress_only(&mut self) -> Result<()> {
+        info!("Zram: recompression-only mode (threshold={}B, interval={}s)",
+            self.config.recompress_threshold, self.config.recompress_interval);
+
+        loop {
+            thread::sleep(Duration::from_secs(self.config.recompress_interval));
+
+            if crate::is_shutdown() {
+                break;
+            }
+
+            if let Some(stats) = get_zram_stats() {
+                // Only recompress if there's meaningful data in zram
+                if stats.orig_data_size > 0 {
+                    let _ = recompress_idle(self.config.recompress_threshold);
+                }
             }
         }
 
@@ -691,6 +850,19 @@ impl ZramWritebackManager {
             // Check if we need to expand backing
             if self.config.auto_expand_backing {
                 self.maybe_expand_backing(stats);
+            }
+        }
+
+        // Recompression: runs on its own interval (independent of writeback threshold)
+        if self.config.recompress_enabled && is_recompression_available() {
+            let elapsed = self.recompress_counter * self.config.check_interval;
+            if elapsed >= self.config.recompress_interval {
+                self.recompress_counter = 0;
+                if stats.orig_data_size > 0 {
+                    let _ = recompress_idle(self.config.recompress_threshold);
+                }
+            } else {
+                self.recompress_counter += 1;
             }
         }
     }
@@ -768,9 +940,9 @@ impl ZramWritebackManager {
                 new_size / (1024 * 1024),
                 backing_usage_percent);
 
-            // Expand the sparse file
-            let status = Command::new("truncate")
-                .args(["--size", &new_size.to_string()])
+            // Expand with fallocate to pre-allocate space (avoids sparse file holes)
+            let status = Command::new("fallocate")
+                .args(["-l", &new_size.to_string()])
                 .arg(&backing_file)
                 .status();
 

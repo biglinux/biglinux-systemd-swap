@@ -1,6 +1,7 @@
 // Systemd integration for systemd-swap
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -25,11 +26,6 @@ pub enum SystemdError {
 }
 
 pub type Result<T> = std::result::Result<T, SystemdError>;
-
-/// Send sd_notify message
-pub fn notify(message: &str) {
-    let _ = libsystemd::daemon::notify(false, &[(libsystemd::daemon::NotifyState::Status(message.to_string()))]);
-}
 
 /// Notify systemd that we're ready
 pub fn notify_ready() {
@@ -159,20 +155,19 @@ TimeoutSec=1h
     Ok(unit_name)
 }
 
-/// Disable a swap device
+/// Disable a swap device using the swapoff(2) syscall directly
 pub fn swapoff(device: &str) -> Result<()> {
-    let status = Command::new("swapoff")
-        .arg(device)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if status.success() {
+    let c_path = CString::new(device).map_err(|_| {
+        SystemdError::CommandFailed(format!("invalid path for swapoff: {}", device))
+    })?;
+    let ret = unsafe { libc::swapoff(c_path.as_ptr()) };
+    if ret == 0 {
         Ok(())
     } else {
+        let err = std::io::Error::last_os_error();
         Err(SystemdError::CommandFailed(format!(
-            "swapoff {} failed with {}",
-            device, status
+            "swapoff {} failed: {}",
+            device, err
         )))
     }
 }

@@ -1,11 +1,13 @@
 // Helper utilities for systemd-swap
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
 
@@ -36,9 +38,17 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> Result<String> {
 }
 
 /// Write string to file
+/// For sysfs/procfs (virtual filesystems), writes without fsync.
+/// For real filesystem paths, calls sync_all to ensure persistence.
 pub fn write_file<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
+    let path = path.as_ref();
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
+    // Skip fsync for virtual filesystems (sysfs, procfs) where it's meaningless
+    let path_str = path.to_string_lossy();
+    if !path_str.starts_with("/sys/") && !path_str.starts_with("/proc/") {
+        file.sync_all()?;
+    }
     Ok(())
 }
 
@@ -110,30 +120,6 @@ pub fn run_cmd_output(cmd: &[&str]) -> Result<String> {
     }
 }
 
-/// Run systemctl action
-pub fn systemctl(action: &str, unit: &str) -> Result<()> {
-    let args = if action == "daemon-reload" {
-        vec!["systemctl", "daemon-reload"]
-    } else {
-        vec!["systemctl", action, unit]
-    };
-
-    let status = Command::new(args[0])
-        .args(&args[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(HelperError::CommandFailed(format!(
-            "systemctl {} {} failed",
-            action, unit
-        )))
-    }
-}
-
 /// Find swap unit files in /run/systemd
 pub fn find_swap_units() -> Vec<String> {
     let mut units = Vec::new();
@@ -165,7 +151,14 @@ pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
     None
 }
 
-/// Get the filesystem type of a given path
+/// Cache for filesystem type detection (avoids repeated findmnt calls)
+static FS_TYPE_CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn fs_cache() -> &'static Mutex<HashMap<PathBuf, String>> {
+    FS_TYPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get the filesystem type of a given path (cached)
 pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
     let path = path.as_ref();
     // Use parent if path doesn't exist
@@ -177,6 +170,13 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| Path::new("/").to_path_buf())
     };
+
+    // Check cache first
+    if let Ok(cache) = fs_cache().lock() {
+        if let Some(cached) = cache.get(&check_path) {
+            return Some(cached.clone());
+        }
+    }
 
     let output = Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", "--target", &check_path.to_string_lossy()])
@@ -193,21 +193,13 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
             None
         }
     } else {
+        // Store in cache
+        if let Ok(mut cache) = fs_cache().lock() {
+            cache.insert(check_path, fstype.clone());
+        }
         Some(fstype)
     }
 }
-
-/// Filesystems that support swap files well
-pub const SWAPFILE_SUPPORTED_FS: &[&str] = &["btrfs", "ext4", "xfs"];
-
-/// Check if a filesystem supports swap files
-pub fn supports_swapfiles(fstype: &Option<String>) -> bool {
-    match fstype {
-        Some(fs) => SWAPFILE_SUPPORTED_FS.contains(&fs.as_str()),
-        None => false,
-    }
-}
-
 
 
 // Logging macros

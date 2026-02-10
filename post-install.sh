@@ -236,7 +236,7 @@ echo ""
 
 print_info "Compressor: ${BOLD}LZ4${NC} (2-3x mais rápido)"
 print_info "Pool Zswap: ${BOLD}50%${NC} (~20GB swap em RAM)"
-print_info "Allocator: ${BOLD}z3fold${NC} (menos overhead)"
+print_info "Allocator: ${BOLD}zsmalloc${NC} (allocator padrão)"
 print_info "Chunk Size: ${BOLD}1GB${NC} (melhor para NVMe/SSD)"
 print_info "Anti-Thrashing: ${BOLD}5000ms${NC} (proteção forte)"
 print_info "Pré-alocação: ${BOLD}Habilitada${NC} (melhor performance)"

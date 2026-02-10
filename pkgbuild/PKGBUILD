@@ -41,6 +41,9 @@ package() {
     # Install user config
     install -Dm644 include/swap-default.conf "${pkgdir}/etc/systemd/swap.conf"
     
+    # Install sysctl config (swappiness + page-cluster tuning)
+    install -Dm644 include/99-systemd-swap.conf "${pkgdir}/usr/lib/sysctl.d/99-systemd-swap.conf"
+    
     # Install man pages
     install -Dm644 man/swap.conf.5 "${pkgdir}/usr/share/man/man5/swap.conf.5"
     install -Dm644 man/systemd-swap.8 "${pkgdir}/usr/share/man/man8/systemd-swap.8"

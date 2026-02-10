@@ -118,10 +118,6 @@ impl SwapFileInfo {
         self.usage_percent() <= threshold
     }
     
-    /// Check if file is nearly full
-    pub fn is_nearly_full(&self, threshold: u8) -> bool {
-        self.usage_percent() >= threshold
-    }
 }
 
 /// SwapFC configuration
@@ -169,56 +165,79 @@ pub struct SwapFileConfig {
 
 impl SwapFileConfig {
     /// Create config from parsed Config file
+    /// Supports both swapfile_* and legacy swapfc_* config keys
     pub fn from_config(config: &Config) -> Result<Self> {
-        let path = config.get("swapfile_path").unwrap_or("/swapfile");
+        // Helper: try swapfile_* key first, fall back to swapfc_* for backward compat
+        let get_compat = |new_key: &str, old_key: &str, default: &str| -> String {
+            config.get(new_key)
+                .or_else(|_| config.get(old_key))
+                .unwrap_or(default)
+                .to_string()
+        };
+        let get_compat_as = |new_key: &str, old_key: &str, default: u32| -> u32 {
+            config.get_as(new_key)
+                .or_else(|_| config.get_as(old_key))
+                .unwrap_or(default)
+        };
+        let get_compat_bool = |new_key: &str, old_key: &str| -> bool {
+            if config.has_explicit(new_key) {
+                config.get_bool(new_key)
+            } else {
+                config.get_bool(old_key)
+            }
+        };
+
+        let path = get_compat("swapfile_path", "swapfc_path", "/swapfile");
         let path = PathBuf::from(path.trim_end_matches('/'));
 
-        let chunk_size_str = config.get("swapfile_chunk_size").unwrap_or("512M");
-        let chunk_size = parse_size(chunk_size_str)?;
+        let chunk_size_str = get_compat("swapfile_chunk_size", "swapfc_chunk_size", "512M");
+        let chunk_size = parse_size(&chunk_size_str)?;
 
-        let max_count: u32 = config.get_as("swapfile_max_count").unwrap_or(28);
+        let max_count: u32 = get_compat_as("swapfile_max_count", "swapfc_max_count", 28);
         let max_count = max_count.clamp(1, 28);
 
-        let min_count: u32 = config.get_as("swapfile_min_count").unwrap_or(1);
-        let frequency: u64 = config.get_as("swapfile_frequency").unwrap_or(1);
+        let min_count: u32 = get_compat_as("swapfile_min_count", "swapfc_min_count", 1);
+        let frequency: u64 = get_compat_as("swapfile_frequency", "swapfc_frequency", 1) as u64;
         let frequency = frequency.clamp(1, 86400);
 
-        let progressive_scaling = !config.get_bool("swapfile_progressive_disable");
-        let scaling_step: u32 = config.get_as("swapfile_scaling_step").unwrap_or(4);
+        let progressive_scaling = !get_compat_bool("swapfile_progressive_disable", "swapfc_progressive_disable");
+        let scaling_step: u32 = get_compat_as("swapfile_scaling_step", "swapfc_scaling_step", 4);
         let scaling_step = scaling_step.clamp(2, 8);
         
-        let max_chunk_size_str = config.get("swapfile_max_chunk_size").unwrap_or("32G");
-        let max_chunk_size = parse_size(max_chunk_size_str).unwrap_or(32 * 1024 * 1024 * 1024);
+        let max_chunk_size_str = get_compat("swapfile_max_chunk_size", "swapfc_max_chunk_size", "32G");
+        let max_chunk_size = parse_size(&max_chunk_size_str).unwrap_or(32 * 1024 * 1024 * 1024);
 
-        let shrink_threshold: u8 = config.get_as("swapfile_shrink_threshold").unwrap_or(30);
+        let shrink_threshold: u8 = get_compat_as("swapfile_shrink_threshold", "swapfc_shrink_threshold", 30) as u8;
         let shrink_threshold = shrink_threshold.clamp(10, 50);
         
-        let safe_headroom: u8 = config.get_as("swapfile_safe_headroom").unwrap_or(40);
+        let safe_headroom: u8 = get_compat_as("swapfile_safe_headroom", "swapfc_safe_headroom", 40) as u8;
         let safe_headroom = safe_headroom.clamp(20, 60);
 
-        let discard_str = config.get("swapfile_discard").unwrap_or("auto");
-        let discard_policy = DiscardPolicy::parse_str(discard_str);
+        let discard_str = get_compat("swapfile_discard", "swapfc_discard", "auto");
+        let discard_policy = DiscardPolicy::parse_str(&discard_str);
 
         Ok(Self {
             path,
             chunk_size,
             max_count,
             min_count,
-            free_ram_perc: config.get_as("swapfile_free_ram_perc").unwrap_or(35),
-            free_swap_perc: config.get_as("swapfile_free_swap_perc").unwrap_or(25),
-            remove_free_swap_perc: config.get_as("swapfile_remove_free_swap_perc").unwrap_or(55),
+            free_ram_perc: get_compat_as("swapfile_free_ram_perc", "swapfc_free_ram_perc", 35) as u8,
+            free_swap_perc: get_compat_as("swapfile_free_swap_perc", "swapfc_free_swap_perc", 25) as u8,
+            remove_free_swap_perc: get_compat_as("swapfile_remove_free_swap_perc", "swapfc_remove_free_swap_perc", 55) as u8,
             frequency,
-            priority: config.get_as("swapfile_priority").unwrap_or(-1),
-            force_use_loop: config.get_bool("swapfile_force_use_loop"),
-            directio_disable: config.get_bool("swapfile_directio_disable"),
+            priority: config.get_as("swapfile_priority")
+                .or_else(|_| config.get_as("swapfc_priority"))
+                .unwrap_or(-1),
+            force_use_loop: get_compat_bool("swapfile_force_use_loop", "swapfc_force_use_loop"),
+            directio_disable: get_compat_bool("swapfile_directio_disable", "swapfc_directio_disable"),
             progressive_scaling,
             scaling_step,
             max_chunk_size,
             shrink_threshold,
             safe_headroom,
             discard_policy,
-            use_partitions: config.get_bool("swapfile_use_partitions"),
-            partition_threshold: config.get_as("swapfile_partition_threshold").unwrap_or(90),
+            use_partitions: get_compat_bool("swapfile_use_partitions", "swapfc_use_partitions"),
+            partition_threshold: get_compat_as("swapfile_partition_threshold", "swapfc_partition_threshold", 90) as u8,
         })
     }
 }
@@ -261,7 +280,6 @@ fn parse_size(s: &str) -> Result<u64> {
 pub struct SwapFile {
     config: SwapFileConfig,
     allocated: u32,
-    block_size: u64,
     priority: i32,
     /// True if path is on btrfs (for subvolume/nodatacow handling)
     is_btrfs: bool,
@@ -354,6 +372,7 @@ impl SwapFile {
         }
 
         let block_size = fs::metadata(&swapfile_config.path)?.blksize();
+        let _ = block_size; // Used for mkswap alignment, not needed in struct
         makedirs(format!("{}/swapfile", WORK_DIR))?;
 
         // Detect storage type for optimizations
@@ -379,7 +398,6 @@ impl SwapFile {
         Ok(Self {
             config: swapfile_config,
             allocated: 0,
-            block_size,
             priority,
             is_btrfs,
             file_sizes: Vec::new(),
@@ -412,56 +430,6 @@ impl SwapFile {
         let size = self.config.chunk_size.saturating_mul(1u64 << tier);
         
         size.min(self.config.max_chunk_size)
-    }
-
-    /// Get total configured swap capacity (virtual, with progressive scaling)
-    pub fn total_capacity(&self) -> u64 {
-        (1..=self.config.max_count)
-            .map(|n| self.get_chunk_size_for_file(n))
-            .sum()
-    }
-
-    /// Get currently allocated swap size
-    pub fn allocated_size(&self) -> u64 {
-        self.file_sizes.iter().sum()
-    }
-
-    /// Print scaling plan for debugging
-    pub fn print_scaling_plan(&self) {
-        if !self.config.progressive_scaling {
-            info!("swapFC: fixed chunk size {}MB x {} = {}GB total",
-                self.config.chunk_size / (1024 * 1024),
-                self.config.max_count,
-                (self.config.chunk_size * self.config.max_count as u64) / (1024 * 1024 * 1024));
-            return;
-        }
-
-        info!("swapFC: Progressive scaling plan:");
-        let mut cumulative: u64 = 0;
-        let mut current_tier = 0u32;
-        let mut tier_start = 1u32;
-
-        for file_num in 1..=self.config.max_count {
-            let size = self.get_chunk_size_for_file(file_num);
-            cumulative += size;
-            
-            let tier = (file_num.saturating_sub(1)) / self.config.scaling_step;
-            if tier != current_tier || file_num == self.config.max_count {
-                let tier_end = if tier != current_tier { file_num - 1 } else { file_num };
-                let tier_size = self.get_chunk_size_for_file(tier_start);
-                info!("  Files {}-{}: {}MB each, cumulative: {}GB",
-                    tier_start, tier_end,
-                    tier_size / (1024 * 1024),
-                    cumulative / (1024 * 1024 * 1024));
-                
-                current_tier = tier;
-                tier_start = file_num;
-            }
-        }
-        
-        info!("swapFC: Total potential capacity: {}GB with {} files",
-            self.total_capacity() / (1024 * 1024 * 1024),
-            self.config.max_count);
     }
 
     /// Calculate dynamic expansion threshold based on number of allocated files
@@ -800,7 +768,7 @@ impl SwapFile {
 
     fn has_enough_space(&self, required_size: u64) -> bool {
         if let Ok(stat) = nix::sys::statvfs::statvfs(&self.config.path) {
-            let free_bytes = stat.blocks_available() * self.block_size;
+            let free_bytes = stat.blocks_available() * stat.block_size();
             // Need at least 2x the required size (safety margin)
             free_bytes >= required_size * 2
         } else {
@@ -849,10 +817,16 @@ impl SwapFile {
         // This guarantees disk space is reserved and prevents system freezes
         info!("swapFC: creating preallocated file #{} ({}MB)",
             self.allocated, chunk_size / (1024 * 1024));
-        Command::new("fallocate")
+        let status = Command::new("fallocate")
             .args(["-l", &chunk_size.to_string()])
             .arg(&swapfile_path)
             .status()?;
+        if !status.success() {
+            force_remove(&swapfile_path, false);
+            self.allocated -= 1;
+            self.file_sizes.pop();
+            return Err(SwapFileError::NoSpace);
+        }
 
         // Loop device only if explicitly requested
         let use_loop = self.config.force_use_loop;
@@ -872,11 +846,17 @@ impl SwapFile {
         };
 
         // mkswap
-        Command::new("mkswap")
+        let status = Command::new("mkswap")
             .args(["-L", &format!("SWAP_btrfs_{}", self.allocated)])
             .arg(&swapfile)
             .stdout(Stdio::null())
             .status()?;
+        if !status.success() {
+            force_remove(&swapfile_path, false);
+            self.allocated -= 1;
+            self.file_sizes.pop();
+            return Err(SwapFileError::Io(std::io::Error::other("mkswap failed")));
+        }
 
         // Generate and start swap unit with discard policy based on storage type
         let discard_options = self.config.discard_policy.to_options_string(&self.storage_type);

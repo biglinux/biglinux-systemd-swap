@@ -17,10 +17,10 @@ pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Check if shutdown was requested
 pub fn is_shutdown() -> bool {
-    SHUTDOWN.load(Ordering::Relaxed)
+    SHUTDOWN.load(Ordering::Acquire)
 }
 
 /// Request shutdown
 pub fn request_shutdown() {
-    SHUTDOWN.store(true, Ordering::Relaxed);
+    SHUTDOWN.store(true, Ordering::Release);
 }

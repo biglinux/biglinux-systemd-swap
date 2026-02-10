@@ -316,14 +316,11 @@ impl RamProfile {
         }
     }
 
-    /// Recommended zram algorithm based on RAM
-    /// Low RAM: zstd for max compression
-    /// High RAM: lz4 for max speed
+    /// Recommended zram algorithm: always zstd
+    /// Modern CPUs handle zstd with minimal overhead and the better
+    /// compression ratio means more effective memory usage
     pub fn recommended_zram_alg(&self) -> &'static str {
-        match self {
-            RamProfile::UltraLow | RamProfile::Low => "zstd",
-            _ => "lz4",
-        }
+        "zstd"
     }
 
     /// Recommended zram size percentage
@@ -348,23 +345,23 @@ impl RamProfile {
     }
 
     /// Recommended MGLRU min_ttl_ms for working set protection
+    /// Desktop systems benefit from generous protection to prevent UI stuttering
     pub fn recommended_mglru_min_ttl(&self) -> u32 {
         match self {
             RamProfile::UltraLow => 5000,   // 5s - maximum protection
             RamProfile::Low => 3000,        // 3s
             RamProfile::Medium => 2000,     // 2s
-            RamProfile::Standard => 1000,   // 1s
-            RamProfile::High => 500,        // 0.5s
-            RamProfile::VeryHigh => 250,    // 0.25s - RAM is abundant
+            RamProfile::Standard => 1500,   // 1.5s
+            RamProfile::High => 1000,       // 1s - still protect working set
+            RamProfile::VeryHigh => 1000,   // 1s - desktop UX matters even with lots of RAM
         }
     }
 
     /// Recommended zswap compressor
+    /// Always zstd: better compression ratio means more pages in pool,
+    /// less disk I/O, and modern CPUs handle it with minimal overhead
     pub fn recommended_zswap_compressor(&self) -> &'static str {
-        match self {
-            RamProfile::UltraLow | RamProfile::Low => "zstd",
-            _ => "lz4",
-        }
+        "zstd"
     }
 }
 
@@ -382,7 +379,7 @@ pub struct SystemCapabilities {
 impl SystemCapabilities {
     /// Detect system capabilities
     pub fn detect() -> Self {
-        let swap_path = "/swapfc";
+        let swap_path = "/swapfile";
         let swap_path_fstype = get_fstype(swap_path).or_else(|| get_fstype("/"));
         let storage_type = StorageType::detect(swap_path);
         let ram_profile = RamProfile::detect();
@@ -470,14 +467,14 @@ impl Default for RecommendedConfig {
             use_swapfc: false,
             zram_enabled: true,
             zram_size_percent: 80,
-            zram_algorithm: "lz4".to_string(),
+            zram_algorithm: "zstd".to_string(),
             zram_mem_limit_percent: 70,
             zswap_enabled: false,
-            zswap_compressor: "lz4".to_string(),
+            zswap_compressor: "zstd".to_string(),
             zswap_max_pool_percent: 25,
             swapfc_enabled: false,
             swapfc_directio: false,
-            swapfc_chunk_size: "256M".to_string(),
+            swapfc_chunk_size: "512M".to_string(),
             mglru_min_ttl_ms: 1000,
         }
     }
@@ -494,10 +491,22 @@ impl RecommendedConfig {
             return Self::for_live_system(ram);
         }
 
-        // HDD: prefer zram to avoid thrashing
+        // HDD: use zswap+swapfc if filesystem supports it and enough disk space
+        // On HDD, zswap caches hot pages in RAM while cold pages go to disk.
+        // This is critical for low-RAM systems (2-4GB) that NEED disk swap.
         if matches!(caps.storage_type, StorageType::HDD) {
-            info!("Autoconfig: HDD detected - using zram only to avoid thrashing");
-            return Self::for_hdd(ram);
+            let supports_swapfiles = caps.swap_path_fstype.as_deref()
+                .map(|fs| matches!(fs, "btrfs" | "ext4" | "xfs"))
+                .unwrap_or(false);
+            let has_enough_space = caps.free_disk_space_bytes > caps.total_ram_bytes * 5;
+            
+            if supports_swapfiles && has_enough_space {
+                info!("Autoconfig: HDD + supported FS + enough space - using zswap + swapfc");
+                return Self::for_hdd_with_swap(ram, caps.total_ram_bytes);
+            } else {
+                info!("Autoconfig: HDD without enough disk space - using zram only");
+                return Self::for_hdd(ram);
+            }
         }
 
         // eMMC/SD: protect wear, minimize disk writes
@@ -511,13 +520,15 @@ impl RecommendedConfig {
             .map(|fs| matches!(fs, "btrfs" | "ext4" | "xfs"))
             .unwrap_or(false);
 
-        // SSD/NVMe with supported filesystem and enough space: zswap + swapfc
-        if supports_swapfiles && caps.free_disk_space_bytes > 4 * GB {
+        // SSD/NVMe with supported filesystem and enough space (5x RAM): zswap + swapfc
+        if supports_swapfiles && caps.free_disk_space_bytes > caps.total_ram_bytes * 5 {
             let is_nvme = matches!(caps.storage_type, StorageType::NVMe);
-            info!("Autoconfig: {} + {} - using zswap + swapfc", 
+            info!("Autoconfig: {} + {} - using zswap + swapfc (disk space {:.1}GB, RAM {:.1}GB)", 
                 if is_nvme { "NVMe" } else { "SSD" },
-                caps.swap_path_fstype.as_deref().unwrap_or("unknown"));
-            return Self::for_ssd(ram, is_nvme);
+                caps.swap_path_fstype.as_deref().unwrap_or("unknown"),
+                caps.free_disk_space_bytes as f64 / GB as f64,
+                caps.total_ram_bytes as f64 / GB as f64);
+            return Self::for_ssd(ram, is_nvme, caps.total_ram_bytes);
         }
 
         // Fallback: zram only
@@ -532,7 +543,7 @@ impl RecommendedConfig {
             use_swapfc: false,
             zram_enabled: true,
             zram_size_percent: 100,  // Max for live systems
-            zram_algorithm: ram.recommended_zram_alg().to_string(),
+            zram_algorithm: "zstd".to_string(),
             zram_mem_limit_percent: 50,  // Protect RAM on live systems
             zswap_enabled: false,
             zswap_compressor: "zstd".to_string(),
@@ -551,15 +562,43 @@ impl RecommendedConfig {
             use_swapfc: false,
             zram_enabled: true,
             zram_size_percent: ram.recommended_zram_size_percent(),
-            zram_algorithm: ram.recommended_zram_alg().to_string(),
+            zram_algorithm: "zstd".to_string(),
             zram_mem_limit_percent: ram.recommended_zram_mem_limit_percent(),
             zswap_enabled: false,
             zswap_compressor: "zstd".to_string(),
             zswap_max_pool_percent: 0,
             swapfc_enabled: false,
-            swapfc_directio: false,  // HDD: no direct I/O
+            swapfc_directio: false,
             swapfc_chunk_size: "256M".to_string(),
             mglru_min_ttl_ms: ram.recommended_mglru_min_ttl(),
+        }
+    }
+
+    /// HDD with supported filesystem and enough disk space
+    /// Uses zswap to cache hot pages in RAM + swap files on disk as safety net
+    /// Critical for low-RAM systems (2-4GB) that need disk-backed swap
+    fn for_hdd_with_swap(ram: &RamProfile, total_ram_bytes: u64) -> Self {
+        // Chunk size: 1GB if RAM > 8GB, otherwise 512MB
+        let chunk_size = if total_ram_bytes > 8 * 1024 * 1024 * 1024 {
+            "1G"
+        } else {
+            "512M"
+        };
+        Self {
+            swap_mode: SwapMode::ZswapSwapfc,
+            use_zswap: true,
+            use_swapfc: true,
+            zram_enabled: false,
+            zram_size_percent: 0,
+            zram_algorithm: "zstd".to_string(),
+            zram_mem_limit_percent: 0,
+            zswap_enabled: true,
+            zswap_compressor: "zstd".to_string(),
+            zswap_max_pool_percent: 50,  // Generous pool to minimize HDD writes
+            swapfc_enabled: true,
+            swapfc_directio: false,  // No direct I/O on HDD
+            swapfc_chunk_size: chunk_size.to_string(),
+            mglru_min_ttl_ms: ram.recommended_mglru_min_ttl().max(3000),  // Extra protection on HDD
         }
     }
 
@@ -570,7 +609,7 @@ impl RecommendedConfig {
             use_swapfc: false,
             zram_enabled: true,
             zram_size_percent: ram.recommended_zram_size_percent(),
-            zram_algorithm: "zstd".to_string(),  // Max compression = less overflow
+            zram_algorithm: "zstd".to_string(),
             zram_mem_limit_percent: ram.recommended_zram_mem_limit_percent(),
             zswap_enabled: false,
             zswap_compressor: "zstd".to_string(),
@@ -582,21 +621,27 @@ impl RecommendedConfig {
         }
     }
 
-    fn for_ssd(ram: &RamProfile, is_nvme: bool) -> Self {
+    fn for_ssd(ram: &RamProfile, is_nvme: bool, total_ram_bytes: u64) -> Self {
+        // Chunk size: 1GB if RAM > 8GB, otherwise 512MB
+        let chunk_size = if total_ram_bytes > 8 * 1024 * 1024 * 1024 {
+            "1G"
+        } else {
+            "512M"
+        };
         Self {
             swap_mode: SwapMode::ZswapSwapfc,
             use_zswap: true,
             use_swapfc: true,
             zram_enabled: false,
             zram_size_percent: 0,
-            zram_algorithm: "lz4".to_string(),
+            zram_algorithm: "zstd".to_string(),
             zram_mem_limit_percent: 0,
             zswap_enabled: true,
-            zswap_compressor: ram.recommended_zswap_compressor().to_string(),
+            zswap_compressor: "zstd".to_string(),
             zswap_max_pool_percent: 25,  // Uniform for all RAM profiles
             swapfc_enabled: true,
             swapfc_directio: is_nvme,    // Direct I/O only on NVMe
-            swapfc_chunk_size: if is_nvme { "512M" } else { "256M" }.to_string(),
+            swapfc_chunk_size: chunk_size.to_string(),
             mglru_min_ttl_ms: ram.recommended_mglru_min_ttl(),
         }
     }

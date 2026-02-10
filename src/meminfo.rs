@@ -108,49 +108,6 @@ pub fn get_cpu_count() -> usize {
         .unwrap_or(1)
 }
 
-/// Zswap statistics from debugfs
-#[derive(Debug, Default, Clone)]
-pub struct ZswapStats {
-    /// Pages currently stored in zswap pool (RAM)
-    pub stored_pages: u64,
-    /// Total bytes used by zswap pool in RAM
-    pub pool_total_size: u64,
-    /// Pages that have been written back to disk swap
-    pub written_back_pages: u64,
-    /// Pages rejected due to reclaim failure
-    pub reject_reclaim_fail: u64,
-    /// Same-value filled pages (often zeros)
-    pub same_filled_pages: u64,
-    /// Pool limit hit count
-    pub pool_limit_hit: u64,
-}
-
-const ZSWAP_DEBUG_DIR: &str = "/sys/kernel/debug/zswap";
-
-/// Read zswap statistics from debugfs (requires root)
-pub fn get_zswap_stats() -> Option<ZswapStats> {
-    let debug_path = std::path::Path::new(ZSWAP_DEBUG_DIR);
-    if !debug_path.is_dir() {
-        return None;
-    }
-
-    let read_stat = |name: &str| -> u64 {
-        std::fs::read_to_string(debug_path.join(name))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
-    };
-
-    Some(ZswapStats {
-        stored_pages: read_stat("stored_pages"),
-        pool_total_size: read_stat("pool_total_size"),
-        written_back_pages: read_stat("written_back_pages"),
-        reject_reclaim_fail: read_stat("reject_reclaim_fail"),
-        same_filled_pages: read_stat("same_filled_pages"),
-        pool_limit_hit: read_stat("pool_limit_hit"),
-    })
-}
-
 /// Effective swap usage information accounting for zswap
 #[derive(Debug, Default)]
 pub struct EffectiveSwapUsage {
@@ -264,29 +221,6 @@ fn get_mem_stats_optional(fields: &[&str]) -> Result<HashMap<String, u64>> {
     }
 
     Ok(stats)
-}
-
-/// Get effective free swap percentage accounting for zswap
-/// 
-/// This returns a more accurate picture of swap pressure:
-/// - If zswap is inactive, returns normal SwapFree percentage
-/// - If zswap is active, considers both pool utilization and disk pressure
-pub fn get_effective_free_swap_percent() -> Result<u8> {
-    let usage = get_effective_swap_usage()?;
-
-    if !usage.zswap_active || usage.swap_total == 0 {
-        // No zswap, use traditional calculation
-        return Ok(((usage.swap_free * 100) / usage.swap_total.max(1)) as u8);
-    }
-
-    // With zswap active, calculate based on actual disk usage
-    let disk_used_percent = if usage.swap_total > 0 {
-        ((usage.swap_used_disk * 100) / usage.swap_total) as u8
-    } else {
-        0
-    };
-
-    Ok(100u8.saturating_sub(disk_used_percent))
 }
 
 #[cfg(test)]
