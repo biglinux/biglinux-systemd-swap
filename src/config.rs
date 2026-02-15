@@ -84,8 +84,10 @@ impl Config {
                         if let Some(basename) = entry.file_name() {
                             if let Some(path_str) = entry.to_str() {
                                 debug!("Found {}", path_str);
-                                config_files
-                                    .insert(basename.to_string_lossy().to_string(), path_str.to_string());
+                                config_files.insert(
+                                    basename.to_string_lossy().to_string(),
+                                    path_str.to_string(),
+                                );
                             }
                         }
                     }
@@ -107,14 +109,93 @@ impl Config {
         Ok(Self { values })
     }
 
-    /// Apply optimized values from autoconfig (only if not explicitly set)
-    /// This allows hardware-based auto-tuning while respecting user overrides
-    /// Apply optimized values from autoconfig
-    /// Currently this only logs the detection result, as specific parameters are static
-    pub fn apply_autoconfig(&mut self, _recommended: &crate::autoconfig::RecommendedConfig) {
-        // We no longer override specific parameters dynamically.
-        // The mode selection happens in main.rs based on recommendations.
-        debug!("Autoconfig applied (mode selection only)");
+    /// Helper: set a config key only if the user hasn't explicitly set it
+    fn set_if_missing(&mut self, key: &str, value: &str) {
+        if !self.values.contains_key(key) {
+            debug!("Autoconfig: injecting {}={}", key, value);
+            self.values.insert(key.to_string(), value.to_string());
+        } else {
+            debug!(
+                "Autoconfig: keeping user-defined {}={}",
+                key, self.values[key]
+            );
+        }
+    }
+
+    /// Apply optimized values from autoconfig (only if not explicitly set).
+    /// This allows hardware-based auto-tuning while respecting user overrides.
+    /// When swap_mode=auto, the GUI comments out all keys, so this method
+    /// effectively sets all recommended values for the detected hardware.
+    pub fn apply_autoconfig(&mut self, recommended: &crate::autoconfig::RecommendedConfig) {
+        info!("Autoconfig: applying recommended configuration for detected hardware");
+
+        // Zswap settings
+        self.set_if_missing("zswap_compressor", &recommended.zswap_compressor);
+        self.set_if_missing(
+            "zswap_max_pool_percent",
+            &recommended.zswap_max_pool_percent.to_string(),
+        );
+        self.set_if_missing("zswap_zpool", "zsmalloc");
+        self.set_if_missing("zswap_shrinker_enabled", "1");
+        self.set_if_missing("zswap_accept_threshold", "85");
+
+        // MGLRU
+        self.set_if_missing(
+            "mglru_min_ttl_ms",
+            &recommended.mglru_min_ttl_ms.to_string(),
+        );
+
+        // Zram settings
+        self.set_if_missing("zram_alg", &recommended.zram_algorithm);
+        self.set_if_missing("zram_size", &format!("{}%", recommended.zram_size_percent));
+        self.set_if_missing(
+            "zram_mem_limit",
+            &format!("{}%", recommended.zram_mem_limit_percent),
+        );
+        self.set_if_missing("zram_prio", "32767");
+
+        // Swapfile settings
+        self.set_if_missing("swapfc_chunk_size", &recommended.swapfc_chunk_size);
+        self.set_if_missing("swapfile_chunk_size", &recommended.swapfc_chunk_size);
+        self.set_if_missing(
+            "swapfc_max_count",
+            &recommended.swapfc_max_count.to_string(),
+        );
+        self.set_if_missing(
+            "swapfile_max_count",
+            &recommended.swapfc_max_count.to_string(),
+        );
+        self.set_if_missing(
+            "swapfc_free_ram_perc",
+            &recommended.swapfc_free_ram_perc.to_string(),
+        );
+        self.set_if_missing(
+            "swapfile_free_ram_perc",
+            &recommended.swapfc_free_ram_perc.to_string(),
+        );
+        self.set_if_missing(
+            "swapfc_free_swap_perc",
+            &recommended.swapfc_free_swap_perc.to_string(),
+        );
+        self.set_if_missing(
+            "swapfile_free_swap_perc",
+            &recommended.swapfc_free_swap_perc.to_string(),
+        );
+        self.set_if_missing(
+            "swapfc_remove_free_swap_perc",
+            &recommended.swapfc_remove_free_swap_perc.to_string(),
+        );
+        self.set_if_missing(
+            "swapfile_remove_free_swap_perc",
+            &recommended.swapfc_remove_free_swap_perc.to_string(),
+        );
+
+        if recommended.swapfc_directio {
+            self.set_if_missing("swapfc_directio", "1");
+            self.set_if_missing("swapfile_directio", "1");
+        }
+
+        info!("Autoconfig: {} values injected", "done");
     }
 
     /// Check if a key has been explicitly set (vs default)
@@ -158,7 +239,12 @@ impl Config {
             if let Some(end) = result[start..].find("))") {
                 let expr = &result[start + 3..start + end];
                 let expanded = Self::evaluate_simple_arithmetic(expr);
-                result = format!("{}{}{}", &result[..start], expanded, &result[start + end + 2..]);
+                result = format!(
+                    "{}{}{}",
+                    &result[..start],
+                    expanded,
+                    &result[start + end + 2..]
+                );
             } else {
                 break;
             }
@@ -176,7 +262,9 @@ impl Config {
         // Try binary operations
         for op in ['*', '/', '+', '-'] {
             if let Some(pos) = expr.rfind(op) {
-                if pos == 0 { continue; } // Skip leading minus
+                if pos == 0 {
+                    continue;
+                } // Skip leading minus
                 let left = expr[..pos].trim();
                 let right = expr[pos + 1..].trim();
                 if let (Ok(l), Ok(r)) = (left.parse::<i64>(), right.parse::<i64>()) {
@@ -184,7 +272,13 @@ impl Config {
                         '+' => l + r,
                         '-' => l - r,
                         '*' => l * r,
-                        '/' => if r != 0 { l / r } else { 0 },
+                        '/' => {
+                            if r != 0 {
+                                l / r
+                            } else {
+                                0
+                            }
+                        }
                         _ => unreachable!(),
                     };
                     return result.to_string();

@@ -197,9 +197,12 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         SwapMode::Auto => {
             config.apply_autoconfig(&recommended);
 
-            if recommended.use_zswap {
+            if recommended.zswap_enabled {
                 info!("Auto-detected: using zswap + swapfc");
                 SwapMode::ZswapSwapfc
+            } else if recommended.swapfc_enabled {
+                info!("Auto-detected: using zram + swapfc");
+                SwapMode::ZramSwapfc
             } else {
                 info!("Auto-detected: using zram only");
                 SwapMode::ZramOnly
@@ -244,7 +247,10 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
             match SwapFile::new(&config) {
                 Ok(mut swapfc) => {
                     if let Err(e) = swapfc.create_initial_swap() {
-                        warn!("Swapfile initial creation failed, continuing without: {}", e);
+                        warn!(
+                            "Swapfile initial creation failed, continuing without: {}",
+                            e
+                        );
                     } else if let Err(e) = swapfc.run() {
                         warn!("Swapfile monitor exited: {}", e);
                     }
@@ -317,7 +323,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 let wb_config = systemd_swap::zram::ZramWritebackConfig::from_config(&config);
                 let mut wb_manager = systemd_swap::zram::ZramWritebackManager::new(wb_config);
 
-                if config.get_bool("zram_writeback") || wb_manager.is_available()
+                if config.get_bool("zram_writeback")
+                    || wb_manager.is_available()
                     || systemd_swap::zram::is_recompression_available()
                 {
                     if let Err(e) = wb_manager.run() {
@@ -612,14 +619,42 @@ fn autoconfig() -> Result<(), Box<dyn std::error::Error>> {
     println!("Swap path filesystem: {:?}", caps.swap_path_fstype);
 
     println!("\n=== Recommended Configuration ===");
-
-    if recommended.use_zswap {
-        println!("Mode: zswap + swapfc (best for desktop with supported filesystem)");
-    } else {
-        println!("Mode: zram only (fallback for unsupported filesystem)");
-    }
-
-    println!("\nNOTE: Specific parameters (compressor, sizes, etc.) are controlled via /etc/systemd/swap.conf");
+    println!("  swap_mode:              {:?}", recommended.swap_mode);
+    println!("  zswap_enabled:          {}", recommended.zswap_enabled);
+    println!("  zswap_compressor:       {}", recommended.zswap_compressor);
+    println!(
+        "  zswap_max_pool_percent: {}%",
+        recommended.zswap_max_pool_percent
+    );
+    println!("  zram_enabled:           {}", recommended.zram_enabled);
+    println!(
+        "  zram_size:              {}%",
+        recommended.zram_size_percent
+    );
+    println!("  zram_algorithm:         {}", recommended.zram_algorithm);
+    println!(
+        "  zram_mem_limit:         {}%",
+        recommended.zram_mem_limit_percent
+    );
+    println!("  swapfc_enabled:         {}", recommended.swapfc_enabled);
+    println!(
+        "  swapfc_chunk_size:      {}",
+        recommended.swapfc_chunk_size
+    );
+    println!("  swapfc_directio:        {}", recommended.swapfc_directio);
+    println!("  swapfc_max_count:       {}", recommended.swapfc_max_count);
+    println!(
+        "  swapfc_free_ram_perc:   {}%",
+        recommended.swapfc_free_ram_perc
+    );
+    println!(
+        "  swapfc_free_swap_perc:  {}%",
+        recommended.swapfc_free_swap_perc
+    );
+    println!(
+        "  mglru_min_ttl_ms:       {}ms",
+        recommended.mglru_min_ttl_ms
+    );
 
     Ok(())
 }

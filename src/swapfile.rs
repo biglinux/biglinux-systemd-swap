@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::autoconfig::{StorageType, get_swap_partition_stats};
+use crate::autoconfig::{get_swap_partition_stats, StorageType};
 use crate::config::{Config, WORK_DIR};
 use crate::helpers::{force_remove, get_fstype, makedirs, run_cmd_output};
-use crate::meminfo::get_free_ram_percent;
-use crate::systemd::{gen_swap_unit, notify_ready, notify_status, systemctl, swapoff};
+use crate::meminfo::{get_free_ram_percent, get_free_swap_percent};
+use crate::systemd::{gen_swap_unit, notify_ready, notify_status, swapoff, systemctl};
 use crate::{debug, info, is_shutdown, warn};
 
 /// Discard policy for swap on SSDs/NVMe
@@ -40,10 +40,10 @@ impl DiscardPolicy {
             "once" => DiscardPolicy::Once,
             "pages" => DiscardPolicy::Pages,
             "both" | "all" => DiscardPolicy::Both,
-            _ => DiscardPolicy::Auto,  // Default to auto
+            _ => DiscardPolicy::Auto, // Default to auto
         }
     }
-    
+
     /// Convert to systemd swap unit Options string
     pub fn to_options_string(&self, storage_type: &StorageType) -> Option<&'static str> {
         match self {
@@ -56,7 +56,7 @@ impl DiscardPolicy {
                 match storage_type {
                     StorageType::NVMe | StorageType::SSD => Some("discard=once"),
                     StorageType::EMMC => Some("discard=once"),
-                    _ => None,  // HDD, SD, Unknown - no discard
+                    _ => None, // HDD, SD, Unknown - no discard
                 }
             }
         }
@@ -67,13 +67,13 @@ impl DiscardPolicy {
 /// Higher priority = used first by the kernel
 pub fn calculate_auto_priority(storage_type: &StorageType) -> i32 {
     match storage_type {
-        StorageType::Tmpfs => 150,     // RAM-based, highest priority
-        StorageType::NVMe => 100,      // Fastest physical storage
-        StorageType::SSD => 75,        // Fast
-        StorageType::EMMC => 50,       // Moderate
-        StorageType::SD => 25,         // Slow, avoid wearing
-        StorageType::HDD => 10,        // Slowest
-        StorageType::Unknown => 0,     // Unknown, lowest priority
+        StorageType::Tmpfs => 150, // RAM-based, highest priority
+        StorageType::NVMe => 100,  // Fastest physical storage
+        StorageType::SSD => 75,    // Fast
+        StorageType::EMMC => 50,   // Moderate
+        StorageType::SD => 25,     // Slow, avoid wearing
+        StorageType::HDD => 10,    // Slowest
+        StorageType::Unknown => 0, // Unknown, lowest priority
     }
 }
 
@@ -112,12 +112,11 @@ impl SwapFileInfo {
         }
         ((self.used_bytes * 100) / self.size_bytes) as u8
     }
-    
+
     /// Check if file is nearly empty (candidate for removal)
     pub fn is_nearly_empty(&self, threshold: u8) -> bool {
         self.usage_percent() <= threshold
     }
-    
 }
 
 /// SwapFC configuration
@@ -169,13 +168,15 @@ impl SwapFileConfig {
     pub fn from_config(config: &Config) -> Result<Self> {
         // Helper: try swapfile_* key first, fall back to swapfc_* for backward compat
         let get_compat = |new_key: &str, old_key: &str, default: &str| -> String {
-            config.get(new_key)
+            config
+                .get(new_key)
                 .or_else(|_| config.get(old_key))
                 .unwrap_or(default)
                 .to_string()
         };
         let get_compat_as = |new_key: &str, old_key: &str, default: u32| -> u32 {
-            config.get_as(new_key)
+            config
+                .get_as(new_key)
                 .or_else(|_| config.get_as(old_key))
                 .unwrap_or(default)
         };
@@ -200,17 +201,21 @@ impl SwapFileConfig {
         let frequency: u64 = get_compat_as("swapfile_frequency", "swapfc_frequency", 1) as u64;
         let frequency = frequency.clamp(1, 86400);
 
-        let progressive_scaling = !get_compat_bool("swapfile_progressive_disable", "swapfc_progressive_disable");
+        let progressive_scaling =
+            !get_compat_bool("swapfile_progressive_disable", "swapfc_progressive_disable");
         let scaling_step: u32 = get_compat_as("swapfile_scaling_step", "swapfc_scaling_step", 4);
         let scaling_step = scaling_step.clamp(2, 8);
-        
-        let max_chunk_size_str = get_compat("swapfile_max_chunk_size", "swapfc_max_chunk_size", "32G");
+
+        let max_chunk_size_str =
+            get_compat("swapfile_max_chunk_size", "swapfc_max_chunk_size", "32G");
         let max_chunk_size = parse_size(&max_chunk_size_str).unwrap_or(32 * 1024 * 1024 * 1024);
 
-        let shrink_threshold: u8 = get_compat_as("swapfile_shrink_threshold", "swapfc_shrink_threshold", 30) as u8;
+        let shrink_threshold: u8 =
+            get_compat_as("swapfile_shrink_threshold", "swapfc_shrink_threshold", 30) as u8;
         let shrink_threshold = shrink_threshold.clamp(10, 50);
-        
-        let safe_headroom: u8 = get_compat_as("swapfile_safe_headroom", "swapfc_safe_headroom", 40) as u8;
+
+        let safe_headroom: u8 =
+            get_compat_as("swapfile_safe_headroom", "swapfc_safe_headroom", 40) as u8;
         let safe_headroom = safe_headroom.clamp(20, 60);
 
         let discard_str = get_compat("swapfile_discard", "swapfc_discard", "auto");
@@ -221,15 +226,25 @@ impl SwapFileConfig {
             chunk_size,
             max_count,
             min_count,
-            free_ram_perc: get_compat_as("swapfile_free_ram_perc", "swapfc_free_ram_perc", 35) as u8,
-            free_swap_perc: get_compat_as("swapfile_free_swap_perc", "swapfc_free_swap_perc", 25) as u8,
-            remove_free_swap_perc: get_compat_as("swapfile_remove_free_swap_perc", "swapfc_remove_free_swap_perc", 55) as u8,
+            free_ram_perc: get_compat_as("swapfile_free_ram_perc", "swapfc_free_ram_perc", 20)
+                as u8,
+            free_swap_perc: get_compat_as("swapfile_free_swap_perc", "swapfc_free_swap_perc", 40)
+                as u8,
+            remove_free_swap_perc: get_compat_as(
+                "swapfile_remove_free_swap_perc",
+                "swapfc_remove_free_swap_perc",
+                70,
+            ) as u8,
             frequency,
-            priority: config.get_as("swapfile_priority")
+            priority: config
+                .get_as("swapfile_priority")
                 .or_else(|_| config.get_as("swapfc_priority"))
                 .unwrap_or(-1),
             force_use_loop: get_compat_bool("swapfile_force_use_loop", "swapfc_force_use_loop"),
-            directio_disable: get_compat_bool("swapfile_directio_disable", "swapfc_directio_disable"),
+            directio_disable: get_compat_bool(
+                "swapfile_directio_disable",
+                "swapfc_directio_disable",
+            ),
             progressive_scaling,
             scaling_step,
             max_chunk_size,
@@ -237,7 +252,11 @@ impl SwapFileConfig {
             safe_headroom,
             discard_policy,
             use_partitions: get_compat_bool("swapfile_use_partitions", "swapfc_use_partitions"),
-            partition_threshold: get_compat_as("swapfile_partition_threshold", "swapfc_partition_threshold", 90) as u8,
+            partition_threshold: get_compat_as(
+                "swapfile_partition_threshold",
+                "swapfc_partition_threshold",
+                90,
+            ) as u8,
         })
     }
 }
@@ -245,21 +264,23 @@ impl SwapFileConfig {
 /// Parse size string like "512M", "1G", or "10%" (percentage of RAM) to bytes
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
-    
+
     // Check for percentage (e.g., "10%", "50%")
     if let Some(percent_str) = s.strip_suffix('%') {
-        let percent: u64 = percent_str.parse().map_err(|_| SwapFileError::InvalidPath)?;
+        let percent: u64 = percent_str
+            .parse()
+            .map_err(|_| SwapFileError::InvalidPath)?;
         if percent > 100 {
             return Err(SwapFileError::InvalidPath);
         }
-        
+
         // Get total RAM and calculate percentage
         let ram_size = crate::meminfo::get_ram_size().map_err(|_| SwapFileError::InvalidPath)?;
         return Ok(ram_size * percent / 100);
     }
-    
+
     let (num, suffix) = s.split_at(s.len().saturating_sub(1));
-    
+
     let multiplier = match suffix.to_uppercase().as_str() {
         "K" => 1024u64,
         "M" => 1024 * 1024,
@@ -295,10 +316,15 @@ impl SwapFile {
         let swapfile_config = SwapFileConfig::from_config(config)?;
 
         if swapfile_config.progressive_scaling {
-            info!("swapFC: progressive scaling enabled (step={})", swapfile_config.scaling_step);
-            info!("swapFC: base={}MB, max={}GB", 
+            info!(
+                "swapFC: progressive scaling enabled (step={})",
+                swapfile_config.scaling_step
+            );
+            info!(
+                "swapFC: base={}MB, max={}GB",
                 swapfile_config.chunk_size / (1024 * 1024),
-                swapfile_config.max_chunk_size / (1024 * 1024 * 1024));
+                swapfile_config.max_chunk_size / (1024 * 1024 * 1024)
+            );
         }
 
         notify_status("Monitoring memory status...");
@@ -309,13 +335,16 @@ impl SwapFile {
         // Detect filesystem type
         let fstype = get_fstype(&swapfile_config.path);
         let is_btrfs = fstype.as_deref() == Some("btrfs");
-        
+
         // Verify supported filesystem
         match fstype.as_deref() {
-            Some("btrfs") | Some("ext4") | Some("xfs") => {},
+            Some("btrfs") | Some("ext4") | Some("xfs") => {}
             Some(fs) => {
-                warn!("swapFC: unsupported filesystem '{}', swap files may not work correctly", fs);
-            },
+                warn!(
+                    "swapFC: unsupported filesystem '{}', swap files may not work correctly",
+                    fs
+                );
+            }
             None => {
                 warn!("swapFC: could not detect filesystem type");
             }
@@ -325,7 +354,7 @@ impl SwapFile {
         if is_btrfs {
             // For btrfs: create subvolume with nodatacow for swap
             let is_subvolume = is_btrfs_subvolume(&swapfile_config.path);
-            
+
             if !is_subvolume {
                 if swapfile_config.path.exists() {
                     warn!("swapFC: path exists but not a subvolume, removing...");
@@ -347,27 +376,36 @@ impl SwapFile {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     warn!("swapFC: btrfs subvolume create failed: {}", stderr.trim());
-                    
+
                     // Fallback: try creating as regular directory
                     info!("swapFC: falling back to regular directory");
                     fs::create_dir_all(&swapfile_config.path)?;
-                    
+
                     // Set nodatacow attribute if possible
                     let _ = Command::new("chattr")
                         .args(["+C"])
                         .arg(&swapfile_config.path)
                         .status();
-                    
-                    info!("swapFC: created directory (non-subvolume) at {:?}", swapfile_config.path);
+
+                    info!(
+                        "swapFC: created directory (non-subvolume) at {:?}",
+                        swapfile_config.path
+                    );
                 } else {
-                    info!("swapFC: created btrfs subvolume at {:?}", swapfile_config.path);
+                    info!(
+                        "swapFC: created btrfs subvolume at {:?}",
+                        swapfile_config.path
+                    );
                 }
             }
         } else {
             // For ext4/xfs: just create directory
             if !swapfile_config.path.exists() {
                 fs::create_dir_all(&swapfile_config.path)?;
-                info!("swapFC: created swap directory at {:?}", swapfile_config.path);
+                info!(
+                    "swapFC: created swap directory at {:?}",
+                    swapfile_config.path
+                );
             }
         }
 
@@ -382,15 +420,24 @@ impl SwapFile {
         // Calculate priority: auto-detect if -1, otherwise use configured value
         let priority = if swapfile_config.priority < 0 {
             let auto_priority = calculate_auto_priority(&storage_type);
-            info!("swapFC: auto-calculated priority {} for {:?}", auto_priority, storage_type);
+            info!(
+                "swapFC: auto-calculated priority {} for {:?}",
+                auto_priority, storage_type
+            );
             auto_priority
         } else {
             swapfile_config.priority
         };
 
         // Log discard policy
-        if let Some(discard_opt) = swapfile_config.discard_policy.to_options_string(&storage_type) {
-            info!("swapFC: discard policy: {:?} -> {}", swapfile_config.discard_policy, discard_opt);
+        if let Some(discard_opt) = swapfile_config
+            .discard_policy
+            .to_options_string(&storage_type)
+        {
+            info!(
+                "swapFC: discard policy: {:?} -> {}",
+                swapfile_config.discard_policy, discard_opt
+            );
         } else {
             info!("swapFC: discard disabled for {:?}", storage_type);
         }
@@ -406,7 +453,7 @@ impl SwapFile {
     }
 
     /// Calculate the chunk size for a given file number using progressive scaling
-    /// 
+    ///
     /// With scaling_step=4 and base_size=512MB:
     /// - Files 1-4: 512MB each (tier 0)
     /// - Files 5-8: 1GB each (tier 1)
@@ -415,7 +462,7 @@ impl SwapFile {
     /// - Files 17-20: 8GB each (tier 4)
     /// - Files 21-24: 16GB each (tier 5)
     /// - Files 25-28: 32GB each (tier 6)
-    /// 
+    ///
     /// This allows up to 254GB of swap with only 28 files!
     fn get_chunk_size_for_file(&self, file_num: u32) -> u64 {
         if !self.config.progressive_scaling {
@@ -425,10 +472,10 @@ impl SwapFile {
         // Calculate tier: (file_num - 1) / scaling_step
         // file_num is 1-based, so file 1-4 = tier 0, 5-8 = tier 1, etc.
         let tier = (file_num.saturating_sub(1)) / self.config.scaling_step;
-        
+
         // Size = base_size * 2^tier, capped at max_chunk_size
         let size = self.config.chunk_size.saturating_mul(1u64 << tier);
-        
+
         size.min(self.config.max_chunk_size)
     }
 
@@ -437,43 +484,43 @@ impl SwapFile {
     /// When there are many, wait longer before creating new ones
     fn get_expand_threshold(&self) -> u8 {
         match self.allocated {
-            0 | 1 => 50,      // 1 file → expand when usage > 50%
-            2 => 60,          // 2 files → expand when usage > 60%
-            3 => 70,          // 3 files → expand when usage > 70%
-            _ => 80,          // 4+ files → expand when usage > 80%
+            0 | 1 => 50, // 1 file → expand when usage > 50%
+            2 => 60,     // 2 files → expand when usage > 60%
+            3 => 70,     // 3 files → expand when usage > 70%
+            _ => 80,     // 4+ files → expand when usage > 80%
         }
     }
 
     /// Read information about all swap files from /proc/swaps
     fn get_swapfiles_info(&self) -> Vec<SwapFileInfo> {
         let mut files = Vec::new();
-        
+
         let content = match std::fs::read_to_string("/proc/swaps") {
             Ok(c) => c,
             Err(_) => return files,
         };
-        
+
         // Skip header: Filename Type Size Used Priority
         for line in content.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() < 5 {
                 continue;
             }
-            
+
             let path = PathBuf::from(fields[0]);
-            
+
             // Filter only our swap files (in the configured directory or loop devices)
             let is_our_file = path.starts_with(&self.config.path)
                 || (path.starts_with("/dev/loop") && self.is_our_loop_device(&path));
-            
+
             if !is_our_file {
                 continue;
             }
-            
+
             let size_kb: u64 = fields[2].parse().unwrap_or(0);
             let used_kb: u64 = fields[3].parse().unwrap_or(0);
             let priority: i32 = fields[4].parse().unwrap_or(0);
-            
+
             files.push(SwapFileInfo {
                 path,
                 size_bytes: size_kb * 1024,
@@ -481,7 +528,7 @@ impl SwapFile {
                 priority,
             });
         }
-        
+
         // Sort by priority (higher priority first - used first by kernel)
         files.sort_by(|a, b| b.priority.cmp(&a.priority));
         files
@@ -504,23 +551,29 @@ impl SwapFile {
 
     /// Find a safe candidate for removal
     /// Returns None if no removal is safe
-    fn find_safe_removal_candidate<'a>(&self, files: &'a [SwapFileInfo]) -> Option<&'a SwapFileInfo> {
+    fn find_safe_removal_candidate<'a>(
+        &self,
+        files: &'a [SwapFileInfo],
+    ) -> Option<&'a SwapFileInfo> {
         if files.len() <= self.config.min_count as usize {
             return None; // Don't remove below minimum
         }
-        
+
         // Find files with low usage (< shrink_threshold%)
         let candidates: Vec<&SwapFileInfo> = files
             .iter()
             .filter(|f| f.is_nearly_empty(self.config.shrink_threshold))
             .collect();
-        
+
         if candidates.is_empty() {
             return None; // No file is empty enough
         }
-        
+
         // For each candidate, verify if it's SAFE to remove
-        candidates.into_iter().find(|&candidate| self.can_safely_remove(candidate, files)).map(|v| v as _)
+        candidates
+            .into_iter()
+            .find(|&candidate| self.can_safely_remove(candidate, files))
+            .map(|v| v as _)
     }
 
     /// Verify if it's safe to remove a specific file
@@ -529,38 +582,40 @@ impl SwapFile {
         // Calculate free space in OTHER files
         let mut other_total_size: u64 = 0;
         let mut other_total_used: u64 = 0;
-        
+
         for file in all_files {
             if file.path != target.path {
                 other_total_size += file.size_bytes;
                 other_total_used += file.used_bytes;
             }
         }
-        
+
         // If no other files, not safe to remove
         if other_total_size == 0 {
             return false;
         }
-        
+
         // Free space in other files
         let other_free_space = other_total_size.saturating_sub(other_total_used);
-        
+
         // Data that needs to be migrated from target file
         let data_to_migrate = target.used_bytes;
-        
+
         // Verify if there's enough space WITH safety margin
         // Want to maintain at least safe_headroom% free after migration
         let required_headroom = (other_total_size * self.config.safe_headroom as u64) / 100;
         let required_free = data_to_migrate + required_headroom;
-        
+
         if other_free_space < required_free {
-            debug!("swapFC: removing {} not safe - needs {}MB free, has {}MB",
+            debug!(
+                "swapFC: removing {} not safe - needs {}MB free, has {}MB",
                 target.path.display(),
                 required_free / (1024 * 1024),
-                other_free_space / (1024 * 1024));
+                other_free_space / (1024 * 1024)
+            );
             return false;
         }
-        
+
         true
     }
 
@@ -568,17 +623,15 @@ impl SwapFile {
     fn destroy_swapfile_by_path(&mut self, path: &Path) -> Result<()> {
         // Find which index this file corresponds to
         let file_index = self.find_file_index(path);
-        
+
         notify_status(&format!("Deallocating swap file {}...", path.display()));
-        
+
         // First: swapoff (kernel will migrate data to other files)
         if let Err(e) = swapoff(&path.to_string_lossy()) {
             warn!("swapFC: swapoff failed for {}: {}", path.display(), e);
-            return Err(SwapFileError::Io(std::io::Error::other(
-                "swapoff failed"
-            )));
+            return Err(SwapFileError::Io(std::io::Error::other("swapoff failed")));
         }
-        
+
         // If it's a loop device, get the backing file
         let is_loop = path.starts_with("/dev/loop");
         let backing_file = if is_loop {
@@ -586,19 +639,19 @@ impl SwapFile {
         } else {
             Some(path.to_path_buf())
         };
-        
+
         if is_loop {
             // Detach loop device
             let _ = Command::new("losetup")
                 .args(["-d", &path.to_string_lossy()])
                 .status();
         }
-        
+
         // Remove backing file
         if let Some(ref backing) = backing_file {
             force_remove(backing, false);
         }
-        
+
         // Clean up systemd unit
         if let Some(idx) = file_index {
             let tag = format!("swapfile_{}", idx);
@@ -610,19 +663,19 @@ impl SwapFile {
                     }
                 }
             }
-            
+
             // Clean up loop info file
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
             force_remove(&loop_info_path, false);
-            
+
             // Update file_sizes if we tracked this file
             if idx <= self.file_sizes.len() as u32 {
                 self.file_sizes.remove((idx - 1) as usize);
             }
         }
-        
+
         self.allocated = self.allocated.saturating_sub(1);
-        
+
         info!("swapFC: {} removed successfully", path.display());
         notify_status("Monitoring memory status...");
         Ok(())
@@ -636,7 +689,7 @@ impl SwapFile {
                 return name.to_string_lossy().parse().ok();
             }
         }
-        
+
         // Check loop device info files
         for i in 1..=self.allocated {
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, i);
@@ -647,7 +700,7 @@ impl SwapFile {
                 }
             }
         }
-        
+
         None
     }
 
@@ -674,13 +727,23 @@ impl SwapFile {
     }
 
     /// Run the swap monitoring loop with intelligent expansion/contraction
+    /// Uses THREE triggers for expansion (any one is sufficient):
+    ///   1. RAM pressure: free RAM < free_ram_perc (most critical, prevents OOM)
+    ///   2. Swap pressure: free swap < free_swap_perc (proactive expansion)
+    ///   3. File usage: internal swap file usage > dynamic threshold (original logic)
+    /// Uses TWO triggers for contraction:
+    ///   1. Swap abundance: free swap > remove_free_swap_perc
+    ///   2. File emptiness: individual file usage < shrink_threshold (original logic)
     pub fn run(&mut self) -> Result<()> {
         notify_ready();
 
         // Ensure minimum files are created at startup
         while self.allocated < self.config.min_count {
-            info!("swapFC: creating initial file #{} (min_count={})", 
-                self.allocated + 1, self.config.min_count);
+            info!(
+                "swapFC: creating initial file #{} (min_count={})",
+                self.allocated + 1,
+                self.config.min_count
+            );
             self.create_swapfile()?;
         }
 
@@ -692,9 +755,13 @@ impl SwapFile {
                 break;
             }
 
+            // Read system-wide pressure indicators
+            let free_ram = get_free_ram_percent().unwrap_or(100);
+            let free_swap = get_free_swap_percent().unwrap_or(100);
+
             // Get individual file statistics from /proc/swaps
             let swap_files = self.get_swapfiles_info();
-            
+
             // Calculate global statistics for swapfiles
             let total_size: u64 = swap_files.iter().map(|f| f.size_bytes).sum();
             let total_used: u64 = swap_files.iter().map(|f| f.used_bytes).sum();
@@ -703,7 +770,7 @@ impl SwapFile {
             } else {
                 0
             };
-            
+
             // Check swap partition usage if configured to use partitions
             let should_skip_expansion = if self.config.use_partitions {
                 let (part_total, part_used) = get_swap_partition_stats();
@@ -712,35 +779,80 @@ impl SwapFile {
                     if part_usage < self.config.partition_threshold {
                         debug!("swapFC: partitions at {}% (< {}% threshold), deferring swapfile creation", 
                             part_usage, self.config.partition_threshold);
-                        true  // Skip expansion, partitions have capacity
+                        true // Skip expansion, partitions have capacity
                     } else {
-                        info!("swapFC: partitions at {}% (>= {}% threshold), can create swapfiles", 
-                            part_usage, self.config.partition_threshold);
-                        false  // Partitions full, can expand with swapfiles
+                        info!(
+                            "swapFC: partitions at {}% (>= {}% threshold), can create swapfiles",
+                            part_usage, self.config.partition_threshold
+                        );
+                        false // Partitions full, can expand with swapfiles
                     }
                 } else {
-                    false  // No partitions, proceed normally
+                    false // No partitions, proceed normally
                 }
             } else {
-                false  // Not using partitions, proceed normally
+                false // Not using partitions, proceed normally
             };
-            
-            // EXPANSION DECISION: dynamic threshold based on file count
-            let expand_threshold = self.get_expand_threshold();
-            if !should_skip_expansion && global_usage >= expand_threshold && self.allocated < self.config.max_count {
-                info!("swapFC: global usage {}% >= {}% (dynamic threshold for {} files) - expanding", 
-                    global_usage, expand_threshold, self.allocated);
-                let _ = self.create_swapfile();
-                continue;
+
+            if !should_skip_expansion && self.allocated < self.config.max_count {
+                // EXPANSION TRIGGER 1 (highest priority): RAM pressure
+                // If free RAM is below the configured threshold, expand IMMEDIATELY
+                // This is the critical trigger that prevents OOM kills
+                if free_ram < self.config.free_ram_perc {
+                    info!(
+                        "swapFC: RAM pressure! free_ram={}% < {}% - expanding urgently",
+                        free_ram, self.config.free_ram_perc
+                    );
+                    let _ = self.create_swapfile();
+                    continue;
+                }
+
+                // EXPANSION TRIGGER 2: Swap space pressure
+                // If total swap free is below the configured threshold, expand proactively
+                if free_swap < self.config.free_swap_perc {
+                    info!(
+                        "swapFC: swap pressure! free_swap={}% < {}% - expanding",
+                        free_swap, self.config.free_swap_perc
+                    );
+                    let _ = self.create_swapfile();
+                    continue;
+                }
+
+                // EXPANSION TRIGGER 3 (original): internal file usage threshold
+                let expand_threshold = self.get_expand_threshold();
+                if global_usage >= expand_threshold {
+                    info!("swapFC: global usage {}% >= {}% (dynamic threshold for {} files) - expanding", 
+                        global_usage, expand_threshold, self.allocated);
+                    let _ = self.create_swapfile();
+                    continue;
+                }
             }
-            
-            // CONTRACTION DECISION: intelligent analysis
+
+            // CONTRACTION DECISION: check if swap is abundant enough to remove files
             if self.allocated > self.config.min_count {
-                if let Some(candidate) = self.find_safe_removal_candidate(&swap_files) {
-                    info!("swapFC: removing {} (individual usage: {}%)", 
-                        candidate.path.display(), candidate.usage_percent());
-                    let path = candidate.path.clone();
-                    let _ = self.destroy_swapfile_by_path(&path);
+                // Only attempt contraction when swap is abundant
+                if free_swap > self.config.remove_free_swap_perc {
+                    if let Some(candidate) = self.find_safe_removal_candidate(&swap_files) {
+                        info!(
+                            "swapFC: free_swap={}% > {}%, removing {} (usage: {}%)",
+                            free_swap,
+                            self.config.remove_free_swap_perc,
+                            candidate.path.display(),
+                            candidate.usage_percent()
+                        );
+                        let path = candidate.path.clone();
+                        let _ = self.destroy_swapfile_by_path(&path);
+                    }
+                } else if let Some(candidate) = self.find_safe_removal_candidate(&swap_files) {
+                    // Also allow removal of nearly-empty files even when swap isn't abundant
+                    if candidate.usage_percent() == 0 {
+                        info!(
+                            "swapFC: removing empty file {} (usage: 0%)",
+                            candidate.path.display()
+                        );
+                        let path = candidate.path.clone();
+                        let _ = self.destroy_swapfile_by_path(&path);
+                    }
                 }
             }
         }
@@ -780,15 +892,18 @@ impl SwapFile {
         // Calculate size for the next file using progressive scaling
         let next_file_num = self.allocated + 1;
         let chunk_size = self.get_chunk_size_for_file(next_file_num);
-        
+
         if !self.has_enough_space(chunk_size) {
             warn!("swapFC: ENOSPC (need {}MB)", chunk_size / (1024 * 1024));
             notify_status("Not enough space");
             return Err(SwapFileError::NoSpace);
         }
 
-        notify_status(&format!("Allocating swap file #{} ({}MB)...", 
-            next_file_num, chunk_size / (1024 * 1024)));
+        notify_status(&format!(
+            "Allocating swap file #{} ({}MB)...",
+            next_file_num,
+            chunk_size / (1024 * 1024)
+        ));
         self.allocated += 1;
         self.file_sizes.push(chunk_size);
 
@@ -810,13 +925,19 @@ impl SwapFile {
 
         // Always disable COW on btrfs for better swap performance
         if self.is_btrfs {
-            let _ = Command::new("chattr").args(["+C"]).arg(&swapfile_path).status();
+            let _ = Command::new("chattr")
+                .args(["+C"])
+                .arg(&swapfile_path)
+                .status();
         }
 
         // Always use fallocate to preallocate space
         // This guarantees disk space is reserved and prevents system freezes
-        info!("swapFC: creating preallocated file #{} ({}MB)",
-            self.allocated, chunk_size / (1024 * 1024));
+        info!(
+            "swapFC: creating preallocated file #{} ({}MB)",
+            self.allocated,
+            chunk_size / (1024 * 1024)
+        );
         let status = Command::new("fallocate")
             .args(["-l", &chunk_size.to_string()])
             .arg(&swapfile_path)
@@ -833,9 +954,15 @@ impl SwapFile {
 
         let (swapfile, loop_device) = if use_loop {
             // Create loop device with direct I/O (unless disabled)
-            let directio = if self.config.directio_disable { "off" } else { "on" };
+            let directio = if self.config.directio_disable {
+                "off"
+            } else {
+                "on"
+            };
             let loop_dev = run_cmd_output(&[
-                "losetup", "-f", "--show",
+                "losetup",
+                "-f",
+                "--show",
                 &format!("--direct-io={}", directio),
                 &swapfile_path.to_string_lossy(),
             ])?;
@@ -859,7 +986,10 @@ impl SwapFile {
         }
 
         // Generate and start swap unit with discard policy based on storage type
-        let discard_options = self.config.discard_policy.to_options_string(&self.storage_type);
+        let discard_options = self
+            .config
+            .discard_policy
+            .to_options_string(&self.storage_type);
         let unit_name = gen_swap_unit(
             Path::new(&swapfile),
             Some(self.priority),
@@ -870,7 +1000,10 @@ impl SwapFile {
         // Store loop device info for cleanup
         if let Some(ref loop_dev) = loop_device {
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, self.allocated);
-            let _ = fs::write(&loop_info_path, format!("{}\n{}", loop_dev, swapfile_path.display()));
+            let _ = fs::write(
+                &loop_info_path,
+                format!("{}\n{}", loop_dev, swapfile_path.display()),
+            );
         }
 
         self.priority -= 1;
@@ -898,5 +1031,3 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-
-
