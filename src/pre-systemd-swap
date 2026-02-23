@@ -29,12 +29,13 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     die "Configuration file not found: $CONFIG_FILE"
 fi
 
-# Extract swapfc_path folder name (second component of path)
-# Using grep with anchored pattern to avoid partial matches
-swapfcfolder=$(grep "^swapfc_path=" "$CONFIG_FILE" | cut -d'/' -f2)
+# Extract swapfc_path folder name (second component of path).
+# grep returns exit 1 when no match; || true prevents set -e from aborting.
+swapfcfolder=$(grep "^swapfc_path=" "$CONFIG_FILE" | cut -d'/' -f2 || true)
 
 if [[ -z "$swapfcfolder" ]]; then
-    die "Could not determine swapfc_path from $CONFIG_FILE"
+    # Default path mirrors the default in config.rs
+    swapfcfolder="swapfile"
 fi
 
 # =============================================================================
@@ -83,7 +84,7 @@ if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
         log_info "Adding subvolume to /etc/fstab"
         uuid=$(blkid -s UUID -o value "$rootpartition")
         if [[ -n "$uuid" ]]; then
-            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults 0 0" >>/etc/fstab
+            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime 0 0" >>/etc/fstab
         else
             die "Could not get UUID for $rootpartition"
         fi
@@ -119,5 +120,21 @@ while IFS= read -r partswap; do
         swapoff "/dev/$partswap" 2>/dev/null || true
     fi
 done < <(lsblk -lno NAME,FSTYPE | awk '$2 == "swap" {print $1}')
+
+# =============================================================================
+# Dynamic Kernel Tuning
+# =============================================================================
+
+# Calculate min_free_kbytes: 3% of RAM, capped at 512MB (524288 KB).
+# Gives kswapd enough headroom to reclaim before OOM.
+total_ram_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+if [[ -n "$total_ram_kb" ]]; then
+    min_free=$((total_ram_kb * 3 / 100))
+    if [[ "$min_free" -gt 524288 ]]; then
+        min_free=524288
+    fi
+    log_info "Setting vm.min_free_kbytes = $min_free (3% of ${total_ram_kb}KB)"
+    echo "$min_free" > /proc/sys/vm/min_free_kbytes
+fi
 
 log_info "Pre-systemd-swap setup complete"

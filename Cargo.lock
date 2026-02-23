@@ -485,7 +485,7 @@ dependencies = [
  "glob",
  "libc",
  "libsystemd",
- "nix 0.29.0",
+ "nix 0.30.1",
  "pathdiff",
  "signal-hook",
  "thiserror",

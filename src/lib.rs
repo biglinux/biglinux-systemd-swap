@@ -1,8 +1,12 @@
-// systemd-swap - Dynamic swap management for Linux
+//! Core library for systemd-swap: dynamic swap management for Linux.
+//!
+//! Exposes the public modules for the daemon binary and any future consumers.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#![deny(unsafe_code)]
 pub mod autoconfig;
 pub mod config;
+pub mod defaults;
 pub mod helpers;
 pub mod meminfo;
 pub mod swapfile;

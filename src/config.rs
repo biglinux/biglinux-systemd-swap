@@ -1,8 +1,11 @@
-// Configuration parsing for systemd-swap
+//! Configuration parsing for systemd-swap.
+//!
+//! Reads key=value config files and expands shell-style `${VAR}` references.
+//! Arithmetic expressions of the form `a OP b` (where OP is +, -, *, /) are
+//! also evaluated at parse time.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -42,33 +45,28 @@ impl Config {
     pub fn load() -> Result<Self> {
         let mut values = HashMap::new();
 
-        // Store system info for config value expansion.
-        // We avoid env::set_var here because it is unsound in multi-threaded
-        // programs (UB in Rust 2024 edition). Instead, inject the values
-        // directly into the config map so expand_value can pick them up
-        // via std::env::vars() from values set early in process startup.
-        //
-        // SAFETY: This runs before any threads are spawned (called from
-        // main before ctrlc::set_handler / thread::spawn), so set_var is
-        // safe at this point in the single-threaded startup phase.
-        let ncpu = crate::meminfo::get_cpu_count();
-        let ram_size = crate::meminfo::get_ram_size().unwrap_or(0);
-        // SAFETY: No threads exist yet during Config::load in start()/stop()/status().
-        unsafe {
-            env::set_var("NCPU", ncpu.to_string());
-            env::set_var("RAM_SIZE", ram_size.to_string());
-        }
+        // Inject system-derived values without unsafe env::set_var.
+        // expand_value uses this map before falling back to std::env::vars().
+        let mut system_vars: HashMap<String, String> = HashMap::new();
+        system_vars.insert(
+            "NCPU".to_string(),
+            crate::meminfo::get_cpu_count().to_string(),
+        );
+        system_vars.insert(
+            "RAM_SIZE".to_string(),
+            crate::meminfo::get_ram_size().unwrap_or(0).to_string(),
+        );
 
         // Load default config
         if Path::new(DEF_CONFIG).exists() {
-            if let Ok(cfg) = Self::parse_config(DEF_CONFIG) {
+            if let Ok(cfg) = Self::parse_config(DEF_CONFIG, &system_vars) {
                 values.extend(cfg);
             }
         }
 
         // Load /etc/systemd/swap.conf
         if Path::new(ETC_CONFIG).exists() {
-            match Self::parse_config(ETC_CONFIG) {
+            match Self::parse_config(ETC_CONFIG, &system_vars) {
                 Ok(cfg) => values.extend(cfg),
                 Err(e) => warn!("Could not load {}: {}", ETC_CONFIG, e),
             }
@@ -101,7 +99,7 @@ impl Config {
 
         for (_, path) in sorted_files {
             info!("Load: {}", path);
-            if let Ok(cfg) = Self::parse_config(&path) {
+            if let Ok(cfg) = Self::parse_config(&path, &system_vars) {
                 values.extend(cfg);
             }
         }
@@ -126,85 +124,27 @@ impl Config {
     /// This allows hardware-based auto-tuning while respecting user overrides.
     /// When swap_mode=auto, the GUI comments out all keys, so this method
     /// effectively sets all recommended values for the detected hardware.
-    pub fn apply_autoconfig(&mut self, recommended: &crate::autoconfig::RecommendedConfig) {
+    ///
+    /// Only called in auto mode. For explicit modes, each subsystem uses
+    /// its own fallback defaults from `unwrap_or()` calls.
+    pub fn apply_autoconfig(
+        &mut self,
+        recommended: &crate::autoconfig::RecommendedConfig,
+    ) {
         info!("Autoconfig: applying recommended configuration for detected hardware");
 
-        // Zswap settings
-        self.set_if_missing("zswap_compressor", &recommended.zswap_compressor);
-        self.set_if_missing(
-            "zswap_max_pool_percent",
-            &recommended.zswap_max_pool_percent.to_string(),
-        );
-        self.set_if_missing("zswap_zpool", "zsmalloc");
-        self.set_if_missing("zswap_shrinker_enabled", "1");
-        self.set_if_missing("zswap_accept_threshold", "85");
-
-        // MGLRU
-        self.set_if_missing(
-            "mglru_min_ttl_ms",
-            &recommended.mglru_min_ttl_ms.to_string(),
-        );
-
-        // Zram settings
-        self.set_if_missing("zram_alg", &recommended.zram_algorithm);
-        self.set_if_missing("zram_size", &format!("{}%", recommended.zram_size_percent));
-        self.set_if_missing(
-            "zram_mem_limit",
-            &format!("{}%", recommended.zram_mem_limit_percent),
-        );
-        self.set_if_missing("zram_prio", "32767");
-
-        // Swapfile settings
-        self.set_if_missing("swapfc_chunk_size", &recommended.swapfc_chunk_size);
-        self.set_if_missing("swapfile_chunk_size", &recommended.swapfc_chunk_size);
-        self.set_if_missing(
-            "swapfc_max_count",
-            &recommended.swapfc_max_count.to_string(),
-        );
-        self.set_if_missing(
-            "swapfile_max_count",
-            &recommended.swapfc_max_count.to_string(),
-        );
-        self.set_if_missing(
-            "swapfc_free_ram_perc",
-            &recommended.swapfc_free_ram_perc.to_string(),
-        );
-        self.set_if_missing(
-            "swapfile_free_ram_perc",
-            &recommended.swapfc_free_ram_perc.to_string(),
-        );
-        self.set_if_missing(
-            "swapfc_free_swap_perc",
-            &recommended.swapfc_free_swap_perc.to_string(),
-        );
-        self.set_if_missing(
-            "swapfile_free_swap_perc",
-            &recommended.swapfc_free_swap_perc.to_string(),
-        );
-        self.set_if_missing(
-            "swapfc_remove_free_swap_perc",
-            &recommended.swapfc_remove_free_swap_perc.to_string(),
-        );
-        self.set_if_missing(
-            "swapfile_remove_free_swap_perc",
-            &recommended.swapfc_remove_free_swap_perc.to_string(),
-        );
-
-        if recommended.swapfc_directio {
-            self.set_if_missing("swapfc_directio", "1");
-            self.set_if_missing("swapfile_directio", "1");
+        for (key, value) in recommended.config_pairs() {
+            self.set_if_missing(key, &value);
         }
 
-        info!("Autoconfig: {} values injected", "done");
-    }
-
-    /// Check if a key has been explicitly set (vs default)
-    pub fn has_explicit(&self, key: &str) -> bool {
-        self.values.contains_key(key)
+        info!("Autoconfig: injection complete");
     }
 
     /// Parse a single config file
-    fn parse_config<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>> {
+    fn parse_config<P: AsRef<Path>>(
+        path: P,
+        extra_vars: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
         let mut config = HashMap::new();
         let content = fs::read_to_string(path)?;
 
@@ -217,7 +157,13 @@ impl Config {
             }
 
             if let Some((key, value)) = line.split_once('=') {
-                let expanded = Self::expand_value(value);
+                // Strip inline comments (everything from the first unquoted '#')
+                let value = value
+                    .split_once('#')
+                    .map(|(v, _)| v)
+                    .unwrap_or(value)
+                    .trim();
+                let expanded = Self::expand_value(value, extra_vars);
                 config.insert(key.to_string(), expanded);
             }
         }
@@ -227,9 +173,14 @@ impl Config {
 
     /// Safely expand environment variables and simple arithmetic in config values
     /// without invoking a shell.
-    fn expand_value(value: &str) -> String {
+    fn expand_value(value: &str, extra_vars: &HashMap<String, String>) -> String {
         let mut result = value.to_string();
-        // Expand environment variables ${VAR} and $VAR
+        // Expand injected system variables first (NCPU, RAM_SIZE) — no env mutation needed.
+        for (key, val) in extra_vars {
+            result = result.replace(&format!("${{{}}}", key), val);
+            result = result.replace(&format!("${}", key), val);
+        }
+        // Expand ambient environment variables ${VAR} and $VAR
         for (key, val) in std::env::vars() {
             result = result.replace(&format!("${{{}}}", key), &val);
             result = result.replace(&format!("${}", key), &val);
@@ -252,7 +203,15 @@ impl Config {
         result
     }
 
-    /// Evaluate basic integer arithmetic: number OP number where OP is +, -, *, /
+    /// Evaluate basic integer arithmetic: `number OP number` where OP is one of
+    /// `+`, `-`, `*`, `/`.
+    ///
+    /// **Important constraints:**
+    /// - Supports only a single binary operation — no operator precedence, no
+    ///   parentheses, no chaining (e.g. `2 + 3 * 4` is NOT supported).
+    /// - Operands and results are `i64`. Division truncates toward zero.
+    /// - Division by zero yields `0`.
+    /// - Unrecognisable expressions are returned unchanged.
     fn evaluate_simple_arithmetic(expr: &str) -> String {
         let expr = expr.trim();
         // Try to parse as a single number first
@@ -317,5 +276,126 @@ impl Config {
     /// Get optional value
     pub fn get_opt(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(|s| s.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_from_str(s: &str) -> Config {
+        let mut values = HashMap::new();
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                values.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        Config { values }
+    }
+
+    // ── evaluate_simple_arithmetic ────────────────────────────────────────────
+
+    #[test]
+    fn arith_addition() {
+        assert_eq!(Config::evaluate_simple_arithmetic("2 + 3"), "5");
+    }
+
+    #[test]
+    fn arith_subtraction() {
+        assert_eq!(Config::evaluate_simple_arithmetic("10 - 4"), "6");
+    }
+
+    #[test]
+    fn arith_multiplication() {
+        assert_eq!(Config::evaluate_simple_arithmetic("3 * 7"), "21");
+    }
+
+    #[test]
+    fn arith_division() {
+        assert_eq!(Config::evaluate_simple_arithmetic("20 / 4"), "5");
+    }
+
+    #[test]
+    fn arith_division_by_zero() {
+        assert_eq!(Config::evaluate_simple_arithmetic("5 / 0"), "0");
+    }
+
+    #[test]
+    fn arith_plain_number() {
+        assert_eq!(Config::evaluate_simple_arithmetic("42"), "42");
+    }
+
+    #[test]
+    fn arith_unknown_expr_passthrough() {
+        assert_eq!(
+            Config::evaluate_simple_arithmetic("not_a_number"),
+            "not_a_number"
+        );
+    }
+
+    // ── Config::get_bool ─────────────────────────────────────────────────────
+
+    #[test]
+    fn get_bool_true_variants() {
+        for v in ["yes", "y", "1", "true", "YES", "True"] {
+            let cfg = config_from_str(&format!("key={}", v));
+            assert!(cfg.get_bool("key"), "'{}' should be true", v);
+        }
+    }
+
+    #[test]
+    fn get_bool_false_variants() {
+        for v in ["no", "0", "false", "off"] {
+            let cfg = config_from_str(&format!("key={}", v));
+            assert!(!cfg.get_bool("key"), "'{}' should be false", v);
+        }
+    }
+
+    #[test]
+    fn get_bool_missing_key_is_false() {
+        let cfg = config_from_str("");
+        assert!(!cfg.get_bool("nonexistent"));
+    }
+
+    // ── Config::get / get_opt / get_as ───────────────────────────────────────
+
+    #[test]
+    fn get_existing_key() {
+        let cfg = config_from_str("swap_size=512M");
+        assert_eq!(cfg.get("swap_size").unwrap(), "512M");
+    }
+
+    #[test]
+    fn get_missing_key_is_err() {
+        let cfg = config_from_str("");
+        assert!(cfg.get("missing").is_err());
+    }
+
+    #[test]
+    fn get_opt_present() {
+        let cfg = config_from_str("foo=bar");
+        assert_eq!(cfg.get_opt("foo"), Some("bar"));
+    }
+
+    #[test]
+    fn get_opt_absent() {
+        let cfg = config_from_str("");
+        assert_eq!(cfg.get_opt("missing"), None);
+    }
+
+    #[test]
+    fn get_as_integer() {
+        let cfg = config_from_str("count=7");
+        assert_eq!(cfg.get_as::<u32>("count").unwrap(), 7u32);
+    }
+
+    #[test]
+    fn get_as_parse_error() {
+        let cfg = config_from_str("count=notanint");
+        assert!(cfg.get_as::<u32>("count").is_err());
     }
 }

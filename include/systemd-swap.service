@@ -6,10 +6,9 @@ After=pre-systemd-swap.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/systemd-swap start
-# ExecStop=/usr/bin/systemd-swap stop
-ExecStop=/usr/bin/swapoff -a
+ExecStop=/usr/bin/systemd-swap stop
 RemainAfterExit=yes
-TimeoutStopSec=5
+TimeoutStopSec=300
 OOMScoreAdjust=-500
 CapabilityBoundingSet=CAP_SYS_ADMIN
 DevicePolicy=auto
@@ -25,7 +24,7 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
-SystemCallFilter=@system-service @swap
+SystemCallFilter=@system-service @swap @mount
 
 [Install]
 WantedBy=multi-user.target

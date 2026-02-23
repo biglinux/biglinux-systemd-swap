@@ -1,4 +1,7 @@
-// Helper utilities for systemd-swap
+//! General-purpose utilities for systemd-swap.
+//!
+//! Provides config-value lookup helpers, unit conversions, and other
+//! small functions shared across multiple modules.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::HashMap;
@@ -91,16 +94,6 @@ pub fn relative_symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link_name: Q)
     Ok(())
 }
 
-/// Run a command and return success status
-pub fn run_cmd(cmd: &[&str]) -> Result<bool> {
-    let status = Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(status.success())
-}
-
 /// Run a command and capture stdout
 pub fn run_cmd_output(cmd: &[&str]) -> Result<String> {
     let output = Command::new(cmd[0])
@@ -114,8 +107,7 @@ pub fn run_cmd_output(cmd: &[&str]) -> Result<String> {
     } else {
         Err(HelperError::CommandFailed(format!(
             "{} exited with {}",
-            cmd[0],
-            output.status
+            cmd[0], output.status
         )))
     }
 }
@@ -138,7 +130,6 @@ pub fn find_swap_units() -> Vec<String> {
     }
     units
 }
-
 
 /// Get What= value from swap unit file
 pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
@@ -179,12 +170,20 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
     }
 
     let output = Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "--target", &check_path.to_string_lossy()])
+        .args([
+            "-n",
+            "-o",
+            "FSTYPE",
+            "--target",
+            &check_path.to_string_lossy(),
+        ])
         .stdout(Stdio::piped())
         .output()
         .ok()?;
 
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    let fstype = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_lowercase();
     if fstype.is_empty() {
         // Fallback to root filesystem
         if check_path != Path::new("/") {
@@ -201,6 +200,53 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
     }
 }
 
+/// Common size-unit constants
+pub const KB: u64 = 1024;
+pub const MB: u64 = 1024 * KB;
+pub const GB: u64 = 1024 * MB;
+
+/// Parse size string to bytes.
+///
+/// Accepts: `"512M"`, `"1G"`, `"256K"`, `"2T"`, `"50%"` (percentage of RAM),
+/// or raw bytes `"1073741824"`.
+pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Empty size string".to_string());
+    }
+
+    // Handle percentage (e.g., "50%", "100%")
+    if let Some(pct) = s.strip_suffix('%') {
+        let percent: u64 = pct
+            .parse()
+            .map_err(|_| format!("Invalid percentage: {}", s))?;
+        let ram = crate::meminfo::get_ram_size()
+            .map_err(|e| format!("Failed to get RAM size: {}", e))?;
+        return Ok(ram * percent / 100);
+    }
+
+    // Handle size with suffix (e.g., "1G", "512M")
+    if s.len() > 1 {
+        let (num_part, suffix) = s.split_at(s.len() - 1);
+        let multiplier = match suffix.to_ascii_uppercase().as_str() {
+            "K" => Some(KB),
+            "M" => Some(MB),
+            "G" => Some(GB),
+            "T" => Some(GB * 1024),
+            _ => None,
+        };
+        if let Some(m) = multiplier {
+            return num_part
+                .parse::<u64>()
+                .map(|n| n * m)
+                .map_err(|_| format!("Invalid size: {}", s));
+        }
+    }
+
+    // No suffix — treat as raw bytes
+    s.parse::<u64>()
+        .map_err(|_| format!("Invalid size: {}", s))
+}
 
 // Logging macros
 #[macro_export]

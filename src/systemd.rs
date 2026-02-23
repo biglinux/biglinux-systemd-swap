@@ -1,4 +1,7 @@
-// Systemd integration for systemd-swap
+//! systemd integration for systemd-swap.
+//!
+//! Wraps `systemctl` subcommand invocations and the sd-notify protocol so the
+//! rest of the codebase never shells out to systemd directly.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::ffi::CString;
@@ -12,6 +15,27 @@ use thiserror::Error;
 use crate::config::RUN_SYSD;
 use crate::helpers::{makedirs, relative_symlink, write_file};
 use crate::info;
+
+/// Typed systemctl sub-commands used by this daemon.
+///
+/// Using an enum prevents passing invalid action strings and makes call sites
+/// self-documenting.
+#[derive(Debug, Clone, Copy)]
+pub enum SystemctlAction {
+    Start,
+    Stop,
+    DaemonReload,
+}
+
+impl SystemctlAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::DaemonReload => "daemon-reload",
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum SystemdError {
@@ -39,29 +63,32 @@ pub fn notify_stopping() {
 
 /// Notify status message
 pub fn notify_status(status: &str) {
-    let _ = libsystemd::daemon::notify(false, &[(libsystemd::daemon::NotifyState::Status(status.to_string()))]);
+    let _ = libsystemd::daemon::notify(
+        false,
+        &[(libsystemd::daemon::NotifyState::Status(status.to_string()))],
+    );
 }
 
-/// Run systemctl command
-pub fn systemctl(action: &str, unit: &str) -> Result<()> {
-    let args: Vec<&str> = if action == "daemon-reload" {
-        vec!["systemctl", "daemon-reload"]
-    } else {
-        vec!["systemctl", action, unit]
-    };
+/// Run a systemctl sub-command, optionally targeting a unit.
+pub fn systemctl(action: SystemctlAction, unit: &str) -> Result<()> {
+    let action_str = action.as_str();
+    let mut cmd = Command::new("systemctl");
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
-    let status = Command::new(args[0])
-        .args(&args[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+    if matches!(action, SystemctlAction::DaemonReload) {
+        cmd.arg(action_str);
+    } else {
+        cmd.arg(action_str).arg(unit);
+    }
+
+    let status = cmd.status()?;
 
     if status.success() {
         Ok(())
     } else {
         Err(SystemdError::CommandFailed(format!(
             "systemctl {} {} failed with {}",
-            action, unit, status
+            action_str, unit, status
         )))
     }
 }
@@ -160,6 +187,8 @@ pub fn swapoff(device: &str) -> Result<()> {
     let c_path = CString::new(device).map_err(|_| {
         SystemdError::CommandFailed(format!("invalid path for swapoff: {}", device))
     })?;
+    // SAFETY: c_path is a valid NUL-terminated C string; swapoff(2) is a documented Linux syscall.
+    #[allow(unsafe_code)]
     let ret = unsafe { libc::swapoff(c_path.as_ptr()) };
     if ret == 0 {
         Ok(())

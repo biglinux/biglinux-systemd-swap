@@ -35,6 +35,7 @@ DFL_T := $(DESTDIR)$(datadir)/systemd-swap/swap-default.conf
 CNF_T := $(DESTDIR)$(sysconfdir)/systemd/swap.conf
 MAN5_T := $(DESTDIR)$(mandir)/man5/swap.conf.5
 MAN8_T := $(DESTDIR)$(mandir)/man8/systemd-swap.8
+SYSCTL_T := $(DESTDIR)$(sysconfdir)/sysctl.d/91-memory.conf
 
 .PHONY: build files dirs install uninstall clean help
 
@@ -72,6 +73,9 @@ $(MAN5_T): man/swap.conf.5
 $(MAN8_T): man/systemd-swap.8
 	install -p -Dm644 $< $@
 
+$(SYSCTL_T): include/91-memory.conf
+	install -p -Dm644 $< $@
+
 define banner
 #  This file is part of systemd-swap.\n#\n# Entries in this file show the systemd-swap defaults as\n# specified in $(datarootdir)/systemd-swap/swap-default.conf\n# You can change settings by editing this file.\n# Defaults can be restored by simply deleting this file.\n#\n# See swap.conf(5) and $(datarootdir)/systemd-swap/swap-default.conf for details.\n\n
 endef
@@ -83,7 +87,7 @@ swap.conf: include/swap-default.conf ## Generate swap.conf
 
 target/release/systemd-swap: build
 
-files: $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T)
+files: $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T) $(SYSCTL_T)
 
 install: ## Install systemd-swap
 install: build dirs files
@@ -91,7 +95,7 @@ install: build dirs files
 uninstall: ## Delete systemd-swap (stop systemd-swap first)
 uninstall:
 	test ! -f /run/systemd/swap/swap.conf
-	rm -v $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T)
+	rm -v $(BIN_T) $(PRE_BIN_T) $(SVC_T) $(PRE_SVC_T) $(DFL_T) $(CNF_T) $(MAN5_T) $(MAN8_T) $(SYSCTL_T)
 	rm -rv $(LIB_T) $(DESTDIR)$(datadir)/systemd-swap
 
 clean: ## Remove generated files

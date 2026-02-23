@@ -79,10 +79,13 @@ pub fn get_ram_size() -> Result<u64> {
 }
 
 /// Get free RAM percentage (0-100)
+/// Uses MemAvailable (includes reclaimable cache) instead of MemFree
+/// MemAvailable is the correct metric for "how much memory can applications use"
+/// MemFree only counts completely unused pages and is misleadingly low
 pub fn get_free_ram_percent() -> Result<u8> {
-    let stats = get_mem_stats(&["MemTotal", "MemFree"])?;
-    let percent = (stats["MemFree"] * 100) / stats["MemTotal"];
-    Ok(percent as u8)
+    let stats = get_mem_stats(&["MemTotal", "MemAvailable"])?;
+    let percent = (stats["MemAvailable"] * 100) / stats["MemTotal"];
+    Ok(percent.min(100) as u8)
 }
 
 /// Get free swap percentage (0-100)
@@ -90,7 +93,41 @@ pub fn get_free_swap_percent() -> Result<u8> {
     let stats = get_mem_stats(&["SwapTotal", "SwapFree"])?;
     let total = stats["SwapTotal"].max(1); // Prevent divide by zero
     let percent = (stats["SwapFree"] * 100) / total;
-    Ok(percent as u8)
+    Ok(percent.min(100) as u8)
+}
+
+/// Get free swap percentage accounting for zswap (0-100)
+///
+/// When zswap is active, the kernel allocates swap slots for pages entering zswap,
+/// reducing SwapFree. But those pages are still in RAM (compressed in zswap pool),
+/// NOT consuming disk space. We add back the Zswapped bytes (original uncompressed
+/// size of data held in zswap) to get the real disk-available swap.
+///
+/// Example: SwapTotal=24GB, SwapFree=5GB, Zswapped=10GB
+///   Naive free: 5/24 = 21%
+///   Effective free: (5+10)/24 = 62% (because 10GB is in RAM, not disk)
+pub fn get_free_swap_percent_effective() -> Result<u8> {
+    match get_effective_swap_usage() {
+        Ok(usage) if usage.swap_total > 0 => {
+            // Effective free = kernel-reported free + Zswapped (original data size in zswap RAM)
+            // Zswapped = uncompressed size of pages held in zswap pool
+            // These pages have swap slots allocated but are NOT on disk
+            let effective_free = usage
+                .swap_free
+                .saturating_add(if usage.zswap_active {
+                    usage.zswapped_original_bytes
+                } else {
+                    0
+                })
+                .min(usage.swap_total);
+            let percent = (effective_free * 100) / usage.swap_total;
+            Ok(percent.min(100) as u8)
+        }
+        _ => {
+            // Fallback to naive calculation
+            get_free_swap_percent()
+        }
+    }
 }
 
 /// Get page size from system
@@ -117,8 +154,12 @@ pub struct EffectiveSwapUsage {
     pub swap_free: u64,
     /// Swap used as reported by kernel (bytes) - includes zswap cached pages
     pub swap_used_kernel: u64,
-    /// Bytes stored in zswap RAM pool (not on disk)
+    /// Compressed bytes in zswap RAM pool (Zswap field from /proc/meminfo)
     pub zswap_pool_bytes: u64,
+    /// Original (uncompressed) bytes held in zswap RAM (Zswapped field from /proc/meminfo)
+    /// This is the amount of swap space that zswap is "saving" - these pages have swap
+    /// slots allocated but are NOT actually written to disk
+    pub zswapped_original_bytes: u64,
     /// Estimated bytes actually written to disk swap
     pub swap_used_disk: u64,
     /// Zswap pool utilization percentage (0-100)
@@ -128,11 +169,11 @@ pub struct EffectiveSwapUsage {
 }
 
 /// Get effective swap usage accounting for zswap compression
-/// 
+///
 /// When zswap is active, the kernel reports swap usage based on allocated slots,
 /// but most of those pages may still be in zswap's RAM pool and not written to disk.
 /// This function calculates the actual disk pressure.
-/// 
+///
 /// Uses /proc/meminfo (Zswap, Zswapped) for basic stats - works without root!
 /// Optionally uses debugfs for additional statistics when running as root.
 pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
@@ -158,6 +199,7 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
         swap_free,
         swap_used_kernel,
         zswap_pool_bytes: zswap_compressed,
+        zswapped_original_bytes: zswap_original,
         swap_used_disk: swap_used_kernel.saturating_sub(zswap_original),
         zswap_pool_percent: 0,
         zswap_active: zswap_original > 0 || zswap_compressed > 0,
@@ -165,23 +207,25 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
 
     // Calculate pool utilization if zswap is active
     if result.zswap_active {
-        let max_pool_percent: u64 = std::fs::read_to_string(
-            "/sys/module/zswap/parameters/max_pool_percent"
-        )
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(20);
+        let max_pool_percent: u64 =
+            std::fs::read_to_string("/sys/module/zswap/parameters/max_pool_percent")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(20);
 
         let max_pool_size = mem_total * max_pool_percent / 100;
         if max_pool_size > 0 {
-            result.zswap_pool_percent = 
-                ((zswap_compressed * 100) / max_pool_size).min(100) as u8;
+            result.zswap_pool_percent = ((zswap_compressed * 100) / max_pool_size).min(100) as u8;
         }
     }
 
     Ok(result)
 }
 
+/// Get the disk-level swap usage percentage from /proc/meminfo (0-100).
+///
+/// For zswap: the kernel allocates swap slots for pages entering zswap,
+/// but those pages are in RAM (compressed). When the pool fills, the shrinker
 /// Read memory stats from /proc/meminfo, ignoring missing fields
 fn get_mem_stats_optional(fields: &[&str]) -> Result<HashMap<String, u64>> {
     let mut stats = HashMap::new();
