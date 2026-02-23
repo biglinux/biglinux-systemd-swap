@@ -11,7 +11,7 @@ depends=('systemd-libs' 'util-linux')
 makedepends=('git' 'rust' 'cargo')
 provides=('systemd-swap')
 conflicts=('systemd-swap-git' 'systemd-swap')
-backup=('etc/systemd/swap.conf' 'etc/sysctl.d/91-memory.conf')
+backup=('etc/systemd/swap.conf')
 source=("git+${url}.git")
 sha256sums=('SKIP')
 replaces=('auto-zram-and-swappiness' 'systemd-oomd-defaults')
@@ -44,7 +44,4 @@ package() {
     # Install man pages
     install -Dm644 man/swap.conf.5 "${pkgdir}/usr/share/man/man5/swap.conf.5"
     install -Dm644 man/systemd-swap.8 "${pkgdir}/usr/share/man/man8/systemd-swap.8"
-    
-    # Install sysctl tuning (recommended kernel parameters)
-    install -Dm644 include/91-memory.conf "${pkgdir}/etc/sysctl.d/91-memory.conf"
 }
