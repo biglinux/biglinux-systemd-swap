@@ -487,7 +487,9 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if content.to_lowercase().contains(subsystem) {
                     if let Some(dev) = get_what_from_swap_unit(&unit_path) {
                         info!("{}: swapoff {}", subsystem, dev);
-                        let _ = swapoff(&dev);
+                        if let Err(e) = swapoff(&dev) {
+                            warn!("{}: swapoff {} failed: {}", subsystem, dev, e);
+                        }
                         force_remove(&unit_path, true);
 
                         if subsystem == "swapfile" && dev.starts_with("/dev/loop") {
@@ -499,7 +501,11 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
                         } else if subsystem == "swapfile" && Path::new(&dev).is_file() {
                             force_remove(&dev, true);
                         } else if subsystem == "zram" {
-                            let _ = systemd_swap::zram::release(&dev);
+                            // A failure here leaves the device initialised and
+                            // unreferenced; say so, rather than leaking silently.
+                            if let Err(e) = systemd_swap::zram::release(&dev) {
+                                warn!("zram: {} left allocated: {}", dev, e);
+                            }
                         }
                     }
                 }

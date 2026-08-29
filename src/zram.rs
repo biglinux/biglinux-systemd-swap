@@ -46,6 +46,18 @@ pub fn is_available() -> bool {
     Path::new(ZRAM_MODULE).is_dir()
 }
 
+/// Whether `dev_path` is listed as active swap in the given /proc/swaps text.
+///
+/// Compares the first field exactly rather than searching for a substring,
+/// which would match /dev/zram1 against a line for /dev/zram10.
+fn swap_in_use(swaps: &str, dev_path: &str) -> bool {
+    swaps
+        .lines()
+        .skip(1) // header
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|filename| filename == dev_path)
+}
+
 /// Set comp_algorithm for a ZRAM device.
 fn configure_zram_algorithm(sysfs: &str, comp_alg: &str, ctx: &str) {
     let comp_path = format!("{}/comp_algorithm", sysfs);
@@ -156,27 +168,54 @@ pub fn start(config: &Config) -> Result<()> {
 }
 
 /// Release a zram device
+/// Attempts to reset and hot-remove a device before giving up.
+const RELEASE_ATTEMPTS: u32 = 10;
+/// Delay between those attempts.
+const RELEASE_BACKOFF: Duration = Duration::from_millis(100);
+
 pub fn release(device: &str) -> Result<()> {
-    let status = Command::new("zramctl")
-        .args(["-r", device])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if !status.success() {
-        return Err(ZramError::ZramctlFailed(format!(
-            "Failed to release {}",
-            device
-        )));
-    }
-
-    // Hot-remove the device from the kernel to avoid orphaned zram entries
     let dev_id = device.trim_start_matches("/dev/zram");
-    if Path::new(ZRAM_HOT_REMOVE).exists() {
-        let _ = std::fs::write(ZRAM_HOT_REMOVE, dev_id);
+    let mut last_failure = String::new();
+
+    // Both steps report EBUSY while anything still holds the block device, and
+    // udev routinely re-opens it to re-probe straight after swapoff. A single
+    // attempt therefore loses that race often enough to matter, and a device
+    // left behind keeps its disksize reservation plus a set of per-CPU
+    // compression streams for every algorithm it was configured with. Nothing
+    // reclaims it later either: adoption only picks up devices that are active
+    // swap, so an orphan is invisible to the pool.
+    for attempt in 0..RELEASE_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(RELEASE_BACKOFF);
+        }
+
+        // Resetting an already-reset device succeeds, so retrying the pair is
+        // safe when only the hot-remove failed.
+        let reset = Command::new("zramctl")
+            .args(["-r", device])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+
+        if !reset.success() {
+            last_failure = format!("reset of {} failed", device);
+            continue;
+        }
+
+        if !Path::new(ZRAM_HOT_REMOVE).exists() {
+            return Ok(()); // Kernel too old to hot-remove; reset is all there is.
+        }
+
+        match std::fs::write(ZRAM_HOT_REMOVE, dev_id) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_failure = format!("hot_remove of zram{} failed: {}", dev_id, e),
+        }
     }
 
-    Ok(())
+    Err(ZramError::ZramctlFailed(format!(
+        "{} after {} attempts",
+        last_failure, RELEASE_ATTEMPTS
+    )))
 }
 
 // =============================================================================
@@ -367,6 +406,12 @@ impl ZramPool {
             );
         }
 
+        // Anything initialised but not adopted is a leak from an earlier run.
+        let reclaimed = self.reclaim_orphaned_devices();
+        if reclaimed > 0 {
+            info!("ZramPool: reclaimed {} orphaned device(s)", reclaimed);
+        }
+
         let remaining = (INITIAL_DEVICES as usize).saturating_sub(self.devices.len());
         if remaining > 0 {
             info!(
@@ -423,17 +468,10 @@ impl ZramPool {
             }
 
             // Check if it's an active swap device via /proc/swaps.
-            // Use exact field match — substring matching would confuse
-            // /dev/zram1 with /dev/zram10.
             let Ok(swaps) = std::fs::read_to_string("/proc/swaps") else {
                 continue;
             };
-            let is_active = swaps
-                .lines()
-                .skip(1)
-                .filter_map(|line| line.split_whitespace().next())
-                .any(|filename| filename == dev_path);
-            if !is_active {
+            if !swap_in_use(&swaps, &dev_path) {
                 continue;
             }
 
@@ -459,6 +497,71 @@ impl ZramPool {
             adopted += 1;
         }
         adopted
+    }
+
+    /// Release initialised zram devices that nothing is using.
+    ///
+    /// Run after adoption, so anything still serving as swap has already been
+    /// taken into the pool. What is left is an earlier instance's leak: a
+    /// disksize reservation and a set of per-CPU compression streams, invisible
+    /// to the pool because adoption only considers active swap. Without this
+    /// they accumulate across restarts and consume device IDs.
+    fn reclaim_orphaned_devices(&self) -> usize {
+        let adopted: Vec<u32> = self.devices.iter().map(|d| d.id).collect();
+        let Ok(entries) = std::fs::read_dir("/sys/block") else {
+            return 0;
+        };
+
+        // Fail closed. Treating an unreadable /proc/swaps as "nothing is in
+        // use" would mark every initialised device an orphan, so the sweep
+        // would try to release devices that are actively serving swap. The
+        // kernel refuses those with EBUSY, but only after the retry loop has
+        // spent a second on each one.
+        let Ok(swaps) = std::fs::read_to_string("/proc/swaps") else {
+            warn!("ZramPool: cannot read /proc/swaps, skipping orphan reclamation");
+            return 0;
+        };
+
+        let mut reclaimed = 0;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id_str) = name.to_string_lossy().strip_prefix("zram").map(String::from) else {
+                continue;
+            };
+            let Ok(id) = id_str.parse::<u32>() else {
+                continue;
+            };
+            if adopted.contains(&id) {
+                continue;
+            }
+
+            // An uninitialised device costs nothing and hot_add will reuse it.
+            let disksize = std::fs::read_to_string(format!("/sys/block/zram{}/disksize", id))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if disksize == 0 {
+                continue;
+            }
+
+            let dev_path = format!("/dev/zram{}", id);
+            if swap_in_use(&swaps, &dev_path) {
+                continue;
+            }
+
+            info!(
+                "ZramPool: reclaiming orphaned zram{} ({}MB reserved)",
+                id,
+                disksize / (1024 * 1024)
+            );
+            match release(&dev_path) {
+                Ok(()) => reclaimed += 1,
+                Err(e) => warn!("ZramPool: could not reclaim zram{}: {}", id, e),
+            }
+        }
+
+        reclaimed
     }
 
     /// Create a new ZRAM device and add it to the pool
@@ -1083,6 +1186,54 @@ fn get_device_stats(sysfs_path: &str, disksize: u64) -> Option<ZramStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── /proc/swaps parsing ──────────────────────────────────────────────────
+    //
+    // Getting this wrong reclaims a device that is serving swap, so the
+    // near-miss cases are worth pinning down.
+
+    const SWAPS: &str = "\
+Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority
+/dev/zram1                              partition\t24581068\t12628\t\t32767
+/dev/zram10                             partition\t24581068\t0\t\t32767
+/swapfile/1                             file\t\t524284\t\t0\t\t-2
+";
+
+    #[test]
+    fn swap_in_use_matches_whole_field() {
+        assert!(swap_in_use(SWAPS, "/dev/zram1"));
+        assert!(swap_in_use(SWAPS, "/dev/zram10"));
+        assert!(swap_in_use(SWAPS, "/swapfile/1"));
+    }
+
+    #[test]
+    fn swap_in_use_rejects_prefixes_and_substrings() {
+        // /dev/zram1 must not be found via the /dev/zram10 line, nor the
+        // reverse, and a partial path must not match either.
+        assert!(!swap_in_use("/dev/zram10 partition 1 0 -2\n", "/dev/zram1"));
+        assert!(!swap_in_use("/dev/zram1 partition 1 0 -2\n", "/dev/zram10"));
+        assert!(!swap_in_use(SWAPS, "/dev/zram"));
+        assert!(!swap_in_use(SWAPS, "zram1"));
+    }
+
+    #[test]
+    fn swap_in_use_skips_the_header_row() {
+        // A device literally named "Filename" is absurd, but the header must
+        // not be treated as data regardless.
+        assert!(!swap_in_use(SWAPS, "Filename"));
+    }
+
+    #[test]
+    fn swap_in_use_on_empty_input_finds_nothing() {
+        assert!(!swap_in_use("", "/dev/zram1"));
+        // Header only, no swap active.
+        assert!(!swap_in_use("Filename\tType\tSize\tUsed\tPriority\n", "/dev/zram1"));
+    }
+
+    #[test]
+    fn swap_in_use_absent_device() {
+        assert!(!swap_in_use(SWAPS, "/dev/zram2"));
+    }
 
     fn stats(orig: u64, compr: u64, disk: u64) -> ZramStats {
         ZramStats {
