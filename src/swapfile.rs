@@ -1,6 +1,7 @@
 // SwapFC - Dynamic swap file management
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,7 +17,7 @@ use crate::meminfo::{get_free_ram_percent, get_free_swap_percent_effective};
 use crate::systemd::{
     gen_swap_unit, notify_ready, notify_status, swapoff, systemctl, SystemctlAction,
 };
-use crate::{debug, info, is_shutdown, warn};
+use crate::{debug, info, stop_in_progress, warn};
 
 #[derive(Error, Debug)]
 pub enum SwapFileError {
@@ -254,11 +255,12 @@ fn retune_loop_queue(loop_dev: &str) {
 /// SwapFC manager - supports btrfs, ext4, and xfs
 pub struct SwapFile {
     config: SwapFileConfig,
-    allocated: u32,
+    /// Indices of the swap files we manage, e.g. {1, 3} for /swapfile/1 and
+    /// /swapfile/3. Removing a file leaves a gap, so the count and the highest
+    /// index are different numbers and have to be tracked as such.
+    files: BTreeSet<u32>,
     /// True if path is on btrfs (for subvolume/nodatacow handling)
     is_btrfs: bool,
-    /// Track the size of each allocated file (for proper cleanup and stats)
-    file_sizes: Vec<u64>,
     /// Cooldown: last time a swap file was created (prevents runaway creation)
     last_creation: Option<Instant>,
     /// Escalating cooldown in seconds (doubles on each creation, resets when swap is consumed)
@@ -464,9 +466,8 @@ impl SwapFile {
 
         Ok(Self {
             config: swapfile_config,
-            allocated: 0,
+            files: BTreeSet::new(),
             is_btrfs,
-            file_sizes: Vec::new(),
             last_creation: None,
             cooldown_secs: if is_zswap_active { 5 } else { 15 },
             prev_free_swap: 100,
@@ -542,9 +543,9 @@ impl SwapFile {
 
     /// Check if a loop device belongs to us
     fn is_our_loop_device(&self, loop_path: &Path) -> bool {
-        // Scan all loop_info files in WORK_DIR, not just up to self.allocated.
-        // During adoption (adopt_existing_swapfiles), self.allocated is still 0,
-        // so a 1..=self.allocated range would never iterate.
+        // Scan every loop_info file in WORK_DIR rather than only the indices we
+        // already know about: during adoption (adopt_existing_swapfiles) the set
+        // is still empty, so iterating it would find nothing.
         let loop_dir = format!("{}/swapfile", WORK_DIR);
         let Ok(entries) = std::fs::read_dir(&loop_dir) else {
             return false;
@@ -689,18 +690,26 @@ impl SwapFile {
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
             force_remove(&loop_info_path, false);
 
-            // Update file_sizes if we tracked this file.
-            // Guard against idx==0 (would underflow (idx-1) as usize).
-            if idx > 0 && idx <= self.file_sizes.len() as u32 {
-                self.file_sizes.remove((idx - 1) as usize);
-            }
+            self.files.remove(&idx);
         }
-
-        self.allocated = self.allocated.saturating_sub(1);
 
         info!("swapFC: {} removed successfully", path.display());
         notify_status("Monitoring memory status...");
         Ok(())
+    }
+
+    /// How many swap files we currently manage.
+    fn file_count(&self) -> u32 {
+        self.files.len() as u32
+    }
+
+    /// Index for the next file, one past the highest in use.
+    ///
+    /// Gaps are never filled. An index freed by removing a middle file may
+    /// still name a file that another run left behind, and create_swapfile
+    /// unlinks whatever sits at the path it is about to use.
+    fn next_index(&self) -> u32 {
+        self.files.iter().next_back().copied().unwrap_or(0) + 1
     }
 
     /// Find the index of a file/loop device in our managed files
@@ -713,7 +722,7 @@ impl SwapFile {
         }
 
         // Check loop device info files
-        for i in 1..=self.allocated {
+        for &i in &self.files {
             let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, i);
             if let Ok(content) = fs::read_to_string(&loop_info_path) {
                 let lines: Vec<&str> = content.lines().collect();
@@ -728,8 +737,8 @@ impl SwapFile {
 
     /// Get the backing file for a loop device
     fn get_backing_file_for_loop(&self, loop_path: &Path) -> Option<PathBuf> {
-        // Scan all loop_info files (not bounded by self.allocated; may be called
-        // during adoption before allocated is set).
+        // Scan every loop_info file, not just the indices we know about: this
+        // may be called during adoption, before the set is populated.
         let loop_dir = format!("{}/swapfile", WORK_DIR);
         let Ok(entries) = std::fs::read_dir(&loop_dir) else {
             return None;
@@ -754,6 +763,31 @@ impl SwapFile {
         None
     }
 
+    /// Index of the loop_info file recording `loop_dev`, if we wrote one.
+    ///
+    /// Reads the directory rather than probing indices 1..=max_count: indices
+    /// are never reused, so they climb past max_count as files are created and
+    /// removed, and a bounded probe would stop finding them.
+    fn loop_info_index(&self, loop_dev: &str) -> Option<u32> {
+        let loop_dir = format!("{}/swapfile", WORK_DIR);
+        let entries = std::fs::read_dir(&loop_dir).ok()?;
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let Some(idx) = fname.to_string_lossy().strip_prefix("loop_").map(String::from) else {
+                continue;
+            };
+            let Ok(idx) = idx.parse::<u32>() else {
+                continue;
+            };
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if content.lines().next() == Some(loop_dev) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     /// Adopt swap files that already exist from a previous run.
     /// Called before create_initial_swap() so we never swapoff active files on restart.
     fn adopt_existing_swapfiles(&mut self) {
@@ -770,48 +804,33 @@ impl SwapFile {
             return;
         }
 
-        let mut max_num: u32 = 0;
+        // Record the index of every file found, not just the highest. A run
+        // that removed a middle file leaves gaps, so deriving a count from the
+        // maximum index overstates how many files exist and the startup
+        // cleanup then sheds one too many.
+        let mut found: BTreeSet<u32> = BTreeSet::new();
 
         for info in &existing {
             if let Some(name) = info.path.file_name() {
                 if let Ok(n) = name.to_string_lossy().parse::<u32>() {
-                    max_num = max_num.max(n);
+                    found.insert(n);
                 }
             }
             // For loop devices, derive the backing file number from the loop info file.
             if info.path.to_string_lossy().starts_with("/dev/loop") {
-                let loop_name = info.path.to_string_lossy();
-                // Find the matching loop info file we just wrote
-                for i in 1..=28u32 {
-                    let loop_info = format!("{}/swapfile/loop_{}", WORK_DIR, i);
-                    if let Ok(content) = fs::read_to_string(&loop_info) {
-                        if content.lines().next() == Some(&loop_name) {
-                            max_num = max_num.max(i);
-                            break;
-                        }
-                    }
+                if let Some(i) = self.loop_info_index(&info.path.to_string_lossy()) {
+                    found.insert(i);
                 }
             }
         }
 
-        if max_num > 0 {
+        if !found.is_empty() {
             info!(
-                "swapFC: adopting {} existing file(s) (max index: {})",
-                existing.len(),
-                max_num
+                "swapFC: adopting {} existing file(s) (indices: {:?})",
+                found.len(),
+                found
             );
-            self.allocated = max_num;
-
-            // Reconstruct file_sizes from disk metadata
-            self.file_sizes.clear();
-            for i in 1..=max_num {
-                let path = self.config.path.join(i.to_string());
-                let size = path
-                    .metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(self.config.chunk_size);
-                self.file_sizes.push(size);
-            }
+            self.files = found;
         }
     }
 
@@ -901,7 +920,7 @@ impl SwapFile {
         // After adoption, eagerly shed empty surplus files without waiting for the
         // 60-second contraction cooldown. Prevents accumulating ghost swapfiles from
         // previous sessions (e.g. benchmarks) that left multiple empty files active.
-        if self.allocated > self.config.min_count {
+        if self.file_count() > self.config.min_count {
             self.shed_excess_empty_adopted();
         }
 
@@ -909,16 +928,16 @@ impl SwapFile {
         // These are stale from crashes or force-reboots and waste disk space.
         self.cleanup_stale_disk_files();
 
-        while self.allocated < self.config.min_count {
+        while self.file_count() < self.config.min_count {
             if let Err(e) = self.create_swapfile() {
                 warn!(
                     "swapFC: initial swap creation stopped at {}/{}: {}",
-                    self.allocated, self.config.min_count, e
+                    self.file_count(), self.config.min_count, e
                 );
                 break;
             }
         }
-        if self.allocated == 0 {
+        if self.file_count() == 0 {
             return Err(SwapFileError::NoSpace);
         }
 
@@ -989,13 +1008,13 @@ impl SwapFile {
             .collect();
 
         for path in to_remove {
-            if self.allocated <= self.config.min_count {
+            if self.file_count() <= self.config.min_count {
                 break;
             }
             info!(
                 "swapFC: startup cleanup: removing empty surplus file {} ({} active, min {})",
                 path.display(),
-                self.allocated,
+                self.file_count(),
                 self.config.min_count
             );
             let _ = self.destroy_swapfile_by_path(&path);
@@ -1113,7 +1132,7 @@ impl SwapFile {
             let poll_interval = self.get_adaptive_poll_interval();
             thread::sleep(Duration::from_secs(poll_interval));
 
-            if is_shutdown() {
+            if stop_in_progress() {
                 break;
             }
 
@@ -1174,7 +1193,7 @@ impl SwapFile {
             // ~64% free and the growth trigger never fires.
             if self.config.sparse_loop_backing
                 && !self.disk_full
-                && self.allocated < self.config.max_count
+                && self.file_count() < self.config.max_count
             {
                 // Compute free percentage from actual /proc/swaps usage of our files.
                 let disk_free_swap: u8 = {
@@ -1217,7 +1236,7 @@ impl SwapFile {
             // The EMERGENCY and NORMAL triggers only apply to zram/plain swapfile modes.
             if !self.is_zswap_active
                 && !self.disk_full
-                && self.allocated < self.config.max_count
+                && self.file_count() < self.config.max_count
             {
                 // Count files with no data yet to avoid pre-allocating more than needed
                 let unused_count = swap_files.iter().filter(|f| f.used_bytes == 0).count();
@@ -1278,7 +1297,7 @@ impl SwapFile {
             }
 
             // CONTRACTION DECISION: check if swap is abundant enough to remove files
-            if self.allocated > self.config.min_count {
+            if self.file_count() > self.config.min_count {
                 // ZSWAP: must always keep at least 2 unused reserve files.
                 // Never remove if it would drop below the reserve threshold.
                 if self.is_zswap_active {
@@ -1325,7 +1344,7 @@ impl SwapFile {
     }
 
     fn get_adaptive_poll_interval(&self) -> u64 {
-        if self.allocated > 0 {
+        if self.file_count() > 0 {
             return self.config.frequency;
         }
 
@@ -1354,7 +1373,7 @@ impl SwapFile {
     }
 
     fn create_swapfile(&mut self) -> Result<()> {
-        let next_file_num = self.allocated + 1;
+        let idx = self.next_index();
         let chunk_size = self.config.chunk_size;
 
         if !self.has_enough_space(chunk_size) {
@@ -1370,13 +1389,12 @@ impl SwapFile {
 
         notify_status(&format!(
             "Allocating swap file #{} ({}MB)...",
-            next_file_num,
+            idx,
             chunk_size / (1024 * 1024)
         ));
-        self.allocated += 1;
-        self.file_sizes.push(chunk_size);
+        self.files.insert(idx);
 
-        let swapfile_path = self.config.path.join(self.allocated.to_string());
+        let swapfile_path = self.config.path.join(idx.to_string());
 
         // Remove if exists
         force_remove(&swapfile_path, false);
@@ -1405,7 +1423,7 @@ impl SwapFile {
             // Sparse: allocate blocks on-demand via truncate.
             info!(
                 "swapFC: creating sparse loop-backed file #{} ({}MB)",
-                self.allocated,
+                idx,
                 chunk_size / (1024 * 1024)
             );
             let status = Command::new("truncate")
@@ -1414,8 +1432,7 @@ impl SwapFile {
                 .status()?;
             if !status.success() {
                 force_remove(&swapfile_path, false);
-                self.allocated -= 1;
-                self.file_sizes.pop();
+                self.files.remove(&idx);
                 return Err(SwapFileError::NoSpace);
             }
             // direct-io=on: bypasses page cache, prevents deadlock
@@ -1437,7 +1454,7 @@ impl SwapFile {
             // that swapon rejects. Writing zeros creates REG extents.
             info!(
                 "swapFC: creating preallocated file #{} ({}MB)",
-                self.allocated,
+                idx,
                 chunk_size / (1024 * 1024)
             );
             {
@@ -1462,9 +1479,9 @@ impl SwapFile {
 
         // mkswap
         let fs_label = if self.config.sparse_loop_backing {
-            format!("SWAP_loop_{}", self.allocated)
+            format!("SWAP_loop_{}", idx)
         } else {
-            format!("SWAP_btrfs_{}", self.allocated)
+            format!("SWAP_btrfs_{}", idx)
         };
         let status = Command::new("mkswap")
             .args(["-L", &fs_label])
@@ -1473,8 +1490,7 @@ impl SwapFile {
             .status()?;
         if !status.success() {
             force_remove(&swapfile_path, false);
-            self.allocated -= 1;
-            self.file_sizes.pop();
+            self.files.remove(&idx);
             return Err(SwapFileError::Io(std::io::Error::other("mkswap failed")));
         }
 
@@ -1484,12 +1500,12 @@ impl SwapFile {
             Path::new(&swapfile),
             None,
             discard_options,
-            &format!("swapfile_{}", self.allocated),
+            &format!("swapfile_{}", idx),
         )?;
 
         // Store loop device info for cleanup
         if let Some(ref loop_dev) = loop_device {
-            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, self.allocated);
+            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
             let _ = fs::write(
                 &loop_info_path,
                 format!("{}\n{}", loop_dev, swapfile_path.display()),
@@ -1529,6 +1545,63 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── File index bookkeeping ───────────────────────────────────────────────
+    //
+    // Mirrors file_count()/next_index() over the same BTreeSet the manager
+    // holds. Constructing a SwapFile needs a real filesystem, so the set logic
+    // is exercised directly.
+
+    fn count(files: &BTreeSet<u32>) -> u32 {
+        files.len() as u32
+    }
+
+    fn next(files: &BTreeSet<u32>) -> u32 {
+        files.iter().next_back().copied().unwrap_or(0) + 1
+    }
+
+    #[test]
+    fn count_is_not_the_highest_index() {
+        // The bug: one file left at index 2 was counted as two files, so the
+        // startup cleanup shed one too many and left none at all.
+        let files: BTreeSet<u32> = [2].into_iter().collect();
+        assert_eq!(count(&files), 1);
+        assert_ne!(count(&files), *files.iter().next_back().unwrap());
+    }
+
+    #[test]
+    fn next_index_skips_gaps_rather_than_filling_them() {
+        // Filling the gap would collide with /swapfile/3, and create_swapfile
+        // unlinks whatever already sits at the path it is about to use.
+        let files: BTreeSet<u32> = [1, 3].into_iter().collect();
+        assert_eq!(count(&files), 2);
+        assert_eq!(next(&files), 4);
+    }
+
+    #[test]
+    fn next_index_starts_at_one_when_empty() {
+        assert_eq!(next(&BTreeSet::new()), 1);
+    }
+
+    #[test]
+    fn removing_a_middle_file_leaves_the_rest_addressable() {
+        let mut files: BTreeSet<u32> = [1, 2, 3].into_iter().collect();
+        files.remove(&2);
+        assert_eq!(count(&files), 2);
+        assert!(files.contains(&1) && files.contains(&3));
+        assert_eq!(next(&files), 4);
+    }
+
+    #[test]
+    fn min_count_is_respected_when_indices_are_gapped() {
+        // shed_excess_empty_adopted stops once the count reaches min_count.
+        let files: BTreeSet<u32> = [2].into_iter().collect();
+        let min_count = 1;
+        assert!(
+            count(&files) <= min_count,
+            "a single adopted file must not be shed to satisfy min_count"
+        );
+    }
 
     // ── SwapFileInfo ─────────────────────────────────────────────────────────
 

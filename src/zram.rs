@@ -904,7 +904,7 @@ impl ZramPool {
         loop {
             thread::sleep(Duration::from_secs(check_interval));
 
-            if crate::is_shutdown() {
+            if crate::stop_in_progress() {
                 break;
             }
 
