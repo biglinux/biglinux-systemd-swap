@@ -69,9 +69,11 @@ fi
 if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
     log_info "Setting up btrfs subvolume for swap files"
 
-    # Mount root partition on /mnt
-    if ! mount "$rootpartition" /mnt; then
-        die "Failed to mount $rootpartition on /mnt"
+    # Mount the btrfs top level on /mnt. Plain `mount "$rootpartition"` gives
+    # the default subvolume, which a snapper rollback repoints at the booted
+    # snapshot, putting the new subvolume inside that snapshot.
+    if ! mount -o subvolid=5 "$rootpartition" /mnt; then
+        die "Failed to mount btrfs top level of $rootpartition on /mnt"
     fi
 
     # Create subvolume if it doesn't exist
@@ -88,7 +90,9 @@ if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
         log_info "Adding subvolume to /etc/fstab"
         uuid=$(blkid -s UUID -o value "$rootpartition")
         if [[ -n "$uuid" ]]; then
-            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime 0 0" >>/etc/fstab
+            # nofail: this subvolume only holds swap overflow files, so failing
+            # to mount it should cost swap capacity, not fail local-fs.target.
+            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime,nofail 0 0" >>/etc/fstab
         else
             die "Could not get UUID for $rootpartition"
         fi
