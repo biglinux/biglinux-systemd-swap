@@ -29,17 +29,69 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     die "Configuration file not found: $CONFIG_FILE"
 fi
 
-# Extract swapfile_path folder name (second component of path).
-# Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
-# grep returns exit 1 when no match; || true prevents set -e from aborting.
-swapfcfolder=$(grep -E "^(swapfile_path|swapfc_path)=" "$CONFIG_FILE" \
-    | tail -n 1 \
-    | cut -d'=' -f2 \
-    | cut -d'/' -f2 || true)
+# Read the last value of a config key. grep returns exit 1 when no match;
+# || true prevents set -e from aborting. cut -d'#' strips inline comments and
+# read trims surrounding whitespace, matching the daemon's parser
+# (Config::parse in src/config.rs). Internal whitespace is preserved so it can
+# be rejected rather than silently closed up.
+config_get() {
+    local raw value
+    raw=$(grep -E "^($1)=" "$CONFIG_FILE" \
+        | tail -n 1 \
+        | cut -d'=' -f2- \
+        | cut -d'#' -f1 || true)
+    read -r value <<< "$raw"
+    printf '%s' "$value"
+}
 
-if [[ -z "$swapfcfolder" ]]; then
+# swap_mode is read first because it decides whether swapfile_path is used at
+# all. Only zram and disabled never create swap files. auto is resolved by the
+# daemon at runtime, so treat it as needing the subvolume.
+swap_mode=$(config_get "swap_mode")
+
+if [[ -z "$swap_mode" ]]; then
+    swap_mode="auto"
+fi
+
+case "$swap_mode" in
+    zram|disabled) swapfile_subvol_needed=0 ;;
+    *)             swapfile_subvol_needed=1 ;;
+esac
+
+# Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
+swapfcpath=$(config_get "swapfile_path|swapfc_path")
+
+if [[ -z "$swapfcpath" ]]; then
     # Default path mirrors defaults::SWAPFILE_PATH in src/defaults.rs
-    swapfcfolder="swapfile"
+    swapfcpath="/swapfile"
+fi
+
+swapfcfolder=""
+
+# The setup below maps this to subvolume @<folder> mounted at /<folder>, so
+# only single-component absolute paths work. Taking the second component of
+# /var/swap gave folder "var", mounting a new @var over the live /var.
+# Only checked when the value is used: in zram and disabled modes swapfile_path
+# is inert, and rejecting it there would also skip the kernel tuning below.
+if [[ "$swapfile_subvol_needed" == "1" ]]; then
+    if [[ "$swapfcpath" != /* ]]; then
+        die "swapfile_path must be an absolute path, got: $swapfcpath"
+    fi
+
+    if [[ "$swapfcpath" == *[[:space:]]* ]]; then
+        die "swapfile_path must not contain whitespace, got: $swapfcpath"
+    fi
+
+    swapfcfolder="${swapfcpath#/}"
+    swapfcfolder="${swapfcfolder%/}"
+
+    if [[ -z "$swapfcfolder" ]]; then
+        die "swapfile_path must not be the filesystem root"
+    fi
+
+    if [[ "$swapfcfolder" == */* ]]; then
+        die "swapfile_path must be a single top-level directory such as /swapfile, got: $swapfcpath"
+    fi
 fi
 
 # =============================================================================
@@ -56,9 +108,10 @@ fi
 # Get filesystem type
 fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || echo "unknown")
 
-# Check if path is a btrfs subvolume and get top level id
+# Check if path is a btrfs subvolume and get top level id.
+# swapfcfolder is empty when the mode has no swap files, so gate on that too.
 toplevelid=""
-if [[ "$fstype" == "btrfs" ]] && [[ -d "/$swapfcfolder" ]]; then
+if [[ "$swapfile_subvol_needed" == "1" ]] && [[ "$fstype" == "btrfs" ]] && [[ -d "/$swapfcfolder" ]]; then
     toplevelid=$(btrfs subvolume show "/$swapfcfolder" 2>/dev/null | grep -i "top level id" | awk '{print $4}' || echo "")
 fi
 
@@ -66,7 +119,9 @@ fi
 # Btrfs Subvolume Setup
 # =============================================================================
 
-if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
+if [[ "$swapfile_subvol_needed" != "1" ]] && [[ "$fstype" == "btrfs" ]]; then
+    log_info "swap_mode=$swap_mode does not use swap files, skipping subvolume setup"
+elif [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
     log_info "Setting up btrfs subvolume for swap files"
 
     # Mount root partition on /mnt
