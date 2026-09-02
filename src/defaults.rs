@@ -41,6 +41,30 @@ pub const SWAPFILE_SHRINK_THRESHOLD: u8 = 30;
 pub const SWAPFILE_SAFE_HEADROOM: u8 = 40;
 pub const SWAPFILE_NOCOW: &str = "1";
 
+// Free space left on the filesystem after a swap file is created.
+//
+// Expressed as a percentage of the filesystem, clamped into an absolute band,
+// because neither form works alone. A percentage is meaningless on a small
+// filesystem (5% of 8GB does not cover one metadata chunk) and excessive on a
+// large one (5% of 4TB is 200GB withheld for nothing).
+//
+// The floor is what btrfs needs to stay healthy: a metadata chunk is 256MiB to
+// 1GiB and the global reserve is up to 512MiB, so a filesystem with less than
+// that unallocated can fail writes and turn read-only while still reporting
+// free space. ext4 and xfs do not fail this way, but both fragment badly near
+// full, and a swap file wants extents.
+//
+// The cap is a judgement rather than a hard requirement: past a few GiB the
+// reserve stops protecting the filesystem and starts being arbitrary.
+pub const SWAPFILE_MIN_FREE_PERCENT: u64 = 5;
+pub const SWAPFILE_MIN_FREE_FLOOR: u64 = 1024 * 1024 * 1024;
+pub const SWAPFILE_MIN_FREE_CAP: u64 = 8 * 1024 * 1024 * 1024;
+
+// Unallocated space btrfs must keep so it can still allocate a metadata chunk.
+// This is the number statvfs cannot express: free space inside already
+// allocated data chunks is reported as available while metadata starves.
+pub const SWAPFILE_BTRFS_MIN_UNALLOCATED: u64 = 1024 * 1024 * 1024;
+
 // ── MGLRU (Multi-Gen LRU) ──────────────────────────────────────────────────
 
 pub const MGLRU_MIN_TTL_MS: u32 = 1000;

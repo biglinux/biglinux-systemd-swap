@@ -96,9 +96,54 @@ pub struct SwapFileConfig {
     /// NOCOW (chattr +C) on btrfs swap files.
     /// Default: true (prevents btrfs deadlock under memory pressure).
     pub nocow: bool,
+    /// Free space to keep on the filesystem, as a percentage ("5%") or a size
+    /// ("2G"). None resolves to a percentage clamped into an absolute band.
+    pub min_free_disk: Option<String>,
 }
 
 
+
+/// Free space to keep on the filesystem after allocating a swap file.
+///
+/// `configured` accepts a percentage ("5%") or a size ("2G"). An explicit value
+/// is taken as given; only the automatic default is clamped, since an admin
+/// asking for a specific reserve has already made the judgement.
+pub fn resolve_min_free(fs_total: u64, configured: Option<&str>) -> u64 {
+    // Multiply before dividing, in u128 so a filesystem large enough to
+    // overflow the intermediate cannot exist.
+    let percent_of_total = |p: u64| -> u64 { ((fs_total as u128 * p as u128) / 100) as u64 };
+
+    let automatic = || {
+        percent_of_total(defaults::SWAPFILE_MIN_FREE_PERCENT).clamp(
+            defaults::SWAPFILE_MIN_FREE_FLOOR,
+            defaults::SWAPFILE_MIN_FREE_CAP,
+        )
+    };
+
+    match configured {
+        None => automatic(),
+        Some(s) => {
+            let s = s.trim();
+            if let Some(pct) = s.strip_suffix('%') {
+                match pct.trim().parse::<u64>() {
+                    Ok(p) => percent_of_total(p),
+                    Err(_) => automatic(),
+                }
+            } else {
+                parse_size_shared(s).unwrap_or_else(|_| automatic())
+            }
+        }
+    }
+}
+
+/// Bytes not yet allocated to any btrfs chunk, from `btrfs filesystem usage -b`.
+pub fn parse_btrfs_unallocated(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Device unallocated:")
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
 
 /// Reject paths that point at critical system directories or are not absolute.
 ///
@@ -191,6 +236,14 @@ impl SwapFileConfig {
             nocow: {
                 let s = config.get("swapfile_nocow").unwrap_or(defaults::SWAPFILE_NOCOW).to_string();
                 !matches!(s.as_str(), "0" | "false" | "no" | "off")
+            },
+            min_free_disk: {
+                let s = config.get("swapfile_min_free_disk").unwrap_or("").trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             },
         })
     }
@@ -1342,15 +1395,53 @@ impl SwapFile {
         }
     }
 
+    /// Whether a file of `required_size` can be created while leaving the
+    /// filesystem with enough room to keep working.
+    ///
+    /// The old rule was free >= required * 2, which scales with the swap file
+    /// rather than with the filesystem, so it let allocation continue until
+    /// roughly one chunk remained free. What matters instead is what survives
+    /// the allocation, so the reserve is the thing that has to still be there
+    /// afterwards.
     fn has_enough_space(&self, required_size: u64) -> bool {
-        let check_path = self.config.path.clone();
-        if let Ok(stat) = nix::sys::statvfs::statvfs(&check_path) {
-            let free_bytes = stat.blocks_available() * stat.block_size();
-            // Need at least 2x the required size (safety margin)
-            free_bytes >= required_size * 2
-        } else {
-            false
+        let Ok(stat) = nix::sys::statvfs::statvfs(&self.config.path) else {
+            return false;
+        };
+
+        let block_size = stat.block_size();
+        let free = stat.blocks_available() * block_size;
+        let total = stat.blocks() * block_size;
+        let reserve = resolve_min_free(total, self.config.min_free_disk.as_deref());
+
+        if free < required_size.saturating_add(reserve) {
+            return false;
         }
+
+        // btrfs reports space inside allocated data chunks as free even when
+        // nothing is left to carve a metadata chunk from. Writing into that
+        // window is how a filesystem ends up ENOSPC with free space showing,
+        // so ask btrfs directly rather than trusting statvfs alone.
+        if self.is_btrfs {
+            if let Ok(out) = run_cmd_output(&[
+                "btrfs",
+                "filesystem",
+                "usage",
+                "-b",
+                &self.config.path.to_string_lossy(),
+            ]) {
+                if let Some(unallocated) = parse_btrfs_unallocated(&out) {
+                    if unallocated < defaults::SWAPFILE_BTRFS_MIN_UNALLOCATED {
+                        warn!(
+                            "swapFC: btrfs has only {}MB unallocated - refusing to allocate",
+                            unallocated / (1024 * 1024)
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
     }
 
     fn create_swapfile(&mut self) -> Result<()> {
@@ -1440,11 +1531,14 @@ impl SwapFile {
                 self.allocated,
                 chunk_size / (1024 * 1024)
             );
-            {
+            // The space check happens before this write, and the write is what
+            // actually consumes the space, so the filesystem can fill in
+            // between: statvfs is a snapshot and other writers exist. Roll back
+            // on failure like the truncate and mkswap paths below, or a partial
+            // file is left on disk while still counted as allocated.
+            let fill = (|| -> std::io::Result<()> {
                 use std::io::Write;
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&swapfile_path)?;
+                let f = std::fs::OpenOptions::new().write(true).open(&swapfile_path)?;
                 let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, f);
                 let zeros = vec![0u8; 1024 * 1024];
                 let chunks = chunk_size / (1024 * 1024);
@@ -1455,7 +1549,20 @@ impl SwapFile {
                 if remainder > 0 {
                     writer.write_all(&vec![0u8; remainder])?;
                 }
-                writer.flush()?;
+                writer.flush()
+            })();
+
+            if let Err(e) = fill {
+                warn!(
+                    "swapFC: could not fill {} ({}), removing partial file",
+                    swapfile_path.display(),
+                    e
+                );
+                force_remove(&swapfile_path, false);
+                self.allocated -= 1;
+                self.file_sizes.pop();
+                self.disk_full = true;
+                return Err(SwapFileError::Io(e));
             }
             (swapfile_path.to_string_lossy().to_string(), None)
         };
@@ -1529,6 +1636,69 @@ fn is_btrfs_subvolume(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Free space reserve ───────────────────────────────────────────────────
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn reserve_is_a_percentage_between_the_bounds() {
+        assert_eq!(resolve_min_free(100 * GIB, None), 5 * GIB);
+    }
+
+    #[test]
+    fn reserve_floors_on_small_filesystems() {
+        // 5% of 8 GiB is 409 MiB, under one btrfs metadata chunk plus its
+        // global reserve, so the floor takes over.
+        assert_eq!(resolve_min_free(8 * GIB, None), GIB);
+        assert_eq!(resolve_min_free(GIB, None), GIB);
+    }
+
+    #[test]
+    fn reserve_caps_on_large_filesystems() {
+        // 5% of 4 TiB would withhold 200 GiB for no additional safety.
+        assert_eq!(resolve_min_free(4096 * GIB, None), 8 * GIB);
+    }
+
+    #[test]
+    fn reserve_honours_an_explicit_size_or_percentage() {
+        assert_eq!(resolve_min_free(100 * GIB, Some("2G")), 2 * GIB);
+        assert_eq!(resolve_min_free(100 * GIB, Some("10%")), 10 * GIB);
+        // An explicit value is not clamped: the admin has made the call.
+        assert_eq!(resolve_min_free(4096 * GIB, Some("50%")), 2048 * GIB);
+        assert_eq!(resolve_min_free(100 * GIB, Some("64M")), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn reserve_falls_back_to_automatic_on_nonsense() {
+        assert_eq!(resolve_min_free(100 * GIB, Some("banana")), 5 * GIB);
+        assert_eq!(resolve_min_free(100 * GIB, Some("%")), 5 * GIB);
+    }
+
+    // ── btrfs unallocated ────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_device_unallocated_from_btrfs_usage() {
+        let out = "\
+Overall:
+    Device size:                 999930462208
+    Device allocated:            901976686592
+    Device unallocated:           97953775616
+    Used:                        870399021056
+    Free (estimated):            120930316288      (min: 120930316288)
+";
+        assert_eq!(parse_btrfs_unallocated(out), Some(97953775616));
+    }
+
+    #[test]
+    fn btrfs_unallocated_absent_when_unparseable() {
+        assert_eq!(parse_btrfs_unallocated(""), None);
+        // Human-readable output (without -b) is not a number we can use.
+        assert_eq!(
+            parse_btrfs_unallocated("    Device unallocated:\t  91.23GiB\n"),
+            None
+        );
+    }
 
     // ── SwapFileInfo ─────────────────────────────────────────────────────────
 

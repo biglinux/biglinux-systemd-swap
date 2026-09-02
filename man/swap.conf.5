@@ -118,6 +118,24 @@ When at 0 it skips to -2. Max 32767.
 .I
 .IP swapfc_path=
 Path to folder where swapfc creates its swap files.
+.I
+.IP swapfile_min_free_disk=
+Free space to keep on the filesystem after a swap file is allocated, as a
+percentage ("5%") or a size ("2G"). Empty, the default, uses 5% clamped to
+between 1GB and 8GB.
+.sp
+Neither form works alone. A percentage is meaningless on a small filesystem,
+where 5% does not cover a single btrfs metadata chunk, and excessive on a large
+one, where it withholds far more than any filesystem needs. An explicit value
+is used as given and is not clamped.
+.sp
+On btrfs the daemon additionally refuses to allocate when less than 1GB is
+unallocated. btrfs reports free space inside already allocated data chunks as
+available even when nothing remains to carve a metadata chunk from, so it can
+fail writes and turn read-only while
+.BR df (1)
+still looks healthy. ext4 and xfs do not fail that way, but both fragment badly
+near full and a swap file wants extents.
 .PP
 The following options are only for loop devices.
 .I
