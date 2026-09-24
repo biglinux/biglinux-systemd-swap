@@ -4,10 +4,9 @@
 use std::path::Path;
 
 use crate::defaults;
-use crate::helpers::{get_fstype, MB, GB};
+use crate::helpers::{get_fstype, GB, MB};
 use crate::meminfo::get_ram_size;
 use crate::{debug, info};
-
 
 /// Full system capabilities
 #[derive(Debug, Clone)]
@@ -16,7 +15,6 @@ pub struct SystemCapabilities {
     pub free_disk_space_bytes: u64,
     pub total_ram_bytes: u64,
     pub is_live_system: bool,
-    pub cpu_count: usize,
 }
 
 impl SystemCapabilities {
@@ -47,9 +45,6 @@ impl SystemCapabilities {
             free_disk_space_bytes: free_space,
             total_ram_bytes: total_ram,
             is_live_system: is_live,
-            cpu_count: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
         }
     }
 
@@ -70,8 +65,8 @@ impl SystemCapabilities {
 /// Swap mode recommendation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SwapMode {
-    ZramOnly,      // zram without disk backing
-    ZramSwapfc,    // zram + pre-allocated swapfiles for overflow
+    ZramOnly,   // zram without disk backing
+    ZramSwapfc, // zram + pre-allocated swapfiles for overflow
 }
 
 /// Recommended swap configuration for auto mode.
@@ -81,62 +76,17 @@ pub enum SwapMode {
 #[derive(Debug, Clone)]
 pub struct RecommendedConfig {
     pub swap_mode: SwapMode,
-
-    // Zram: disksize = 150% RAM, zstd compression, highest priority
-    pub zram_size_percent: u32,
-    pub zram_algorithm: String,
-
-    // Swapfiles: 512M chunks, up to 28 files, dynamic growth/shrink
-    pub swapfc_chunk_size: String,
-    pub swapfc_max_count: u32,
-    pub swapfc_free_ram_perc: u8,
-    pub swapfc_free_swap_perc: u8,
-    pub swapfc_remove_free_swap_perc: u8,
-
-    // MGLRU settings
-    pub mglru_min_ttl_ms: u32,
 }
 
 impl Default for RecommendedConfig {
     fn default() -> Self {
-        Self::zram_only()
+        Self {
+            swap_mode: SwapMode::ZramOnly,
+        }
     }
 }
 
 impl RecommendedConfig {
-    /// Zram-only config (no disk swap).
-    fn zram_only() -> Self {
-        Self {
-            swap_mode: SwapMode::ZramOnly,
-            zram_size_percent: 150,
-            zram_algorithm: defaults::ZRAM_ALG.to_string(),
-            swapfc_chunk_size: defaults::SWAPFILE_CHUNK_SIZE.to_string(),
-            swapfc_max_count: 0,
-            swapfc_free_ram_perc: defaults::SWAPFILE_FREE_RAM_PERC,
-            swapfc_free_swap_perc: defaults::SWAPFILE_FREE_SWAP_PERC,
-            swapfc_remove_free_swap_perc: defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC,
-            mglru_min_ttl_ms: defaults::MGLRU_MIN_TTL_MS,
-        }
-    }
-
-    /// Zram as primary + pre-allocated swapfiles for overflow.
-    ///
-    /// Zram handles compression in RAM (150% disksize ≈ 37% RAM at ~4x ratio).
-    /// Disk swapfiles provide emergency overflow when zram fills.
-    fn zram_swapfc() -> Self {
-        Self {
-            swap_mode: SwapMode::ZramSwapfc,
-            zram_size_percent: 150,
-            zram_algorithm: defaults::ZRAM_ALG.to_string(),
-            swapfc_chunk_size: defaults::SWAPFILE_CHUNK_SIZE.to_string(),
-            swapfc_max_count: defaults::SWAPFILE_MAX_COUNT,
-            swapfc_free_ram_perc: defaults::SWAPFILE_FREE_RAM_PERC,
-            swapfc_free_swap_perc: defaults::SWAPFILE_FREE_SWAP_PERC,
-            swapfc_remove_free_swap_perc: defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC,
-            mglru_min_ttl_ms: defaults::MGLRU_MIN_TTL_MS,
-        }
-    }
-
     /// Generate recommended configuration based on system capabilities.
     pub fn from_capabilities(caps: &SystemCapabilities) -> Self {
         Self::build_config(caps)
@@ -148,25 +98,49 @@ impl RecommendedConfig {
     /// Each subsystem module (zram.rs, swapfile.rs) has its own fallback
     /// defaults in `unwrap_or()` calls, but auto mode overrides them here
     /// for optimal hardware-matched settings.
+    ///
+    /// `zram_size` is virtual capacity, so 150% only costs 150% of RAM if the
+    /// data does not compress at all. What the pool may actually hold in RAM is
+    /// `zram_mem_limit`, and that is the number that keeps reclaim able to make
+    /// progress. Do not re-derive one from the other by assuming a compression
+    /// ratio: the ratio falls exactly when the pool fills. Measured on one host
+    /// over 21,178 samples, 3.4x while the pool sat below 40% full and 1.93x on
+    /// the sample taken 30 s before a reclaim deadlock.
     pub fn config_pairs(&self) -> Vec<(&str, String)> {
         let mut pairs = vec![
-            ("zram_alg", self.zram_algorithm.clone()),
-            ("zram_size", format!("{}%", self.zram_size_percent)),
+            ("zram_alg", defaults::ZRAM_ALG.to_string()),
+            ("zram_size", defaults::ZRAM_SIZE.to_string()),
+            ("zram_mem_limit", defaults::ZRAM_MEM_LIMIT.to_string()),
             ("zram_prio", defaults::ZRAM_PRIO.to_string()),
         ];
 
         if self.swap_mode == SwapMode::ZramSwapfc {
             pairs.extend([
-                ("swapfile_chunk_size", self.swapfc_chunk_size.clone()),
-                ("swapfile_max_count", self.swapfc_max_count.to_string()),
-                ("swapfile_free_ram_perc", self.swapfc_free_ram_perc.to_string()),
-                ("swapfile_free_swap_perc", self.swapfc_free_swap_perc.to_string()),
-                ("swapfile_remove_free_swap_perc", self.swapfc_remove_free_swap_perc.to_string()),
+                (
+                    "swapfile_chunk_size",
+                    defaults::SWAPFILE_CHUNK_SIZE.to_string(),
+                ),
+                (
+                    "swapfile_max_count",
+                    defaults::SWAPFILE_MAX_COUNT.to_string(),
+                ),
+                (
+                    "swapfile_free_ram_perc",
+                    defaults::SWAPFILE_FREE_RAM_PERC.to_string(),
+                ),
+                (
+                    "swapfile_free_swap_perc",
+                    defaults::SWAPFILE_FREE_SWAP_PERC.to_string(),
+                ),
+                (
+                    "swapfile_remove_free_swap_perc",
+                    defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC.to_string(),
+                ),
             ]);
         }
 
         // MGLRU: always inject so auto mode configures it
-        pairs.push(("mglru_min_ttl_ms", self.mglru_min_ttl_ms.to_string()));
+        pairs.push(("mglru_min_ttl_ms", defaults::MGLRU_MIN_TTL_MS.to_string()));
 
         pairs
     }
@@ -181,7 +155,7 @@ impl RecommendedConfig {
     fn build_config(caps: &SystemCapabilities) -> Self {
         if caps.is_live_system {
             debug!("Autoconfig: Live system detected, using zram only");
-            return Self::zram_only();
+            return Self::default();
         }
 
         let supports_swapfiles = caps
@@ -191,16 +165,20 @@ impl RecommendedConfig {
             .unwrap_or(false);
 
         if !supports_swapfiles {
-            info!("Autoconfig: FS {:?} does not support swapfiles, using zram only",
-                caps.swap_path_fstype);
-            return Self::zram_only();
+            info!(
+                "Autoconfig: FS {:?} does not support swapfiles, using zram only",
+                caps.swap_path_fstype
+            );
+            return Self::default();
         }
 
         if caps.free_disk_space_bytes < caps.total_ram_bytes {
-            info!("Autoconfig: Not enough disk space (free={:.1}GB < RAM={:.1}GB), using zram only",
+            info!(
+                "Autoconfig: Not enough disk space (free={:.1}GB < RAM={:.1}GB), using zram only",
                 caps.free_disk_space_bytes as f64 / GB as f64,
-                caps.total_ram_bytes as f64 / GB as f64);
-            return Self::zram_only();
+                caps.total_ram_bytes as f64 / GB as f64
+            );
+            return Self::default();
         }
 
         info!(
@@ -209,7 +187,9 @@ impl RecommendedConfig {
             caps.total_ram_bytes as f64 / GB as f64,
             caps.swap_path_fstype,
         );
-        Self::zram_swapfc()
+        Self {
+            swap_mode: SwapMode::ZramSwapfc,
+        }
     }
 }
 
@@ -223,7 +203,6 @@ mod tests {
             free_disk_space_bytes: free,
             total_ram_bytes: ram,
             is_live_system: live,
-            cpu_count: 4,
         }
     }
 
@@ -231,9 +210,9 @@ mod tests {
 
     #[test]
     fn live_system_uses_zram_only() {
-        let c = RecommendedConfig::from_capabilities(&caps(Some("overlay"), 8 * GB, 100 * GB, true));
+        let c =
+            RecommendedConfig::from_capabilities(&caps(Some("overlay"), 8 * GB, 100 * GB, true));
         assert_eq!(c.swap_mode, SwapMode::ZramOnly);
-        assert_eq!(c.swapfc_max_count, 0);
     }
 
     #[test]
@@ -249,9 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn low_disk_uses_zram_only() {
-        // Free disk < RAM → zram only.
-        let c = RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 16 * GB, 8 * GB, false));
+    fn disk_below_ram_uses_zram_only() {
+        // The threshold is `free < RAM`: equal still gets swap files.
+        let c = RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 8 * GB, 8 * GB, false));
+        assert_eq!(c.swap_mode, SwapMode::ZramSwapfc);
+        let c =
+            RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 8 * GB, 8 * GB - 1, false));
         assert_eq!(c.swap_mode, SwapMode::ZramOnly);
     }
 
@@ -259,7 +241,6 @@ mod tests {
     fn btrfs_with_enough_disk_uses_zram_swapfc() {
         let c = RecommendedConfig::from_capabilities(&caps(Some("btrfs"), 8 * GB, 100 * GB, false));
         assert_eq!(c.swap_mode, SwapMode::ZramSwapfc);
-        assert_eq!(c.swapfc_max_count, defaults::SWAPFILE_MAX_COUNT);
     }
 
     #[test]
@@ -278,7 +259,7 @@ mod tests {
 
     #[test]
     fn config_pairs_zram_only_has_no_swapfile_keys() {
-        let c = RecommendedConfig::zram_only();
+        let c = RecommendedConfig::default();
         let pairs = c.config_pairs();
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"zram_alg"));
@@ -291,7 +272,9 @@ mod tests {
 
     #[test]
     fn config_pairs_zram_swapfc_has_swapfile_keys() {
-        let c = RecommendedConfig::zram_swapfc();
+        let c = RecommendedConfig {
+            swap_mode: SwapMode::ZramSwapfc,
+        };
         let pairs = c.config_pairs();
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"swapfile_chunk_size"));
@@ -303,7 +286,7 @@ mod tests {
 
     #[test]
     fn config_pairs_zram_size_is_percent_string() {
-        let c = RecommendedConfig::zram_only();
+        let c = RecommendedConfig::default();
         let pairs = c.config_pairs();
         let (_, zram_size) = pairs.iter().find(|(k, _)| *k == "zram_size").unwrap();
         assert!(zram_size.ends_with('%'), "got {}", zram_size);
@@ -312,8 +295,10 @@ mod tests {
     #[test]
     fn config_pairs_always_includes_mglru() {
         for c in [
-            RecommendedConfig::zram_only(),
-            RecommendedConfig::zram_swapfc(),
+            RecommendedConfig::default(),
+            RecommendedConfig {
+                swap_mode: SwapMode::ZramSwapfc,
+            },
         ] {
             let pairs = c.config_pairs();
             assert!(pairs.iter().any(|(k, _)| *k == "mglru_min_ttl_ms"));

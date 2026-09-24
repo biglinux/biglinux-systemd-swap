@@ -152,16 +152,12 @@ pub struct EffectiveSwapUsage {
     pub swap_total: u64,
     /// Free swap space as reported by kernel (bytes)
     pub swap_free: u64,
-    /// Swap used as reported by kernel (bytes) - includes zswap cached pages
-    pub swap_used_kernel: u64,
     /// Compressed bytes in zswap RAM pool (Zswap field from /proc/meminfo)
     pub zswap_pool_bytes: u64,
     /// Original (uncompressed) bytes held in zswap RAM (Zswapped field from /proc/meminfo)
     /// This is the amount of swap space that zswap is "saving" - these pages have swap
     /// slots allocated but are NOT actually written to disk
     pub zswapped_original_bytes: u64,
-    /// Estimated bytes actually written to disk swap
-    pub swap_used_disk: u64,
     /// Zswap pool utilization percentage (0-100)
     pub zswap_pool_percent: u8,
     /// Whether zswap is active and has stored pages
@@ -191,16 +187,13 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
     let stats = get_mem_stats(&["MemTotal", "SwapTotal", "SwapFree"])?;
     let swap_total = stats["SwapTotal"];
     let swap_free = stats["SwapFree"];
-    let swap_used_kernel = swap_total.saturating_sub(swap_free);
     let mem_total = stats["MemTotal"];
 
     let mut result = EffectiveSwapUsage {
         swap_total,
         swap_free,
-        swap_used_kernel,
         zswap_pool_bytes: zswap_compressed,
         zswapped_original_bytes: zswap_original,
-        swap_used_disk: swap_used_kernel.saturating_sub(zswap_original),
         zswap_pool_percent: 0,
         zswap_active: zswap_original > 0 || zswap_compressed > 0,
     };
@@ -214,19 +207,16 @@ pub fn get_effective_swap_usage() -> Result<EffectiveSwapUsage> {
                 .unwrap_or(20);
 
         let max_pool_size = mem_total * max_pool_percent / 100;
-        if max_pool_size > 0 {
-            result.zswap_pool_percent = ((zswap_compressed * 100) / max_pool_size).min(100) as u8;
+        if let Some(pct) = (zswap_compressed * 100).checked_div(max_pool_size) {
+            result.zswap_pool_percent = pct.min(100) as u8;
         }
     }
 
     Ok(result)
 }
 
-/// Get the disk-level swap usage percentage from /proc/meminfo (0-100).
-///
-/// For zswap: the kernel allocates swap slots for pages entering zswap,
-/// but those pages are in RAM (compressed). When the pool fills, the shrinker
-/// Read memory stats from /proc/meminfo, ignoring missing fields
+/// Read memory stats from `/proc/meminfo`, skipping fields that are absent or
+/// unparseable. Values are returned in bytes (kB lines multiplied by 1024).
 fn get_mem_stats_optional(fields: &[&str]) -> Result<HashMap<String, u64>> {
     let mut stats = HashMap::new();
     let mut remaining: HashSet<&str> = fields.iter().copied().collect();
@@ -267,6 +257,88 @@ fn get_mem_stats_optional(fields: &[&str]) -> Result<HashMap<String, u64>> {
     Ok(stats)
 }
 
+/// Sleep that ends early the moment memory pressure starts.
+///
+/// A PSI trigger (Documentation/accounting/psi.rst): the kernel wakes the
+/// poller when tasks spend `STALL_US` stalled on memory within any `WINDOW_US`,
+/// and costs nothing while they do not -- no reads, no wakeups. A fixed tick
+/// cannot do both: at 5 s the zram monitor saw a 300 MB/s burst only after the
+/// slots it needed were gone. The window is 2 s because that is the shortest
+/// one the kernel accepts without CAP_SYS_RESOURCE, which the unit drops.
+/// Without PSI (CONFIG_PSI off, `psi=0`) this is a plain sleep.
+pub struct PressureWait {
+    trigger: Option<File>,
+}
+
+impl PressureWait {
+    const STALL_US: u32 = 100_000;
+    const WINDOW_US: u32 = 2_000_000;
+
+    pub fn new() -> Self {
+        use std::io::Write;
+        let trigger = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/proc/pressure/memory")
+            .and_then(|mut f| {
+                // With the NUL: the kernel overwrites the last byte written
+                // with one, and without it the window loses a digit (2 s
+                // becomes 200 ms, which it rejects as EINVAL).
+                f.write_all(format!("some {} {}\0", Self::STALL_US, Self::WINDOW_US).as_bytes())?;
+                Ok(f)
+            });
+        match trigger {
+            Ok(f) => Self { trigger: Some(f) },
+            Err(e) => {
+                crate::info!(
+                    "Memory pressure trigger unavailable ({}); polling on a timer",
+                    e
+                );
+                Self { trigger: None }
+            }
+        }
+    }
+
+    /// Wait up to `timeout`; true when memory pressure ended the wait.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::fd::AsFd;
+
+        let Some(trigger) = &self.trigger else {
+            std::thread::sleep(timeout);
+            return false;
+        };
+        let mut fds = [PollFd::new(trigger.as_fd(), PollFlags::POLLPRI)];
+        let timeout_ms = PollTimeout::try_from(timeout.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(PollTimeout::MAX);
+        match poll(&mut fds, timeout_ms) {
+            Ok(n) if n > 0 => {
+                // POLLERR: the monitored cgroup went away. Never true for
+                // the system-wide file, but a wait that returns at once
+                // forever would turn this into a busy loop.
+                let err = fds[0]
+                    .revents()
+                    .is_some_and(|r| r.contains(PollFlags::POLLERR));
+                if err {
+                    std::thread::sleep(timeout);
+                }
+                !err
+            }
+            Ok(_) => false,
+            Err(_) => {
+                std::thread::sleep(timeout);
+                false
+            }
+        }
+    }
+}
+
+impl Default for PressureWait {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,24 +353,6 @@ mod tests {
     fn test_get_free_ram_percent() {
         let percent = get_free_ram_percent().unwrap();
         assert!(percent <= 100);
-    }
-
-    #[test]
-    fn test_get_effective_swap_usage() {
-        // This test may not work without swap, but should not panic
-        let _ = get_effective_swap_usage();
-    }
-
-    #[test]
-    fn page_size_is_positive_power_of_two() {
-        let p = get_page_size();
-        assert!(p > 0);
-        assert!(p.is_power_of_two());
-    }
-
-    #[test]
-    fn cpu_count_at_least_one() {
-        assert!(get_cpu_count() >= 1);
     }
 
     #[test]

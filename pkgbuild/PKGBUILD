@@ -2,11 +2,14 @@
 
 pkgname=biglinux-systemd-swap
 pkgver=$(date +%y.%m.%d)
-pkgrel=$(date +%H%M)
+# Static pkgrel — BigLinux CI bumps as needed. Time-based values are
+# non-monotonic (HHMM can go backward within a day), breaking upgrade
+# ordering.
+pkgrel=1
 pkgdesc="Dynamic swap management for zram, zswap, and swap files - biglinux fork"
 arch=('x86_64' 'aarch64')
 url="https://github.com/biglinux/biglinux-systemd-swap"
-license=('GPL3')
+license=('GPL-3.0-or-later')
 depends=('systemd-libs' 'util-linux')
 makedepends=('git' 'rust' 'cargo')
 provides=('systemd-swap')
@@ -18,13 +21,16 @@ replaces=('auto-zram-and-swappiness' 'systemd-oomd-defaults')
 install=pkgbuild.install
 
 build() {
-    cd ${srcdir}/${pkgname}
-    cargo build --release
+    cd "${srcdir}/${pkgname}"
+    cargo build --release --locked
 }
 
 package() {
-    cd ${srcdir}/${pkgname}
-    
+    cd "${srcdir}/${pkgname}"
+
+    # License (Arch policy requires).
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
     # Install Rust binary
     install -Dm755 target/release/systemd-swap "${pkgdir}/usr/bin/systemd-swap"
     
@@ -41,7 +47,11 @@ package() {
     # Install user config
     install -Dm644 include/swap-default.conf "${pkgdir}/etc/systemd/swap.conf"
 
-    # Install sysctl tuning (page-cluster for zram)
+    # Vendor sysctl file (page-cluster for zram); parity with $(SYSCTL_T).
+    # /usr/lib/sysctl.d leaves /etc/sysctl.d free for an administrator to
+    # shadow this file, and keeps the package out of a file-ownership conflict
+    # with auto-rules-io, which ships its own /etc/sysctl.d/91-memory.conf and
+    # would make pacman refuse the install.
     install -Dm644 include/91-memory.conf "${pkgdir}/usr/lib/sysctl.d/91-memory.conf"
 
     # Install man pages

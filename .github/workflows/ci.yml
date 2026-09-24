@@ -1,0 +1,154 @@
+# caveman: unified BigLinux Rust CI
+# customize: env.SYSTEM_LIBS, env.BIN_SIZE_MAX_MIB
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  SYSTEM_LIBS: "common"
+  BIN_SIZE_MAX_MIB: "10"
+  BIN_NAME: "systemd-swap"                # release artifact under target/release/<name>
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+      # The shell in this repo has no .sh suffix: the boot helper and the
+      # pacman install script (sourced by pacman, so no shebang).
+      - name: lint shell scripts
+        run: |
+          shellcheck -S warning src/pre-systemd-swap
+          shellcheck -s bash -S warning pkgbuild/pkgbuild.install
+
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: ${{ env.SYSTEM_LIBS }}
+          cache-key: fmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: ${{ env.SYSTEM_LIBS }}
+          cache-key: clippy
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: ${{ env.SYSTEM_LIBS }}
+          cache-key: test
+      # /tmp is noexec on hosts — skip --doc explicitly
+      - name: nextest (fallback to cargo test)
+        run: |
+          set -euxo pipefail
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            cargo nextest run --all-features --workspace
+          else
+            cargo test --all-features --tests --workspace
+          fi
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: common
+          cache-key: deny
+      - run: cargo deny check advisories bans licenses sources
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: common
+          cache-key: audit
+      - run: cargo audit -D warnings
+
+  machete:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: common
+          cache-key: machete
+      - run: cargo machete --with-metadata
+
+  doc:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: ${{ env.SYSTEM_LIBS }}
+          cache-key: doc
+      - run: cargo doc --no-deps --all-features --workspace
+
+  complexity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: install lizard + jscpd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-pip nodejs npm
+          pip3 install --break-system-packages lizard
+          npm i -g jscpd@4
+      # A ratchet, not a clean slate: two functions are over 25 today
+      # (main::stop, SwapFile::run). -i fails the job on a third.
+      - name: lizard CCN <=25
+        run: lizard -l rust -C 25 -i 1 src
+      - name: jscpd duplication <=5%
+        run: jscpd --threshold 5 --reporters consoleFull --min-tokens 50 src
+
+
+  budgets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-libs: ${{ env.SYSTEM_LIBS }}
+          cache-key: budgets
+          cargo-tools: ""
+      - name: release build
+        run: cargo build --release --workspace
+      - name: binary size budget
+        run: |
+          set -euxo pipefail
+          bin="target/release/${BIN_NAME}"
+          [ -f "$bin" ] || { echo "missing $bin"; exit 1; }
+          strip -s "$bin" || true
+          sz=$(stat -c%s "$bin")
+          mib=$(( (sz + 1048575) / 1048576 ))
+          echo "size: ${mib} MiB (max ${BIN_SIZE_MAX_MIB})"
+          [ "$mib" -le "${BIN_SIZE_MAX_MIB}" ]

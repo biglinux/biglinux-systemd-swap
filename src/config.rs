@@ -127,10 +127,7 @@ impl Config {
     ///
     /// Only called in auto mode. For explicit modes, each subsystem uses
     /// its own fallback defaults from `unwrap_or()` calls.
-    pub fn apply_autoconfig(
-        &mut self,
-        recommended: &crate::autoconfig::RecommendedConfig,
-    ) {
+    pub fn apply_autoconfig(&mut self, recommended: &crate::autoconfig::RecommendedConfig) {
         info!("Autoconfig: applying recommended configuration for detected hardware");
 
         for (key, value) in recommended.config_pairs() {
@@ -386,7 +383,7 @@ mod tests {
 
     #[test]
     fn get_bool_false_variants() {
-        for v in ["no", "0", "false", "off"] {
+        for v in ["no", "0", "false", "off", "random"] {
             let cfg = config_from_str(&format!("key={}", v));
             assert!(!cfg.get_bool("key"), "'{}' should be false", v);
         }

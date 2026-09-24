@@ -4,18 +4,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::config::{Config, WORK_DIR};
+use crate::config::Config;
 use crate::defaults;
-use crate::helpers::{force_remove, get_fstype, makedirs, parse_size as parse_size_shared, run_cmd_output};
-use crate::meminfo::{get_free_ram_percent, get_free_swap_percent_effective};
-use crate::systemd::{
-    gen_swap_unit, notify_ready, notify_status, swapoff, systemctl, SystemctlAction,
+use crate::helpers::{
+    force_remove, get_fstype, makedirs, parse_size as parse_size_shared, run_cmd_output,
 };
+use crate::meminfo::{
+    get_effective_swap_usage, get_free_ram_percent, get_free_swap_percent_effective,
+};
+use crate::systemd::{activate_swap, gen_swap_unit, notify_ready, notify_status, swapoff};
 use crate::{debug, info, is_shutdown, warn};
 
 #[derive(Error, Debug)]
@@ -28,8 +29,6 @@ pub enum SwapFileError {
     Systemd(#[from] crate::systemd::SystemdError),
     #[error("Invalid swapfile_path")]
     InvalidPath,
-    #[error("Unsupported filesystem (requires btrfs, ext4, or xfs)")]
-    UnsupportedFs,
     #[error("Not enough space")]
     NoSpace,
 }
@@ -77,28 +76,7 @@ pub struct SwapFileConfig {
     pub shrink_threshold: u8,
     /// Safe headroom percentage to maintain in other files after migration (default: 40%)
     pub safe_headroom: u8,
-    /// Use sparse backing + loop device for swap files.
-    ///
-    /// When `true`:
-    ///   - A loop device (`--direct-io=on`) is always created; `swapon` targets
-    ///     the loop device, enabling I/O scheduler and queue tuning.
-    ///   - direct-io=on bypasses page cache, preventing memory deadlock
-    ///     during swap writeback under pressure.
-    ///   - Sparse file (truncate). Blocks are allocated on-demand by btrfs.
-    ///   - Compression is handled by zswap (in RAM), not the filesystem.
-    ///
-    /// When `false` (default): fallocate + nodatacow + direct swapon (no loop).
-    pub sparse_loop_backing: bool,
-    /// Size in bytes for each swap file created during the growth phase
-    /// (sparse loop only). Typically 2× the initial chunk_size.
-    /// 0 = not configured (falls back to chunk_size).
-    pub growth_chunk_size: u64,
-    /// NOCOW (chattr +C) on btrfs swap files.
-    /// Default: true (prevents btrfs deadlock under memory pressure).
-    pub nocow: bool,
 }
-
-
 
 /// Reject paths that point at critical system directories or are not absolute.
 ///
@@ -106,7 +84,7 @@ pub struct SwapFileConfig {
 /// `/run/user` and similar writable locations. Rejects bare system directories
 /// such as `/etc`, `/sys`, `/proc`, `/dev`, `/bin`, `/sbin`, `/usr`, `/lib`,
 /// `/boot`, and `/run` itself.
-fn validate_swapfile_path(path: &Path) -> bool {
+pub(crate) fn validate_swapfile_path(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
     }
@@ -138,117 +116,85 @@ fn validate_swapfile_path(path: &Path) -> bool {
 impl SwapFileConfig {
     /// Create config from parsed Config file
     pub fn from_config(config: &Config) -> Result<Self> {
-        let path = config.get("swapfile_path").unwrap_or(defaults::SWAPFILE_PATH).to_string();
+        let path = config
+            .get("swapfile_path")
+            .unwrap_or(defaults::SWAPFILE_PATH)
+            .to_string();
         let path = PathBuf::from(path.trim_end_matches('/'));
         if !validate_swapfile_path(&path) {
             return Err(SwapFileError::InvalidPath);
         }
 
-        let chunk_size_str = config.get("swapfile_chunk_size").unwrap_or(defaults::SWAPFILE_CHUNK_SIZE).to_string();
-        let chunk_size = parse_size_shared(&chunk_size_str).map_err(|_| SwapFileError::InvalidPath)?;
-        let sparse = config.get_bool("swapfile_sparse_loop");
-        let chunk_size = chunk_size.max(if sparse {
-            128 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        });
+        let chunk_size_str = config
+            .get("swapfile_chunk_size")
+            .unwrap_or(defaults::SWAPFILE_CHUNK_SIZE)
+            .to_string();
+        let chunk_size =
+            parse_size_shared(&chunk_size_str).map_err(|_| SwapFileError::InvalidPath)?;
+        let chunk_size = chunk_size.max(512 * 1024 * 1024);
 
-        let max_count: u32 = config.get_as("swapfile_max_count").unwrap_or(defaults::SWAPFILE_MAX_COUNT);
+        let max_count: u32 = config
+            .get_as("swapfile_max_count")
+            .unwrap_or(defaults::SWAPFILE_MAX_COUNT);
         let max_count = max_count.clamp(1, 28);
 
-        let min_count: u32 = config.get_as("swapfile_min_count").unwrap_or(defaults::SWAPFILE_MIN_COUNT);
-        let frequency: u64 = config.get_as::<u32>("swapfile_frequency").unwrap_or(defaults::SWAPFILE_FREQUENCY) as u64;
+        let min_count: u32 = config
+            .get_as("swapfile_min_count")
+            .unwrap_or(defaults::SWAPFILE_MIN_COUNT);
+        let frequency: u64 = config
+            .get_as::<u32>("swapfile_frequency")
+            .unwrap_or(defaults::SWAPFILE_FREQUENCY) as u64;
         let frequency = frequency.clamp(1, 86400);
 
-        let shrink_threshold: u8 =
-            config.get_as::<u32>("swapfile_shrink_threshold").unwrap_or(defaults::SWAPFILE_SHRINK_THRESHOLD as u32) as u8;
-        let shrink_threshold = shrink_threshold.clamp(10, 50);
-
-        let safe_headroom: u8 =
-            config.get_as::<u32>("swapfile_safe_headroom").unwrap_or(defaults::SWAPFILE_SAFE_HEADROOM as u32) as u8;
-        let safe_headroom = safe_headroom.clamp(20, 60);
+        // Clamp while still u32: `as u8` first wraps, so 300 became 44
+        // instead of the documented ceiling.
+        let percent = |key: &str, default: u8, min: u32, max: u32| -> u8 {
+            config
+                .get_as::<u32>(key)
+                .unwrap_or(default as u32)
+                .clamp(min, max) as u8
+        };
+        let shrink_threshold = percent(
+            "swapfile_shrink_threshold",
+            defaults::SWAPFILE_SHRINK_THRESHOLD,
+            10,
+            50,
+        );
+        let safe_headroom = percent(
+            "swapfile_safe_headroom",
+            defaults::SWAPFILE_SAFE_HEADROOM,
+            20,
+            60,
+        );
 
         Ok(Self {
             path,
             chunk_size,
             max_count,
             min_count,
-            free_ram_perc: config.get_as::<u32>("swapfile_free_ram_perc").unwrap_or(defaults::SWAPFILE_FREE_RAM_PERC as u32) as u8,
-            free_swap_perc: config.get_as::<u32>("swapfile_free_swap_perc").unwrap_or(defaults::SWAPFILE_FREE_SWAP_PERC as u32) as u8,
-            remove_free_swap_perc: config.get_as::<u32>("swapfile_remove_free_swap_perc").unwrap_or(defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC as u32) as u8,
+            free_ram_perc: percent(
+                "swapfile_free_ram_perc",
+                defaults::SWAPFILE_FREE_RAM_PERC,
+                0,
+                100,
+            ),
+            free_swap_perc: percent(
+                "swapfile_free_swap_perc",
+                defaults::SWAPFILE_FREE_SWAP_PERC,
+                0,
+                100,
+            ),
+            remove_free_swap_perc: percent(
+                "swapfile_remove_free_swap_perc",
+                defaults::SWAPFILE_REMOVE_FREE_SWAP_PERC,
+                0,
+                100,
+            ),
             frequency,
             shrink_threshold,
             safe_headroom,
-            sparse_loop_backing: sparse,
-            growth_chunk_size: {
-                let s = config.get("swapfile_growth_chunk_size").unwrap_or("").to_string();
-                if s.is_empty() {
-                    0
-                } else {
-                    parse_size_shared(&s).unwrap_or(0)
-                }
-            },
-            nocow: {
-                let s = config.get("swapfile_nocow").unwrap_or(defaults::SWAPFILE_NOCOW).to_string();
-                !matches!(s.as_str(), "0" | "false" | "no" | "off")
-            },
         })
     }
-}
-
-/// Optimize a loop block device's I/O queue parameters for swap.
-///
-/// Scheduler is always "none" — loop devices sit atop a real block device
-/// that already has its own scheduler. Adding another causes deadlock
-/// under extreme memory pressure (proven by testing).
-fn tune_loop_device(loop_dev: &str) {
-    let dev_name = loop_dev.trim_start_matches("/dev/");
-    let queue_path = format!("/sys/block/{}/queue", dev_name);
-
-    if !Path::new(&queue_path).is_dir() {
-        warn!("swapFC: cannot tune {} - sysfs queue not found", dev_name);
-        return;
-    }
-
-    let _ = fs::write(format!("{}/rotational", queue_path), "0");
-    let _ = fs::write(format!("{}/iostats", queue_path), "0");
-    let _ = fs::write(format!("{}/add_random", queue_path), "0");
-
-    // Set scheduler to "none" (passthrough)
-    let scheduler_path = format!("{}/scheduler", queue_path);
-    if fs::write(&scheduler_path, "none").is_ok() {
-        info!("swapFC: {} scheduler set to [none]", dev_name);
-    } else {
-        warn!("swapFC: failed to set scheduler none on {}", dev_name);
-    }
-
-    // Queue parameters
-    let _ = fs::write(format!("{}/nomerges", queue_path), "0");
-    let wbt_path = format!("{}/wbt_lat_usec", queue_path);
-    if Path::new(&wbt_path).exists() {
-        let _ = fs::write(&wbt_path, "75000");
-    }
-    let _ = fs::write(format!("{}/max_sectors_kb", queue_path), "512");
-    let _ = fs::write(format!("{}/rq_affinity", queue_path), "1");
-}
-
-/// Re-apply volatile queue parameters that swapon may reset.
-/// Called AFTER the swap unit is started.
-/// Only sets the two critical params; everything else stays at kernel defaults.
-fn retune_loop_queue(loop_dev: &str) {
-    let dev_name = loop_dev.trim_start_matches("/dev/");
-    let queue_path = format!("/sys/block/{}/queue", dev_name);
-    if !Path::new(&queue_path).is_dir() {
-        info!("swapFC: retune {} - queue path not found", dev_name);
-        return;
-    }
-    let _ = fs::write(format!("{}/nomerges", queue_path), "0");
-    let wbt_path = format!("{}/wbt_lat_usec", queue_path);
-    if Path::new(&wbt_path).exists() {
-        let _ = fs::write(&wbt_path, "75000");
-    }
-    let _ = fs::write(format!("{}/max_sectors_kb", queue_path), "512");
-    let _ = fs::write(format!("{}/rq_affinity", queue_path), "1");
 }
 
 /// SwapFC manager - supports btrfs, ext4, and xfs
@@ -277,9 +223,8 @@ impl SwapFile {
         let swapfile_config = SwapFileConfig::from_config(config)?;
 
         info!(
-            "swapFC: chunk={}MB, sparse_loop={}",
-            swapfile_config.chunk_size / (1024 * 1024),
-            swapfile_config.sparse_loop_backing,
+            "swapFC: chunk={}MB",
+            swapfile_config.chunk_size / (1024 * 1024)
         );
 
         notify_status("Monitoring memory status...");
@@ -311,13 +256,33 @@ impl SwapFile {
             let is_subvolume = is_btrfs_subvolume(&swapfile_config.path);
 
             if !is_subvolume {
-                if swapfile_config.path.exists() {
+                // Clear the way only when there is nothing to lose. A directory
+                // with entries in it is holding live swap: the swapfiles this
+                // very instance is about to adopt a few lines further on, and
+                // any zram writeback store an administrator pointed here. The
+                // snapshot isolation a subvolume adds is not worth destroying
+                // those for, so an occupied directory is kept as it stands --
+                // `btrfs subvolume create` then fails on it and the fallback
+                // below carries on with a plain directory, NOCOW included.
+                let occupied = swapfile_config
+                    .path
+                    .read_dir()
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false);
+
+                if swapfile_config.path.exists() && !occupied {
                     warn!("swapFC: path exists but not a subvolume, removing...");
                     if swapfile_config.path.is_dir() {
                         fs::remove_dir_all(&swapfile_config.path)?;
                     } else {
                         fs::remove_file(&swapfile_config.path)?;
                     }
+                } else if occupied {
+                    warn!(
+                        "swapFC: {:?} holds files and is not a subvolume; keeping it \
+                         (no snapshot isolation)",
+                        swapfile_config.path
+                    );
                 }
 
                 // Try to create btrfs subvolume
@@ -336,48 +301,25 @@ impl SwapFile {
                     info!("swapFC: falling back to regular directory");
                     fs::create_dir_all(&swapfile_config.path)?;
 
-                    // Set nodatacow attribute if configured
-                    if swapfile_config.nocow {
-                        let _ = Command::new("chattr")
-                            .args(["+C"])
-                            .arg(&swapfile_config.path)
-                            .status();
-                    }
-
                     info!(
                         "swapFC: created directory (non-subvolume) at {:?}",
                         swapfile_config.path
                     );
                 } else {
-                    // Set nodatacow on subvolume for safe swap I/O under memory pressure.
-                    // Without NOCOW, btrfs block allocation during swap writes can deadlock.
-                    if swapfile_config.nocow {
-                        let _ = Command::new("chattr")
-                            .args(["+C"])
-                            .arg(&swapfile_config.path)
-                            .status();
-                    }
-
                     info!(
                         "swapFC: created btrfs subvolume at {:?}",
                         swapfile_config.path
                     );
                 }
-            } else {
-                // Subvolume already exists — ensure nocow attribute matches config.
-                // A previous run may have set +C that we need to clear (or vice-versa).
-                if swapfile_config.nocow {
-                    let _ = Command::new("chattr")
-                        .args(["+C"])
-                        .arg(&swapfile_config.path)
-                        .status();
-                } else {
-                    let _ = Command::new("chattr")
-                        .args(["-C"])
-                        .arg(&swapfile_config.path)
-                        .status();
-                }
             }
+
+            // NOCOW on the directory, so every file created in it inherits it:
+            // btrfs refuses swapon on a copy-on-write file, and block allocation
+            // during swap writes can deadlock under memory pressure.
+            let _ = Command::new("chattr")
+                .args(["+C"])
+                .arg(&swapfile_config.path)
+                .status();
         } else {
             // For ext4/xfs: just create directory
             if !swapfile_config.path.exists() {
@@ -388,73 +330,6 @@ impl SwapFile {
                 );
             }
         }
-
-        // Check btrfs mount options for loop-backed swap files.
-        // autodefrag MUST be disabled: it causes extra I/O on swap file extents
-        // and can deadlock under memory pressure when using loop devices.
-        // noatime MUST be enabled: avoids unnecessary metadata writes.
-        // compress-force=zstd:1: fastest zstd level for latency-sensitive swap I/O.
-        if is_btrfs {
-            if let Ok(output) = Command::new("findmnt")
-                .args(["-n", "-o", "OPTIONS", "--target"])
-                .arg(&swapfile_config.path)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-            {
-                let opts = String::from_utf8_lossy(&output.stdout);
-                let needs_no_autodefrag = opts.contains("autodefrag");
-                let needs_noatime = !opts.contains("noatime");
-                // Downgrade zstd level for swap — zstd:1 is ~3x faster than zstd:3
-                // with only ~5% less ratio. Critical under memory pressure when
-                // btrfs compresses swap-back pages written by zswap shrinker.
-                let needs_zstd1 = !swapfile_config.nocow
-                    && (opts.contains("zstd:2")
-                        || opts.contains("zstd:3")
-                        || opts.contains("zstd:4")
-                        || opts.contains("zstd:5"));
-
-                if needs_no_autodefrag || needs_noatime || needs_zstd1 {
-                    let mut remount_opts = String::from("remount");
-                    if needs_no_autodefrag {
-                        remount_opts.push_str(",noautodefrag");
-                        info!(
-                            "swapFC: disabling autodefrag on {:?} for loop swap stability",
-                            swapfile_config.path
-                        );
-                    }
-                    if needs_noatime {
-                        remount_opts.push_str(",noatime");
-                        info!(
-                            "swapFC: enabling noatime on {:?} to reduce metadata I/O",
-                            swapfile_config.path
-                        );
-                    }
-                    if needs_zstd1 {
-                        remount_opts.push_str(",compress-force=zstd:1");
-                        info!(
-                            "swapFC: downgrading compression to zstd:1 on {:?} for swap latency",
-                            swapfile_config.path
-                        );
-                    }
-                    let status = Command::new("mount")
-                        .args(["-o", &remount_opts])
-                        .arg(&swapfile_config.path)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    if status.map(|s| !s.success()).unwrap_or(true) {
-                        warn!(
-                            "swapFC: failed to remount {:?} with {}. \
-                             Update mount options in /etc/fstab manually.",
-                            swapfile_config.path, remount_opts
-                        );
-                    }
-                }
-            }
-        }
-
-        makedirs(format!("{}/swapfile", WORK_DIR))?;
 
         // Check if ZSWAP is active
         let is_zswap_active = crate::zswap::is_enabled();
@@ -482,14 +357,9 @@ impl SwapFile {
             self.is_zswap_active = true;
             self.cooldown_secs = 5;
             info!(
-                "swapFC: ZSWAP mode enabled - initial_count={} chunk={}MB growth={}MB",
+                "swapFC: ZSWAP mode enabled - initial_count={} chunk={}MB",
                 self.config.min_count,
-                self.config.chunk_size / (1024 * 1024),
-                if self.config.growth_chunk_size > 0 {
-                    self.config.growth_chunk_size / (1024 * 1024)
-                } else {
-                    self.config.chunk_size * 2 / (1024 * 1024)
-                },
+                self.config.chunk_size / (1024 * 1024)
             );
         }
     }
@@ -510,17 +380,19 @@ impl SwapFile {
                 continue;
             }
 
-            let path = PathBuf::from(fields[0]);
-
-            // Filter only our swap files (in the configured directory or loop devices)
-            // Note: use string comparison for /dev/loop* — Path::starts_with does component
-            // matching, so "/dev/loop10".starts_with("/dev/loop") is false ("loop10" ≠ "loop").
-            let path_str = path.to_string_lossy();
-            let is_our_file = path.starts_with(&self.config.path)
-                || (path_str.starts_with("/dev/loop") && self.is_our_loop_device(&path));
-
-            if !is_our_file {
-                continue;
+            // The kernel prints the path as seen from the mount namespace
+            // that ran swapon. Our swapon runs in this unit's namespace, where
+            // the swap directory is a mount of its own, so a file a previous
+            // instance activated reads `/1` once that instance has exited.
+            // Without this the next instance saw none of its files, called
+            // them stale and could neither delete nor recreate them.
+            let mut path = PathBuf::from(fields[0]);
+            if !path.starts_with(&self.config.path) {
+                let name = fields[0].trim_start_matches('/');
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+                    continue; // not ours: only our files are numbered
+                }
+                path = self.config.path.join(name);
             }
 
             let size_kb: u64 = fields[2].parse().unwrap_or(0);
@@ -536,32 +408,8 @@ impl SwapFile {
         }
 
         // Sort by priority (higher priority first - used first by kernel)
-        files.sort_by(|a, b| b.priority.cmp(&a.priority));
+        files.sort_by_key(|f| std::cmp::Reverse(f.priority));
         files
-    }
-
-    /// Check if a loop device belongs to us
-    fn is_our_loop_device(&self, loop_path: &Path) -> bool {
-        // Scan all loop_info files in WORK_DIR, not just up to self.allocated.
-        // During adoption (adopt_existing_swapfiles), self.allocated is still 0,
-        // so a 1..=self.allocated range would never iterate.
-        let loop_dir = format!("{}/swapfile", WORK_DIR);
-        let Ok(entries) = std::fs::read_dir(&loop_dir) else {
-            return false;
-        };
-        let loop_dev_str = loop_path.to_string_lossy();
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            if !fname.to_string_lossy().starts_with("loop_") {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                if content.lines().next().map(str::trim) == Some(loop_dev_str.as_ref()) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Find a safe candidate for removal
@@ -587,7 +435,7 @@ impl SwapFile {
         // Sort candidates by priority ASCENDING (Lowest first)
         // We want to remove low-priority files (created last, usually larger) first
         // to scale down properly instead of leaving a giant tail file alone.
-        candidates.sort_by(|a, b| a.priority.cmp(&b.priority));
+        candidates.sort_by_key(|c| c.priority);
 
         // For each candidate, verify if it's SAFE to remove
         candidates
@@ -652,42 +500,21 @@ impl SwapFile {
             return Err(SwapFileError::Io(std::io::Error::other("swapoff failed")));
         }
 
-        // If it's a loop device, get the backing file
-        // Use string comparison: Path::starts_with does component matching.
-        let is_loop = path.to_string_lossy().starts_with("/dev/loop");
-        let backing_file = if is_loop {
-            self.get_backing_file_for_loop(path)
-        } else {
-            Some(path.to_path_buf())
-        };
-
-        if is_loop {
-            // Detach loop device
-            let _ = Command::new("losetup")
-                .args(["-d", &path.to_string_lossy()])
-                .status();
-        }
-
-        // Remove backing file
-        if let Some(ref backing) = backing_file {
-            force_remove(backing, false);
-        }
+        force_remove(path, false);
 
         // Clean up systemd unit
         if let Some(idx) = file_index {
-            let tag = format!("swapfile_{}", idx);
+            // The whole tag line: a substring test for `swapfile_1` also
+            // matched `swapfile_12` and deleted that file's unit instead.
+            let tag_line = format!("# Tag=swapfile_{}", idx);
             for unit_path in crate::helpers::find_swap_units() {
                 if let Ok(content) = crate::helpers::read_file(&unit_path) {
-                    if content.contains(&tag) {
+                    if content.lines().any(|line| line.trim() == tag_line) {
                         force_remove(&unit_path, true);
                         break;
                     }
                 }
             }
-
-            // Clean up loop info file
-            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
-            force_remove(&loop_info_path, false);
 
             // Update file_sizes if we tracked this file.
             // Guard against idx==0 (would underflow (idx-1) as usize).
@@ -703,68 +530,17 @@ impl SwapFile {
         Ok(())
     }
 
-    /// Find the index of a file/loop device in our managed files
+    /// Index of one of our swap files: its file name.
     fn find_file_index(&self, path: &Path) -> Option<u32> {
-        // Check if it's a direct file in our directory
-        if path.starts_with(&self.config.path) {
-            if let Some(name) = path.file_name() {
-                return name.to_string_lossy().parse().ok();
-            }
-        }
-
-        // Check loop device info files
-        for i in 1..=self.allocated {
-            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, i);
-            if let Ok(content) = fs::read_to_string(&loop_info_path) {
-                let lines: Vec<&str> = content.lines().collect();
-                if !lines.is_empty() && lines[0] == path.to_string_lossy() {
-                    return Some(i);
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Get the backing file for a loop device
-    fn get_backing_file_for_loop(&self, loop_path: &Path) -> Option<PathBuf> {
-        // Scan all loop_info files (not bounded by self.allocated; may be called
-        // during adoption before allocated is set).
-        let loop_dir = format!("{}/swapfile", WORK_DIR);
-        let Ok(entries) = std::fs::read_dir(&loop_dir) else {
+        if !path.starts_with(&self.config.path) {
             return None;
-        };
-        let loop_dev_str = loop_path.to_string_lossy();
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            if !fname.to_string_lossy().starts_with("loop_") {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                let mut lines = content.lines();
-                let Some(dev) = lines.next() else { continue };
-                let Some(backing) = lines.next() else {
-                    continue;
-                };
-                if dev.trim() == loop_dev_str.as_ref() {
-                    return Some(PathBuf::from(backing.trim()));
-                }
-            }
         }
-        None
+        path.file_name()?.to_string_lossy().parse().ok()
     }
 
     /// Adopt swap files that already exist from a previous run.
     /// Called before create_initial_swap() so we never swapoff active files on restart.
     fn adopt_existing_swapfiles(&mut self) {
-        // For sparse loop-backed mode, reconstruct loop info files from losetup
-        // before calling get_swapfiles_info(), which requires those files to exist.
-        // This handles the restart case where WORK_DIR was wiped but loop devices
-        // are still active and backed by our sparse files.
-        if self.config.sparse_loop_backing {
-            self.reconstruct_loop_info_from_losetup();
-        }
-
         let existing = self.get_swapfiles_info();
         if existing.is_empty() {
             return;
@@ -776,20 +552,6 @@ impl SwapFile {
             if let Some(name) = info.path.file_name() {
                 if let Ok(n) = name.to_string_lossy().parse::<u32>() {
                     max_num = max_num.max(n);
-                }
-            }
-            // For loop devices, derive the backing file number from the loop info file.
-            if info.path.to_string_lossy().starts_with("/dev/loop") {
-                let loop_name = info.path.to_string_lossy();
-                // Find the matching loop info file we just wrote
-                for i in 1..=28u32 {
-                    let loop_info = format!("{}/swapfile/loop_{}", WORK_DIR, i);
-                    if let Ok(content) = fs::read_to_string(&loop_info) {
-                        if content.lines().next() == Some(&loop_name) {
-                            max_num = max_num.max(i);
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -812,83 +574,6 @@ impl SwapFile {
                     .unwrap_or(self.config.chunk_size);
                 self.file_sizes.push(size);
             }
-        }
-    }
-
-    /// Rebuild per-index loop info files from `losetup -l` output.
-    ///
-    /// Called during adoption at startup when WORK_DIR was cleared (e.g. after
-    /// a restart).  Maps each active loop device whose backing file lives in
-    /// `self.config.path` back to its numeric index (the file's own name),
-    /// then writes `{WORK_DIR}/swapfile/loop_N` so that `is_our_loop_device()`
-    /// and `get_swapfiles_info()` can recognise them normally.
-    fn reconstruct_loop_info_from_losetup(&self) {
-        // losetup -l --noheadings -o NAME,BACK-FILE
-        let output = match Command::new("losetup")
-            .args(["-l", "--noheadings", "-o", "NAME,BACK-FILE"])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let loop_dev = parts[0];
-            let backing = parts[1];
-
-            // Skip loop devices whose backing file has been deleted.
-            // losetup appends "(deleted)" when the inode is unlinked but
-            // the loop device keeps its file descriptor open — these are
-            // from previous sessions whose files were already removed.
-            // Detach them to prevent loop device accumulation.
-            if parts.get(2).copied() == Some("(deleted)") {
-                info!(
-                    "swapFC: detaching loop {} with deleted backing file",
-                    loop_dev
-                );
-                let _ = Command::new("losetup").args(["-d", loop_dev]).status();
-                continue;
-            }
-
-            let backing_path = PathBuf::from(backing);
-
-            // Extract the numeric index from the backing file name.
-            // NOTE: btrfs subvolumes cause losetup to report the backing file path
-            // relative to the subvolume root (e.g. "/1" instead of "/swapfile/1").
-            // We cannot rely on the reported path prefix; match by numeric name only.
-            let idx: u32 = match backing_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.parse().ok())
-            {
-                Some(n) => n,
-                None => continue,
-            };
-
-            // Verify that this numeric file exists in our managed directory.
-            let canonical_backing = self.config.path.join(idx.to_string());
-            let actual_backing = if canonical_backing.exists() {
-                canonical_backing
-            } else {
-                continue;
-            };
-
-            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, idx);
-            let _ = fs::write(
-                &loop_info_path,
-                format!("{}\n{}", loop_dev, actual_backing.display()),
-            );
-            info!(
-                "swapFC: reconstructed loop info: {} → {} (index {})",
-                loop_dev,
-                actual_backing.display(),
-                idx
-            );
         }
     }
 
@@ -925,59 +610,17 @@ impl SwapFile {
         Ok(())
     }
 
-    /// Re-apply volatile queue parameters on all active loop devices.
-    /// Called after initial creation and after udevadm settle.
-    fn retune_all_loops(&self) {
-        let loop_dir = format!("{}/swapfile", WORK_DIR);
-        let entries = match fs::read_dir(&loop_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.starts_with("loop_") {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                let loop_dev = content.lines().next().unwrap_or("").trim();
-                if loop_dev.starts_with("/dev/loop") {
-                    retune_loop_queue(loop_dev);
-                }
-            }
-        }
-    }
-
-    /// Enforce read_ahead_kb on all active loop devices.
-    /// The kernel loop driver overrides read_ahead_kb after swapon and udev events,
-    /// so we use blockdev --setra (ioctl-based) and re-apply periodically.
-    fn enforce_loop_readahead(&self) {
-        let ra_sectors = 16; // 8KB = 16 sectors
-        let loop_dir = format!("{}/swapfile", WORK_DIR);
-        let Ok(entries) = fs::read_dir(&loop_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with("loop_") {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let loop_dev = content.lines().next().unwrap_or("").trim().to_string();
-            if loop_dev.starts_with("/dev/loop") {
-                let _ = Command::new("blockdev")
-                    .args(["--setra", &ra_sectors.to_string(), &loop_dev])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-        }
-    }
-
     /// Remove empty adopted swapfiles above min_count at startup (no cooldown).
     /// Iterates lowest-priority (last created) first for cleanest teardown order.
     fn shed_excess_empty_adopted(&mut self) {
+        // The same RAM guard as the monitor's contraction. A restart no longer
+        // swaps anything off, so it can land under load: measured on the
+        // notebook, file #2 went at 4% free RAM and the emergency path created
+        // it again seconds later.
+        let free_ram = get_free_ram_percent().unwrap_or(100);
+        if free_ram <= self.config.free_ram_perc {
+            return;
+        }
         let swap_files = self.get_swapfiles_info();
 
         // Collect paths to remove: empty files, lowest priority first
@@ -1007,26 +650,8 @@ impl SwapFile {
     fn cleanup_stale_disk_files(&self) {
         let active_swaps = self.get_swapfiles_info();
 
-        // Build set of "active" disk paths:
-        // - Direct swap files (non-loop) → their path is the disk file
-        // - Loop-backed files → the disk file is the BACKING file, not /dev/loopN
-        let mut active: std::collections::HashSet<PathBuf> =
+        let active: std::collections::HashSet<PathBuf> =
             active_swaps.iter().map(|f| f.path.clone()).collect();
-
-        if self.config.sparse_loop_backing {
-            // Add backing file paths for any active loop devices
-            for info in &active_swaps {
-                if info.path.to_string_lossy().starts_with("/dev/loop") {
-                    if let Some(backing) = self.get_backing_file_for_loop(&info.path) {
-                        active.insert(backing);
-                    }
-                }
-            }
-            // Detach loop devices whose backing file is NOT active (orphaned by
-            // a previous stop timeout or forced shutdown). This prevents loop device
-            // leaks accumulating across restarts.
-            self.detach_orphaned_loops(&active);
-        }
 
         let Ok(entries) = std::fs::read_dir(&self.config.path) else {
             return;
@@ -1047,44 +672,6 @@ impl SwapFile {
         }
     }
 
-    /// Detach any loop device whose backing file is not in `active_backings`.
-    /// These are loops left attached without active swap — e.g. after a stop
-    /// timeout where only some loops were swapped off before the process was killed.
-    fn detach_orphaned_loops(&self, active_backings: &std::collections::HashSet<PathBuf>) {
-        let loop_dir = format!("{}/swapfile", WORK_DIR);
-        let Ok(entries) = std::fs::read_dir(&loop_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            if !fname.to_string_lossy().starts_with("loop_") {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let mut lines = content.lines();
-            let Some(loop_dev) = lines.next() else {
-                continue;
-            };
-            let Some(backing_str) = lines.next() else {
-                continue;
-            };
-            let backing = PathBuf::from(backing_str.trim());
-            if !active_backings.contains(&backing) {
-                info!(
-                    "swapFC: detaching orphaned loop {} (backing {})",
-                    loop_dev.trim(),
-                    backing.display()
-                );
-                let _ = std::process::Command::new("losetup")
-                    .args(["-d", loop_dev.trim()])
-                    .status();
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-
     /// Run the swap monitoring loop with controlled expansion/contraction
     ///
     /// Expansion: triggered ONLY by swap pressure (free_swap < free_swap_perc)
@@ -1098,38 +685,16 @@ impl SwapFile {
     pub fn run(&mut self) -> Result<()> {
         notify_ready();
 
-        let use_loop = self.config.sparse_loop_backing;
-        let mut loop_tick: u32 = 0;
-
-        // Enforce readahead immediately after startup
-        if use_loop {
-            self.enforce_loop_readahead();
-        }
-
-        let mut retune_tick: u32 = 0;
+        // Woken early when memory pressure starts; see `PressureWait`.
+        let pressure = crate::meminfo::PressureWait::new();
 
         // Ensure minimum files are created at startup
         loop {
             let poll_interval = self.get_adaptive_poll_interval();
-            thread::sleep(Duration::from_secs(poll_interval));
+            pressure.wait(Duration::from_secs(poll_interval));
 
             if is_shutdown() {
                 break;
-            }
-
-            // Periodically enforce readahead on loop devices (~every 5 ticks)
-            // and re-apply all volatile queue params (~every 30 ticks)
-            if use_loop {
-                loop_tick += 1;
-                retune_tick += 1;
-                if loop_tick >= 5 {
-                    loop_tick = 0;
-                    self.enforce_loop_readahead();
-                }
-                if retune_tick >= 30 {
-                    retune_tick = 0;
-                    self.retune_all_loops();
-                }
             }
 
             // Use zswap-aware swap calculation: pages in zswap RAM pool
@@ -1139,6 +704,31 @@ impl SwapFile {
 
             // Get individual file statistics from /proc/swaps
             let swap_files = self.get_swapfiles_info();
+
+            // How full OUR files are, from their own /proc/swaps rows.
+            //
+            // `free_swap` above is a fraction of SwapTotal, and SwapTotal is
+            // dominated by zram: at a zram disksize of 150% of RAM it is 46 GB
+            // of the 47 GB total, so the figure reports how empty zram is and
+            // says nothing about disk. Two decisions below were reading it and
+            // both were wrong in the same direction. Growth asked for
+            // `free_swap` under 40%, which needs zram 60% full -- around 28 GB
+            // of compressed pages, more than a 31 GB host can hold -- so it
+            // never fired and only the RAM emergency path ever created a file.
+            // Removal asked for `free_swap` above 70%, which is true whenever
+            // zram is under 30% full, so it deleted the disk chunk while RAM
+            // was already short. Observed on one host: the last chunk went at
+            // 13:57:06 on a `free_swap=71%` reading and the reclaim deadlock
+            // followed at 15:23:15 with 512 MB of disk swap left.
+            let disk_free_percent: u8 = {
+                let total: u64 = swap_files.iter().map(|f| f.size_bytes).sum();
+                let used: u64 = swap_files.iter().map(|f| f.used_bytes).sum();
+                if total == 0 {
+                    100
+                } else {
+                    ((total.saturating_sub(used) * 100) / total).min(100) as u8
+                }
+            };
 
             // Cooldown: prevent creating swapfiles too fast
             // ZSWAP: shorter cooldown since writeback consumes swapfiles quickly
@@ -1161,78 +751,40 @@ impl SwapFile {
             }
             self.prev_free_swap = free_swap;
 
-            // ZSWAP SPARSE LOOP GROWTH STRATEGY:
-            // Create a larger backing file when total disk swap is 80%+ full.
-            //
-            // IMPORTANT: must use DISK-based free swap, NOT `free_swap` (effective).
-            // `get_free_swap_percent_effective()` adds Zswapped bytes (pages in zswap
-            // RAM pool) back to free swap to avoid false disk-pressure alarms for
-            // ZswapSwapfc.  For ZswapLoopfile (sparse files), that logic is wrong:
-            // even though pages in the zswap pool haven't written to disk yet, their
-            // swap slots are allocated, and the sparse blocks will be needed when the
-            // shrinker evicts them.  Using effective free makes 99%-full files look
-            // ~64% free and the growth trigger never fires.
-            if self.config.sparse_loop_backing
-                && !self.disk_full
-                && self.allocated < self.config.max_count
-            {
-                // Compute free percentage from actual /proc/swaps usage of our files.
-                let disk_free_swap: u8 = {
-                    let total: u64 = swap_files.iter().map(|f| f.size_bytes).sum();
-                    let used: u64 = swap_files.iter().map(|f| f.used_bytes).sum();
-                    if total == 0 {
-                        100
-                    } else {
-                        let free = total.saturating_sub(used);
-                        ((free * 100) / total).min(100) as u8
-                    }
-                };
-
-                if disk_free_swap < 20 && cooldown_ok {
-                    let growth = if self.config.growth_chunk_size > 0 {
-                        self.config.growth_chunk_size
-                    } else {
-                        self.config.chunk_size * 2
-                    };
-                    info!(
-                        "swapFC: ZswapLoopfile disk swap 80%+ full (disk_free={}%, effective_free={}%) - creating growth file ({}MB)",
-                        disk_free_swap,
-                        free_swap,
-                        growth / (1024 * 1024),
-                    );
-                    // Temporarily override chunk size for the next create call
-                    let prev_chunk = self.config.chunk_size;
-                    self.config.chunk_size = growth;
-                    if self.create_swapfile().is_ok() {
-                        self.last_creation = Some(Instant::now());
-                        self.cooldown_secs = 30;
-                    }
-                    self.config.chunk_size = prev_chunk;
-                    continue;
-                }
-            }
-
-            // EXPANSION TRIGGERS (non-zswap only)
-            // With zswap active, the reserve file strategy above handles ALL expansion.
-            // The EMERGENCY and NORMAL triggers only apply to zram/plain swapfile modes.
-            if !self.is_zswap_active
-                && !self.disk_full
-                && self.allocated < self.config.max_count
-            {
+            // EXPANSION TRIGGERS, in every mode. With zswap each stored page
+            // holds a slot in these files, so their fill is what zswap uses up.
+            // Zswap mode used to skip all of this and grow only through the
+            // removed sparse loop path, which left it at `min_count` files.
+            if !self.disk_full && self.allocated < self.config.max_count {
                 // Count files with no data yet to avoid pre-allocating more than needed
                 let unused_count = swap_files.iter().filter(|f| f.used_bytes == 0).count();
 
                 // EMERGENCY TRIGGER: critical RAM pressure.
                 let emergency_ram_threshold: u8 = 10;
 
+                // Low RAM alone does not justify a disk file. These files sit
+                // at priority -1, below the zram tier, so the kernel reaches
+                // them only once zram is full -- while real swap headroom
+                // remains, every page goes to zram and the file we create stays
+                // at Used=0. `unused_count` does not stop this: contraction
+                // deletes the idle file, and the next tick creates it again, so
+                // the pair flaps under sustained pressure (observed: 9 creates,
+                // 7 deletes in one boot, none ever used). Gate on the whole
+                // swap stack, not zram's share of it: create only when kernel
+                // SwapFree falls under two chunks, i.e. zram itself is nearly
+                // spent and the disk tier is about to be the one in use.
+                let swap_headroom = get_effective_swap_usage()
+                    .map(|u| u.swap_free)
+                    .unwrap_or(u64::MAX);
+                let swap_nearly_full = swap_headroom < self.config.chunk_size.saturating_mul(2);
                 if free_ram < emergency_ram_threshold
-                    && free_swap < 80
+                    && swap_nearly_full
                     && unused_count < 2
                     && emergency_cooldown_ok
                 {
                     info!(
-                        "swapFC: EMERGENCY! free_ram={}% free_swap={}% unused={} - creating swap urgently",
-                        free_ram, free_swap, unused_count
+                        "swapFC: EMERGENCY! free_ram={}% disk_free={}% unused={} - creating swap urgently",
+                        free_ram, disk_free_percent, unused_count
                     );
                     if self.create_swapfile().is_ok() {
                         self.last_creation = Some(Instant::now());
@@ -1247,14 +799,13 @@ impl SwapFile {
                 let files_stressed =
                     !swap_files.is_empty() && swap_files.iter().all(|f| f.usage_percent() >= 85);
 
-                if files_stressed
-                    && free_swap < swap_threshold
-                    && unused_count < 2
-                    && emergency_cooldown_ok
-                {
+                // `files_stressed` already means every file we own is 85% full,
+                // so the extra `free_swap` term added nothing but the chance to
+                // veto a justified expansion on a reading about zram.
+                if files_stressed && unused_count < 2 && emergency_cooldown_ok {
                     info!(
-                        "swapFC: all {} file(s) >= 85% full, free_swap={}% - expanding (stress trigger)",
-                        swap_files.len(), free_swap
+                        "swapFC: all {} file(s) >= 85% full, disk_free={}% - expanding (stress trigger)",
+                        swap_files.len(), disk_free_percent
                     );
                     if self.create_swapfile().is_ok() {
                         self.last_creation = Some(Instant::now());
@@ -1263,11 +814,11 @@ impl SwapFile {
                     continue;
                 }
 
-                // NORMAL TRIGGER: swap space running low.
-                if cooldown_ok && free_swap < swap_threshold && unused_count < 2 {
+                // NORMAL TRIGGER: our own disk swap running low.
+                if cooldown_ok && disk_free_percent < swap_threshold && unused_count < 2 {
                     info!(
-                        "swapFC: swap pressure! effective_free_swap={}% < {}% (thresh) - expanding (cooldown={}s)",
-                        free_swap, swap_threshold, self.cooldown_secs
+                        "swapFC: disk swap pressure! disk_free={}% < {}% (thresh) - expanding (cooldown={}s)",
+                        disk_free_percent, swap_threshold, self.cooldown_secs
                     );
                     if self.create_swapfile().is_ok() {
                         self.last_creation = Some(Instant::now());
@@ -1303,12 +854,18 @@ impl SwapFile {
                     .map(|t| t.elapsed() >= Duration::from_secs(removal_cooldown_secs))
                     .unwrap_or(true);
 
-                if free_swap > remove_threshold && removal_cooldown_ok {
+                // Shed a file only when OUR files are the thing that is idle,
+                // and only while RAM is still comfortable. The reading used to
+                // be `free_swap`, so a mostly-empty zram read as abundant swap
+                // and the chunk went away exactly when RAM was getting short.
+                let ram_comfortable = free_ram > self.config.free_ram_perc;
+                if disk_free_percent > remove_threshold && ram_comfortable && removal_cooldown_ok {
                     if let Some(candidate) = self.find_safe_removal_candidate(&swap_files) {
                         info!(
-                            "swapFC: free_swap={}% > {}% (thresh), removing {} (usage: {}%)",
-                            free_swap,
+                            "swapFC: disk_free={}% > {}% (thresh), free_ram={}%, removing {} (usage: {}%)",
+                            disk_free_percent,
                             remove_threshold,
+                            free_ram,
                             candidate.path.display(),
                             candidate.usage_percent()
                         );
@@ -1381,91 +938,20 @@ impl SwapFile {
         // Remove if exists
         force_remove(&swapfile_path, false);
 
-        // Create file with secure permissions (0600)
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&swapfile_path)?;
-        }
-
-        // NOCOW on btrfs — prevents deadlock under memory pressure.
-        if self.is_btrfs && self.config.nocow {
-            let _ = Command::new("chattr")
-                .args(["+C"])
-                .arg(&swapfile_path)
-                .status();
-        }
-
-        // File allocation + optional loop device
-        let (swapfile, loop_device): (String, Option<String>) = if self.config.sparse_loop_backing {
-            // Sparse: allocate blocks on-demand via truncate.
-            info!(
-                "swapFC: creating sparse loop-backed file #{} ({}MB)",
-                self.allocated,
-                chunk_size / (1024 * 1024)
-            );
-            let status = Command::new("truncate")
-                .args(["-s", &chunk_size.to_string()])
-                .arg(&swapfile_path)
-                .status()?;
-            if !status.success() {
+        // One cleanup for every failure: a partial file would hold disk space
+        // and the counters would name a swap file that does not exist.
+        if let Err(e) = self.allocate_file(&swapfile_path, chunk_size) {
+            {
                 force_remove(&swapfile_path, false);
                 self.allocated -= 1;
                 self.file_sizes.pop();
-                return Err(SwapFileError::NoSpace);
+                return Err(e);
             }
-            // direct-io=on: bypasses page cache, prevents deadlock
-            let loop_dev = run_cmd_output(&[
-                "losetup",
-                "-f",
-                "--show",
-                "--direct-io=on",
-                &swapfile_path.to_string_lossy(),
-            ])?;
-            let loop_dev = loop_dev.trim().to_string();
-
-            tune_loop_device(&loop_dev);
-
-            (loop_dev.clone(), Some(loop_dev))
-        } else {
-            // Pre-allocate with zero-fill (direct swapon, no loop).
-            // Cannot use fallocate on btrfs: it creates PREALLOC extents
-            // that swapon rejects. Writing zeros creates REG extents.
-            info!(
-                "swapFC: creating preallocated file #{} ({}MB)",
-                self.allocated,
-                chunk_size / (1024 * 1024)
-            );
-            {
-                use std::io::Write;
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&swapfile_path)?;
-                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, f);
-                let zeros = vec![0u8; 1024 * 1024];
-                let chunks = chunk_size / (1024 * 1024);
-                for _ in 0..chunks {
-                    writer.write_all(&zeros)?;
-                }
-                let remainder = (chunk_size % (1024 * 1024)) as usize;
-                if remainder > 0 {
-                    writer.write_all(&vec![0u8; remainder])?;
-                }
-                writer.flush()?;
-            }
-            (swapfile_path.to_string_lossy().to_string(), None)
-        };
+        }
+        let swapfile = swapfile_path.to_string_lossy().to_string();
 
         // mkswap
-        let fs_label = if self.config.sparse_loop_backing {
-            format!("SWAP_loop_{}", self.allocated)
-        } else {
-            format!("SWAP_btrfs_{}", self.allocated)
-        };
+        let fs_label = format!("SWAP_btrfs_{}", self.allocated);
         let status = Command::new("mkswap")
             .args(["-L", &fs_label])
             .arg(&swapfile)
@@ -1478,34 +964,73 @@ impl SwapFile {
             return Err(SwapFileError::Io(std::io::Error::other("mkswap failed")));
         }
 
-        // No discard for loop-backed swap on btrfs (PUNCH_HOLE destroys extents)
-        let discard_options: Option<&str> = None;
         let unit_name = gen_swap_unit(
             Path::new(&swapfile),
             None,
-            discard_options,
+            None,
             &format!("swapfile_{}", self.allocated),
         )?;
 
-        // Store loop device info for cleanup
-        if let Some(ref loop_dev) = loop_device {
-            let loop_info_path = format!("{}/swapfile/loop_{}", WORK_DIR, self.allocated);
-            let _ = fs::write(
-                &loop_info_path,
-                format!("{}\n{}", loop_dev, swapfile_path.display()),
-            );
-        }
-
-        systemctl(SystemctlAction::DaemonReload, "")?;
-        systemctl(SystemctlAction::Start, &unit_name)?;
-
-        // Re-apply volatile queue parameters that swapon may have reset.
-        if let Some(ref loop_dev) = loop_device {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            retune_loop_queue(loop_dev);
-        }
+        activate_swap(&swapfile, None, false, &unit_name)?;
 
         notify_status("Monitoring memory status...");
+        Ok(())
+    }
+
+    /// Create `swapfile_path` and reserve `chunk_size` bytes for it. The caller
+    /// removes the file on error.
+    fn allocate_file(&self, swapfile_path: &Path, chunk_size: u64) -> Result<()> {
+        // Create file with secure permissions (0600)
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(swapfile_path)?;
+        }
+
+        // NOCOW on btrfs — prevents deadlock under memory pressure.
+        if self.is_btrfs {
+            let _ = Command::new("chattr")
+                .args(["+C"])
+                .arg(swapfile_path)
+                .status();
+        }
+
+        // Btrfs supports preallocated NOCOW swapfiles. Avoid writing the
+        // entire file under memory pressure just to reserve its extents.
+        info!(
+            "swapFC: creating preallocated file #{} ({}MB)",
+            self.allocated,
+            chunk_size / (1024 * 1024)
+        );
+        if self.is_btrfs {
+            run_cmd_output(&[
+                "fallocate",
+                "--length",
+                &chunk_size.to_string(),
+                "--",
+                &swapfile_path.to_string_lossy(),
+            ])?;
+        } else {
+            use std::io::Write;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(swapfile_path)?;
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, f);
+            let zeros = vec![0u8; 1024 * 1024];
+            let chunks = chunk_size / (1024 * 1024);
+            for _ in 0..chunks {
+                writer.write_all(&zeros)?;
+            }
+            let remainder = (chunk_size % (1024 * 1024)) as usize;
+            if remainder > 0 {
+                writer.write_all(&vec![0u8; remainder])?;
+            }
+            writer.flush()?;
+        }
         Ok(())
     }
 }
@@ -1583,9 +1108,22 @@ mod tests {
     #[test]
     fn validate_rejects_forbidden_system_dirs() {
         for p in &[
-            "/etc", "/etc/swap", "/sys", "/proc", "/dev", "/run", "/bin",
-            "/sbin", "/usr", "/lib", "/lib64", "/boot", "/snap", "/lost+found",
-            "/usr/local/swap", "/boot/swap",
+            "/etc",
+            "/etc/swap",
+            "/sys",
+            "/proc",
+            "/dev",
+            "/run",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/lib",
+            "/lib64",
+            "/boot",
+            "/snap",
+            "/lost+found",
+            "/usr/local/swap",
+            "/boot/swap",
         ] {
             assert!(
                 !validate_swapfile_path(Path::new(p)),
@@ -1638,9 +1176,10 @@ mod tests {
 
     #[test]
     fn from_config_clamps_max_count_to_28() {
-        let c = cfg(&[("swapfile_max_count", "99")]);
-        let sc = SwapFileConfig::from_config(&c).unwrap();
-        assert_eq!(sc.max_count, 28);
+        for (v, want) in [("28", 28), ("29", 28), ("99", 28)] {
+            let c = cfg(&[("swapfile_max_count", v)]);
+            assert_eq!(SwapFileConfig::from_config(&c).unwrap().max_count, want);
+        }
     }
 
     #[test]
@@ -1652,20 +1191,30 @@ mod tests {
 
     #[test]
     fn from_config_clamps_shrink_threshold_10_50() {
-        let c = cfg(&[("swapfile_shrink_threshold", "5")]);
-        assert_eq!(SwapFileConfig::from_config(&c).unwrap().shrink_threshold, 10);
+        for (v, want) in [("5", 10), ("10", 10), ("50", 50)] {
+            let c = cfg(&[("swapfile_shrink_threshold", v)]);
+            assert_eq!(
+                SwapFileConfig::from_config(&c).unwrap().shrink_threshold,
+                want
+            );
+        }
 
-        let c = cfg(&[("swapfile_shrink_threshold", "99")]);
-        assert_eq!(SwapFileConfig::from_config(&c).unwrap().shrink_threshold, 50);
+        // 300 used to wrap through `as u8` to 44 before the clamp saw it.
+        for v in ["99", "300"] {
+            let c = cfg(&[("swapfile_shrink_threshold", v)]);
+            assert_eq!(
+                SwapFileConfig::from_config(&c).unwrap().shrink_threshold,
+                50
+            );
+        }
     }
 
     #[test]
     fn from_config_clamps_safe_headroom_20_60() {
-        let c = cfg(&[("swapfile_safe_headroom", "5")]);
-        assert_eq!(SwapFileConfig::from_config(&c).unwrap().safe_headroom, 20);
-
-        let c = cfg(&[("swapfile_safe_headroom", "99")]);
-        assert_eq!(SwapFileConfig::from_config(&c).unwrap().safe_headroom, 60);
+        for (v, want) in [("5", 20), ("20", 20), ("60", 60), ("99", 60)] {
+            let c = cfg(&[("swapfile_safe_headroom", v)]);
+            assert_eq!(SwapFileConfig::from_config(&c).unwrap().safe_headroom, want);
+        }
     }
 
     #[test]
@@ -1675,35 +1224,11 @@ mod tests {
     }
 
     #[test]
-    fn from_config_enforces_min_chunk_non_sparse() {
-        // non-sparse: min chunk is 512MiB
-        let c = cfg(&[("swapfile_chunk_size", "64M")]);
-        let sc = SwapFileConfig::from_config(&c).unwrap();
-        assert_eq!(sc.chunk_size, 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn from_config_enforces_min_chunk_sparse() {
-        // sparse: min chunk is 128MiB
-        let c = cfg(&[
-            ("swapfile_chunk_size", "64M"),
-            ("swapfile_sparse_loop", "1"),
-        ]);
-        let sc = SwapFileConfig::from_config(&c).unwrap();
-        assert_eq!(sc.chunk_size, 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn from_config_nocow_defaults_true() {
-        let c = cfg(&[]);
-        assert!(SwapFileConfig::from_config(&c).unwrap().nocow);
-    }
-
-    #[test]
-    fn from_config_nocow_false_variants() {
-        for v in &["0", "false", "no", "off"] {
-            let c = cfg(&[("swapfile_nocow", *v)]);
-            assert!(!SwapFileConfig::from_config(&c).unwrap().nocow);
+    fn from_config_enforces_min_chunk() {
+        let mb = 1024 * 1024;
+        for (v, want) in [("64M", 512 * mb), ("512M", 512 * mb), ("2G", 2048 * mb)] {
+            let c = cfg(&[("swapfile_chunk_size", v)]);
+            assert_eq!(SwapFileConfig::from_config(&c).unwrap().chunk_size, want);
         }
     }
 
@@ -1712,20 +1237,5 @@ mod tests {
         let c = cfg(&[("swapfile_path", "/swap/")]);
         let sc = SwapFileConfig::from_config(&c).unwrap();
         assert_eq!(sc.path, PathBuf::from("/swap"));
-    }
-
-    #[test]
-    fn from_config_growth_chunk_size_empty_is_zero() {
-        let c = cfg(&[]);
-        assert_eq!(SwapFileConfig::from_config(&c).unwrap().growth_chunk_size, 0);
-    }
-
-    #[test]
-    fn from_config_growth_chunk_size_parsed() {
-        let c = cfg(&[("swapfile_growth_chunk_size", "1G")]);
-        assert_eq!(
-            SwapFileConfig::from_config(&c).unwrap().growth_chunk_size,
-            1024 * 1024 * 1024
-        );
     }
 }

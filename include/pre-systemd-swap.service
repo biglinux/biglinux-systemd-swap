@@ -1,11 +1,63 @@
+# pre-systemd-swap.service
+#
+# Oneshot helper that prepares the system for systemd-swap:
+#   - creates the btrfs subvolume used by swap files (mutates /etc/fstab once)
+#   - disables pre-existing swap partitions
+#   - tunes vm.min_free_kbytes
+#
+# Type=oneshot (not forking): /usr/bin/pre-systemd-swap is a bash script that
+# does its work and exits. RemainAfterExit=no because the changes it performs
+# (fstab append, swapoff, sysctl write) persist in the kernel/disk; there is
+# no daemon state to keep "active".
+#
+# Hardening notes (trade-offs documented inline):
+#
+#   ProtectKernelTunables=no
+#     The script writes /proc/sys/vm/min_free_kbytes. ReadWritePaths cannot
+#     re-open /proc/sys nodes once ProtectKernelTunables=yes has remounted
+#     them read-only (see systemd.exec(5) -- ProtectKernelTunables forces a
+#     read-only bind of /proc/sys, /sys, /proc/sysrq-trigger, etc., and
+#     ReadWritePaths does not undo /proc/sys protection). So we keep it off.
+#
+#   ProtectKernelModules=no
+#     Unit pulls modprobe@zram.service; module load must be allowed.
+#
+#   PrivateTmp=no
+#     Script does `mount $rootpartition /mnt` and expects the mount to be
+#     visible to the host (subsequent boot stages and systemd-swap.service
+#     read /etc/fstab and the mounted subvolume). PrivateTmp=yes implies a
+#     private mount namespace which would hide /mnt and /<swapfolder> mounts
+#     from the rest of the system.
+#
+#   SystemCallFilter mirrors systemd-swap.service: needs @swap (swapoff) and
+#     @mount (mount/umount) on top of @system-service.
+#
+# Everything else is locked down.
+
 [Unit]
 Description=Manage swap spaces on zram, files and partitions.
 Wants=modprobe@zram.service
 After=modprobe@zram.service
 
 [Service]
-Type=forking
+Type=oneshot
+RemainAfterExit=no
 ExecStart=/usr/bin/pre-systemd-swap
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service @swap @mount
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

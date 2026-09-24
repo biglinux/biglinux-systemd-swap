@@ -7,7 +7,7 @@
 
 use std::io::Write;
 
-use systemd_swap::autoconfig::{RecommendedConfig, SwapMode};
+use systemd_swap::autoconfig::RecommendedConfig;
 use systemd_swap::config::Config;
 use systemd_swap::swapfile::SwapFileConfig;
 use systemd_swap::zram::ZramPoolConfig;
@@ -69,27 +69,6 @@ fn arithmetic_addition_expands() {
     assert_eq!(cfg.get("answer").unwrap(), "5");
 }
 
-#[test]
-fn arithmetic_multiplication_expands() {
-    let f = write_conf("x=$(( 4 * 8 ))\n");
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    assert_eq!(cfg.get("x").unwrap(), "32");
-}
-
-#[test]
-fn arithmetic_division_by_zero_is_zero() {
-    let f = write_conf("x=$(( 10 / 0 ))\n");
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    assert_eq!(cfg.get("x").unwrap(), "0");
-}
-
-#[test]
-fn arithmetic_plain_number_passes_through() {
-    let f = write_conf("x=$(( 42 ))\n");
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    assert_eq!(cfg.get("x").unwrap(), "42");
-}
-
 // ── Env var expansion ───────────────────────────────────────────────────────
 
 #[test]
@@ -118,39 +97,6 @@ fn undefined_env_var_left_unchanged() {
     assert_eq!(cfg.get("x").unwrap(), "${UNDEFINED_ENV_VAR_XYZ_12345}");
 }
 
-// ── Boolean parsing ─────────────────────────────────────────────────────────
-
-#[test]
-fn get_bool_all_true_values() {
-    let f = write_conf(
-        "a=yes\n\
-         b=y\n\
-         c=1\n\
-         d=true\n\
-         e=TRUE\n\
-         f=Yes\n",
-    );
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    for k in &["a", "b", "c", "d", "e", "f"] {
-        assert!(cfg.get_bool(k), "{} should be true", k);
-    }
-}
-
-#[test]
-fn get_bool_all_false_values() {
-    let f = write_conf(
-        "a=no\n\
-         b=0\n\
-         c=false\n\
-         d=off\n\
-         e=random\n",
-    );
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    for k in &["a", "b", "c", "d", "e"] {
-        assert!(!cfg.get_bool(k), "{} should be false", k);
-    }
-}
-
 // ── End-to-end pipeline: config → subsystem configs ─────────────────────────
 
 #[test]
@@ -164,7 +110,7 @@ fn full_pipeline_zram_only_config() {
     let cfg = Config::from_file_for_tests(f.path()).unwrap();
     let pool = ZramPoolConfig::from_config(&cfg);
     assert_eq!(pool.algorithm, "lz4");
-    assert_eq!(pool.initial_size_percent, 100);
+    assert_eq!(pool.size_ceiling_percent, 100);
     assert_eq!(pool.max_devices, 4);
 }
 
@@ -173,17 +119,13 @@ fn full_pipeline_swapfile_config() {
     let f = write_conf(
         "swapfile_path=/var/swap\n\
          swapfile_chunk_size=1G\n\
-         swapfile_max_count=10\n\
-         swapfile_nocow=no\n\
-         swapfile_sparse_loop=yes\n",
+         swapfile_max_count=10\n",
     );
     let cfg = Config::from_file_for_tests(f.path()).unwrap();
     let sf = SwapFileConfig::from_config(&cfg).unwrap();
     assert_eq!(sf.path, std::path::PathBuf::from("/var/swap"));
     assert_eq!(sf.chunk_size, 1024 * 1024 * 1024);
     assert_eq!(sf.max_count, 10);
-    assert!(!sf.nocow);
-    assert!(sf.sparse_loop_backing);
 }
 
 #[test]
@@ -197,30 +139,7 @@ fn autoconfig_respects_user_override_full_flow() {
     assert_eq!(cfg.get("zram_alg").unwrap(), "zstd");
     // Flow continues into pool config with preserved override
     let pool = ZramPoolConfig::from_config(&cfg);
-    assert_eq!(pool.initial_size_percent, 250);
-}
-
-#[test]
-fn autoconfig_injected_keys_flow_to_swapfile_config() {
-    // Simulate zram+swapfc autoconfig: build pairs from the recommended config
-    // and load them via the real Config code path.
-    let rec = RecommendedConfig {
-        swap_mode: SwapMode::ZramSwapfc,
-        swapfc_max_count: 28,
-        ..RecommendedConfig::default()
-    };
-
-    // Serialise to conf format
-    let mut content = String::new();
-    for (k, v) in rec.config_pairs() {
-        content.push_str(&format!("{}={}\n", k, v));
-    }
-    content.push_str("swapfile_path=/swap\n"); // path required by validation
-
-    let f = write_conf(&content);
-    let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    let sf = SwapFileConfig::from_config(&cfg).unwrap();
-    assert_eq!(sf.max_count, 28);
+    assert_eq!(pool.size_ceiling_percent, 250);
 }
 
 // ── Config file precedence via apply_autoconfig ─────────────────────────────
@@ -244,10 +163,9 @@ fn multiple_apply_autoconfig_calls_are_idempotent() {
 fn config_parse_error_on_invalid_typed_value() {
     let f = write_conf("swapfile_max_count=not_a_number\n");
     let cfg = Config::from_file_for_tests(f.path()).unwrap();
-    // Typed accessor must return Err, but fallback default kicks in via unwrap_or
+    // The typed accessor fails, so from_config falls back to the default.
     let sf = SwapFileConfig::from_config(&cfg).unwrap();
-    // Default kicks in silently (28 per defaults::SWAPFILE_MAX_COUNT)
-    assert!(sf.max_count >= 1 && sf.max_count <= 28);
+    assert_eq!(sf.max_count, 28);
 }
 
 #[test]

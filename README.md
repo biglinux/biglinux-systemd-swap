@@ -32,19 +32,39 @@ In `auto` mode, the daemon checks:
 The daemon manages a **dynamic pool of zram devices** that expands and
 contracts based on demand:
 
-- **Initial pool**: one device per CPU core (max 8 devices)
-- **Expansion**: adds a device when pool utilization exceeds 85%
-- **Contraction**: removes idle devices when utilization drops below 20% for 120s
-- **Monitoring interval**: 5 seconds
+- **Initial pool**: one device sized to 95% of `mem_limit` (compression is
+  per-CPU since Linux 4.7)
+- **Expansion**: at 85% utilization, adds a device with only the slots the
+  remaining RAM could back if the next data did not compress at all. Data
+  that compresses 4x leaves three quarters of each page in the budget, so the
+  pool grows with it toward `zram_size` (150% of RAM); random data earns
+  nothing
+- **Contraction**: removes idle devices when utilization drops below 20% for
+  120s, or the last device as soon as the pool advertises slots its RAM can no
+  longer back and that device is cheap to empty
+- **Monitoring**: woken by the kernel the moment memory pressure starts
+  (a PSI trigger, no cost while idle), otherwise every 5 seconds for slow
+  trends; new devices are `swapon`ed directly, before systemd adopts the unit
 
 Each zram device uses:
 - **Algorithm**: zstd (level 3) — best ratio-to-speed balance
-- **Disksize**: 150% of RAM (virtual/uncompressed size)
-- **No mem_limit**: prevents write errors that block kernel fallback to disk swap
-- **Priority**: 32767 (maximum — kernel uses zram before disk swap)
+- **mem_limit**: 50% of RAM for the pool. The kernel only offers a limit per
+  device, so each device may use what it holds plus everything the pool has
+  left; with one priority per device the kernel writes one device at a time
+  and the limit binds only when the pool total does
+- **Reserve**: expansion commits 65% of that ceiling. When churn eats into the
+  rest — compressible pages leaving free slots behind without the RAM to back
+  them — incompressible pages are written to the writeback store on disk
+- **Priority**: 32767 for the first device, one less for each later one
+  (kernel uses zram before disk swap)
 
-Physical RAM usage is naturally limited by the kernel's memory watermarks
-and the daemon's free-RAM guard (adaptive check before each expansion).
+Sizing works this way because a slot the pool cannot back in RAM is a trap,
+and the kernel cannot tell: once `mem_limit` is reached, writes to the device
+fail, but `should_reclaim_retry()` still counts the unbacked slots as free
+swap and keeps aiming reclaim at the same device instead of falling through
+to the swap files below it. Measured in a VM: a pool advertising 3.0x against
+data compressing 1.02x produced 1.5 million `Write-error on swap-device`
+lines, left the swap files at 0 bytes, and hung with no OOM kill.
 
 **Compression ratios** (typical):
 - Desktop workloads: 3–4x
@@ -57,10 +77,11 @@ In `zram+swapfile` mode, swap files provide emergency overflow:
 
 - **Size**: 512MB each, created on demand
 - **Maximum**: 28 files (14GB total capacity)
-- **Priority**: -1 (kernel only uses when zram is full)
+- **Priority**: negative, below zram (kernel only uses them when zram is full)
 - **NOCOW**: enabled on btrfs (prevents deadlock under pressure)
-- **Created when**: free RAM < 20% or free swap < 40%
-- **Removed when**: free swap > 70%
+- **Created when**: free space in the files < 40%, every file ≥ 85% full, or
+  free RAM < 10% with total free swap under two chunks
+- **Removed when**: free space in the files > 70% and free RAM > 20%
 
 ### Zswap Mode
 
@@ -73,9 +94,10 @@ In `zswap+swapfile` mode, the kernel's zswap handles compression:
 
 ## Recommended Kernel Tuning
 
-The following kernel parameters are **not applied by the daemon** — they are
-recommendations for optimal performance with zram/zswap. Configure them
-via `/etc/sysctl.d/99-swap.conf` or your distribution's tuning service.
+At boot `pre-systemd-swap` sets `vm.min_free_kbytes` and THP `madvise`, and the
+daemon sets MGLRU `min_ttl_ms`. The other parameters are **not applied** — they
+are recommendations for zram/zswap. Configure them via
+`/etc/sysctl.d/99-swap.conf` or your distribution's tuning service.
 
 ### Memory Management
 
@@ -102,7 +124,6 @@ via `/etc/sysctl.d/99-swap.conf` or your distribution's tuning service.
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | THP enabled | `madvise` | Only apps requesting huge pages get them — avoids compaction stalls |
-| mTHP 64kB | `madvise` | 64kB folios via madvise — reduces swap I/O overhead |
 
 ### MGLRU (Multi-Gen LRU)
 
@@ -121,7 +142,7 @@ makepkg -si
 
 ### Manual Build
 
-Requirements: Rust 1.70+, `util-linux`
+Requirements: Rust 1.93+, `util-linux`
 
 ```bash
 cargo build --release
@@ -209,16 +230,20 @@ with descriptions.
 ```
 systemd-swap (Rust daemon)
 ├── main.rs          — CLI (clap), mode dispatch, kernel tuning, THP/MGLRU
-├── lib.rs           — Module declarations, global SHUTDOWN flag
+├── lib.rs           — Module declarations, global SHUTDOWN/DRY_RUN flags
 ├── config.rs        — Config parser (key=value, ${VAR} expansion, arithmetic)
+├── defaults.rs      — Compile-time defaults (paths, MGLRU TTL, fallbacks)
 ├── autoconfig.rs    — Hardware detection, recommended config generation
 ├── zram.rs          — Dynamic zram pool (expansion, contraction, monitoring)
-├── swapfile.rs      — Dynamic swap file management (NOCOW, loop-backed)
+├── swapfile.rs      — Dynamic swap file management (preallocated, NOCOW on btrfs)
 ├── zswap.rs         — Zswap kernel module configuration
 ├── meminfo.rs       — /proc/meminfo parser, effective swap calculation
 ├── systemd.rs       — Systemd unit generation, sd-notify
 └── helpers.rs       — Shared utilities (parse_size, fs detection, logging)
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full module map, state
+machine and external-process inventory.
 
 ### Data Flow
 
@@ -231,10 +256,10 @@ Memory pressure (free RAM < threshold)
       │   └─ All disksize consumed → kernel falls back to swapfiles
       └─ zswap: compress in kernel pool → shrinker writes back to disk
 
-SwapFile monitor (1s interval):
-  ├─ free_ram < 20%  → create 512MB swap file
-  ├─ free_ram < 5%   → emergency: create immediately
-  └─ free_swap > 70% → remove unused swap file
+SwapFile monitor (1s interval while files exist):
+  ├─ files' free space < 40% → create 512MB swap file
+  ├─ free_ram < 10% and swap nearly full → emergency: create immediately
+  └─ files' free space > 70% and free_ram > 20% → remove an idle file
 
 ZramPool monitor (5s interval):
   ├─ utilization > 85% → add zram device (up to 8)
@@ -246,11 +271,23 @@ ZramPool monitor (5s interval):
 - **Zero configuration**: works out of the box for any system
 - **Dynamic scaling**: creates/removes swap resources on demand
 - **MGLRU integration**: protects working set from premature eviction (kernel 6.1+)
-- **mTHP support**: 64kB folios for efficient zram swap I/O
 - **Zswap disabled for zram**: prevents double compression per kernel docs
 - **NOCOW swap files**: safe on btrfs under memory pressure
-- **Adopt on restart**: reuses existing zram devices and swap files without swapoff
-- **Graceful shutdown**: restores all kernel parameters on stop
+- **Adopt on restart**: a new instance reuses the zram devices and swap files left active, without swapoff
+- **Stop without swapoff**: stopping or removing the service leaves active swap in place; nothing is forced back into RAM
+
+## For contributors and AI agents
+
+- [AGENTS.md](AGENTS.md) — entrypoint: real build/test/lint commands, module
+  map, where to edit.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — module map, state machine, external
+  processes.
+- [INVARIANTS.md](INVARIANTS.md) — H1–H7 living contract (memory safety,
+  subprocess argv, fstab atomicity, hardening, config parser, shutdown).
+
+Quick gate: `cargo fmt --all -- --check && cargo clippy --workspace
+--all-targets --all-features -- -D warnings && cargo test --all-features
+--workspace`. Full CI in `.github/workflows/ci.yml`.
 
 ## License
 

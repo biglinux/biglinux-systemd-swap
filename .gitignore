@@ -167,3 +167,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Sibling git repos (own provenance)
+big-first-boot/
+biglinux-livecd/
+
+# Local-only notes, not part of the repository
+SECURITY.md
+REVIEW.md

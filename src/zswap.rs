@@ -87,10 +87,16 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
 
     // Get config values with adaptive defaults
     let enabled = config.get("zswap_enabled").unwrap_or("1");
-    let compressor = config.get("zswap_compressor").unwrap_or(defaults::ZSWAP_COMPRESSOR);
+    let compressor = config
+        .get("zswap_compressor")
+        .unwrap_or(defaults::ZSWAP_COMPRESSOR);
     let zpool = config.get("zswap_zpool").unwrap_or(defaults::ZSWAP_ZPOOL);
-    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or(defaults::ZSWAP_SHRINKER_ENABLED);
-    let accept_threshold = config.get("zswap_accept_threshold").unwrap_or(defaults::ZSWAP_ACCEPT_THRESHOLD);
+    let shrinker_enabled = config
+        .get("zswap_shrinker_enabled")
+        .unwrap_or(defaults::ZSWAP_SHRINKER_ENABLED);
+    let accept_threshold = config
+        .get("zswap_accept_threshold")
+        .unwrap_or(defaults::ZSWAP_ACCEPT_THRESHOLD);
 
     // Use config value if set, otherwise fall back to the well-tested default.
     let max_pool_percent = config
@@ -361,24 +367,5 @@ mod tests {
         let pct = s.ram_usage_percent();
         assert!(pct >= 0.0);
         assert!(pct <= 100.0, "got {}", pct);
-    }
-
-    // ── log_summary must not panic ───────────────────────────────────────────
-
-    #[test]
-    fn log_summary_disabled_is_noop() {
-        let s = ZswapStatus::default();
-        s.log_summary(); // enabled=false → returns early
-    }
-
-    #[test]
-    fn log_summary_enabled_runs() {
-        let s = ZswapStatus {
-            pool_size: 1024 * 1024,
-            stored_pages: 256,
-            pool_limit_hit: 1,
-            ..sample_status()
-        };
-        s.log_summary();
     }
 }

@@ -28,3 +28,17 @@ pub fn is_shutdown() -> bool {
 pub fn request_shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
 }
+
+// caveman: --dry-run flag. when true, refuse any system-mutating call
+// (modprobe, fstab append, swapon/off, sysfs write). plan-only mode.
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
+
+/// Return true if --dry-run was set on the CLI.
+pub fn is_dry_run() -> bool {
+    DRY_RUN.load(Ordering::Acquire)
+}
+
+/// Enable dry-run mode (set once during CLI parsing).
+pub fn set_dry_run(v: bool) {
+    DRY_RUN.store(v, Ordering::Release);
+}

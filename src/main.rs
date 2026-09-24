@@ -1,6 +1,9 @@
 // systemd-swap - Dynamic swap management for Linux
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! `systemd-swap` CLI binary. Parses subcommands (start/status/autoconfig) and
+//! drives the swap unit lifecycle using the `systemd_swap` library crate.
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -10,12 +13,10 @@ use clap::{Parser, Subcommand};
 use systemd_swap::autoconfig::{RecommendedConfig, SwapMode as AutoSwapMode, SystemCapabilities};
 use systemd_swap::config::{Config, WORK_DIR};
 use systemd_swap::defaults;
-use systemd_swap::helpers::{
-    am_i_root, find_swap_units, force_remove, get_what_from_swap_unit, makedirs, read_file,
-};
+use systemd_swap::helpers::{am_i_root, makedirs};
 use systemd_swap::meminfo::get_mem_stats;
 use systemd_swap::swapfile::SwapFile;
-use systemd_swap::systemd::{notify_ready, notify_stopping, swapoff};
+use systemd_swap::systemd::notify_ready;
 use systemd_swap::zswap::ZswapBackup;
 use systemd_swap::{error, info, request_shutdown, warn};
 
@@ -24,6 +25,12 @@ use systemd_swap::{error, info, request_shutdown, warn};
 #[command(about = "Dynamic swap management for zram, zswap, and swap files")]
 #[command(version)]
 struct Cli {
+    // caveman: global --dry-run. prints plan, no mutations.
+    // applies to start and downstream modprobe/fstab/sysfs writes.
+    /// Show what would be done without mutating the system
+    #[arg(long, global = true)]
+    dry_run: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -32,8 +39,6 @@ struct Cli {
 enum Commands {
     /// Start the swap management daemon
     Start,
-    /// Stop the swap management daemon
-    Stop,
     /// Show swap status information
     Status,
     /// Show recommended configuration for this system
@@ -44,19 +49,27 @@ enum Commands {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SwapMode {
     Auto,
-    ZramSwapfc,    // zram + swap files for overflow
-    ZswapSwapfc,   // zswap + swapfc (preallocated or sparse loop)
-    ZramOnly,      // zram only
-    Manual,        // Use explicit config values (zram_enabled, zswap_enabled, swapfc_enabled)
-    Disabled,      // Swap management disabled (service exits cleanly)
+    ZramSwapfc,  // zram + swap files for overflow
+    ZswapSwapfc, // zswap + swapfc (preallocated files)
+    ZramOnly,    // zram only
+    Manual,      // Use explicit config values (zram_enabled, zswap_enabled, swapfile_enabled)
+    Disabled,    // Swap management disabled (service exits cleanly)
 }
 
 fn main() {
     let cli = Cli::parse();
+    // caveman: propagate dry-run to lib-level flag so deep call sites
+    // (zram sysfs writes, writeback) can short-circuit.
+    systemd_swap::set_dry_run(cli.dry_run);
 
     let result = match cli.command {
-        Some(Commands::Start) => start(),
-        Some(Commands::Stop) => stop(false),
+        Some(Commands::Start) => {
+            if cli.dry_run {
+                dry_run_plan()
+            } else {
+                start()
+            }
+        }
         Some(Commands::Status) => status(),
         Some(Commands::Autoconfig) => autoconfig(),
         None => {
@@ -83,7 +96,9 @@ fn get_swap_mode(config: &Config) -> SwapMode {
         .as_str()
     {
         "zram+swapfc" | "zram_swapfc" => SwapMode::ZramSwapfc,
-        "zswap+swapfc" | "zswap" | "zswap+swapfile" | "zswap+loopfile" | "zswap_loopfile" => SwapMode::ZswapSwapfc,
+        "zswap+swapfc" | "zswap" | "zswap+swapfile" | "zswap+loopfile" | "zswap_loopfile" => {
+            SwapMode::ZswapSwapfc
+        }
         "zram" | "zram_only" => SwapMode::ZramOnly,
         "zram+swapfile" => SwapMode::ZramSwapfc,
         "disabled" => SwapMode::Disabled,
@@ -159,10 +174,9 @@ fn disable_zswap_for_zram() {
     }
 }
 
-
 /// Configure MGLRU anti-thrashing protection
 /// Sets min_ttl_ms which protects the working set from premature eviction
-fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
+fn configure_mglru(config: &Config) {
     const MGLRU_MIN_TTL_PATH: &str = "/sys/kernel/mm/lru_gen/min_ttl_ms";
 
     // Check if MGLRU is available
@@ -170,15 +184,11 @@ fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
         return;
     }
 
-    // Get configured value, or use recommended value from autoconfig
+    // Auto mode has injected the recommended value by now.
     let min_ttl_ms: u32 = config
         .get_opt("mglru_min_ttl_ms")
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or_else(|| {
-            recommended
-                .map(|r| r.mglru_min_ttl_ms)
-                .unwrap_or(defaults::MGLRU_MIN_TTL_MS)
-        });
+        .unwrap_or(defaults::MGLRU_MIN_TTL_MS);
 
     if min_ttl_ms == 0 {
         return;
@@ -194,6 +204,60 @@ fn configure_mglru(config: &Config, recommended: Option<&RecommendedConfig>) {
     }
 }
 
+/// caveman: dry-run plan. mirrors start() resolution path but never touches
+/// /sys, /proc, modprobe, swapon, fstab, or systemd. read-only detection only.
+fn dry_run_plan() -> Result<(), Box<dyn std::error::Error>> {
+    println!("[dry-run] no system state will be modified");
+
+    let caps = SystemCapabilities::detect();
+    let recommended = RecommendedConfig::from_capabilities(&caps);
+
+    let config = Config::load()?;
+    let swap_mode = get_swap_mode(&config);
+
+    let effective_mode = match swap_mode {
+        SwapMode::Auto => match recommended.swap_mode {
+            AutoSwapMode::ZramSwapfc => SwapMode::ZramSwapfc,
+            AutoSwapMode::ZramOnly => SwapMode::ZramOnly,
+        },
+        mode => mode,
+    };
+
+    println!("[dry-run] effective swap_mode: {:?}", effective_mode);
+    println!("[dry-run] would configure MGLRU min_ttl_ms (if available)");
+
+    match effective_mode {
+        SwapMode::ZramSwapfc => {
+            println!("[dry-run] would: disable zswap (zram+zswap conflict)");
+            println!("[dry-run] would: add zram devices via sysfs hot_add");
+            println!(
+                "[dry-run] would: create initial swap file under {}",
+                config
+                    .get("swapfile_path")
+                    .unwrap_or(defaults::SWAPFILE_PATH)
+            );
+            println!("[dry-run] would: NOT append to /etc/fstab (managed via /run units)");
+        }
+        SwapMode::ZswapSwapfc => {
+            println!("[dry-run] would: create swap file as zswap backing");
+            println!("[dry-run] would: write zswap sysfs parameters and save backup");
+        }
+        SwapMode::ZramOnly => {
+            println!("[dry-run] would: disable zswap, then load zram pool only");
+        }
+        SwapMode::Manual => {
+            println!("[dry-run] would: honor explicit flags (zram_enabled, zswap_enabled, swapfile_enabled)");
+        }
+        SwapMode::Disabled => {
+            println!("[dry-run] swap management disabled in config; nothing to do");
+        }
+        SwapMode::Auto => unreachable!(),
+    }
+
+    println!("\n[dry-run] complete — no changes applied");
+    Ok(())
+}
+
 /// Start the swap daemon
 fn start() -> Result<(), Box<dyn std::error::Error>> {
     am_i_root()?;
@@ -202,8 +266,8 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let caps = SystemCapabilities::detect();
     let recommended = RecommendedConfig::from_capabilities(&caps);
 
-    // Clean up any previous instance
-    let _ = stop(true);
+    // Clean up after any previous instance
+    clear_previous_instance();
 
     // Clean up legacy swapfc/swapfile path
     let legacy_path = Path::new("/swapfc/swapfile");
@@ -242,7 +306,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Configure MGLRU early (protects working set during swap operations)
-    configure_mglru(&config, Some(&recommended));
+    configure_mglru(&config);
 
     // Determine effective mode
     let effective_mode = match swap_mode {
@@ -281,29 +345,7 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // Disable zswap when using zram (per kernel documentation)
     disable_zswap_for_zram();
 
-    // Start zram pool (primary high-priority swap)
-    info!("Setting up ZramPool as primary swap...");
-    let zram_ok = match systemd_swap::zram::ZramPool::new(config) {
-        Ok(mut pool) => match pool.start_primary() {
-            Ok(()) => {
-                // Run pool monitor in background thread (handles expansion/contraction)
-                std::thread::spawn(move || {
-                    if let Err(e) = pool.run_monitor() {
-                        warn!("ZramPool monitor error: {}", e);
-                    }
-                });
-                true
-            }
-            Err(e) => {
-                error!("ZramPool: start_primary failed: {}", e);
-                false
-            }
-        },
-        Err(e) => {
-            error!("ZramPool: init failed: {}", e);
-            false
-        }
-    };
+    let zram_ok = spawn_zram_pool(config);
 
     // Create swapfc for overflow (lower priority) - non-critical
     info!("Setting up swapfc as secondary swap for overflow...");
@@ -325,12 +367,7 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             if zram_ok {
                 warn!("Swapfile setup failed, continuing with zram only: {}", e);
                 notify_ready();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                    if systemd_swap::is_shutdown() {
-                        break;
-                    }
-                }
+                idle_until_shutdown();
             } else {
                 error!("Both zram and swapfile failed");
                 return Err(e.into());
@@ -338,6 +375,32 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Start the zram pool as primary swap, its monitor on a background thread
+/// (expansion/contraction). False when the pool could not start.
+fn spawn_zram_pool(config: &Config) -> bool {
+    info!("Setting up ZramPool as primary swap...");
+    match systemd_swap::zram::ZramPool::new(config) {
+        Ok(mut pool) => match pool.start_primary() {
+            Ok(()) => {
+                std::thread::spawn(move || {
+                    if let Err(e) = pool.run_monitor() {
+                        warn!("ZramPool monitor error: {}", e);
+                    }
+                });
+                true
+            }
+            Err(e) => {
+                error!("ZramPool: start_primary failed: {}", e);
+                false
+            }
+        },
+        Err(e) => {
+            error!("ZramPool: init failed: {}", e);
+            false
+        }
+    }
 }
 
 /// ZswapSwapfc: create swapfile first (zswap needs a backing swap device), then enable zswap
@@ -392,25 +455,30 @@ fn run_zram_only(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 // No devices — idle until shutdown instead of looping in monitor.
-                while !systemd_swap::is_shutdown() {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                }
+                idle_until_shutdown();
             }
         }
         Err(e) => {
             error!("ZramPool: {}", e);
             notify_ready();
-            while !systemd_swap::is_shutdown() {
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
+            idle_until_shutdown();
         }
     }
     Ok(())
 }
 
+/// Keep the service alive with nothing to monitor until SIGTERM.
+fn idle_until_shutdown() {
+    while !systemd_swap::is_shutdown() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
 /// Manual mode: legacy mode driven by explicit config flags
 fn run_manual(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    warn!("Manual mode: using explicit config flags (zram_enabled, zswap_enabled, swapfc_enabled)");
+    warn!(
+        "Manual mode: using explicit config flags (zram_enabled, zswap_enabled, swapfile_enabled)"
+    );
 
     if config.get_bool("zswap_enabled") {
         match systemd_swap::zswap::start(config) {
@@ -426,9 +494,10 @@ fn run_manual(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         if !config.get_bool("zswap_enabled") {
             disable_zswap_for_zram();
         }
-        if let Err(e) = systemd_swap::zram::start(config) {
-            error!("Zram: {}", e);
-        }
+        // The same pool as every other zram mode: one legacy device sized
+        // straight from zram_size had no RAM bound on its slots, the setup that
+        // hung with writes failing and disk swap untouched.
+        spawn_zram_pool(config);
     }
 
     if config.get_bool("swapfile_enabled") {
@@ -438,12 +507,7 @@ fn run_manual(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         notify_ready();
         info!("Manual mode swap setup complete");
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            if systemd_swap::is_shutdown() {
-                break;
-            }
-        }
+        idle_until_shutdown();
     }
     Ok(())
 }
@@ -462,52 +526,20 @@ fn save_zswap_backup(backup: &Option<ZswapBackup>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Stop the swap daemon
-fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
-    am_i_root()?;
-
-    if !on_init {
-        notify_stopping();
-    }
-
-    let config = Config::load()?;
-
-    // Stop all managed swap units (check both swapfile and legacy swapfc names).
-    // On init (on_init=true), skip swapfile units: adopt_existing_swapfiles() will
-    // take ownership of them without swapping them off under memory pressure.
-    for subsystem in ["swapfile", "swapfc", "zram"] {
-        if on_init {
-            // On init, skip ALL subsystems: adopt_existing_swapfiles() will
-            // reuse swapfiles, and ZramPool will adopt existing zram devices.
-            // Doing swapoff under memory pressure causes OOM on low-RAM systems.
-            continue;
-        }
-        for unit_path in find_swap_units() {
-            if let Ok(content) = read_file(&unit_path) {
-                if content.to_lowercase().contains(subsystem) {
-                    if let Some(dev) = get_what_from_swap_unit(&unit_path) {
-                        info!("{}: swapoff {}", subsystem, dev);
-                        let _ = swapoff(&dev);
-                        force_remove(&unit_path, true);
-
-                        if subsystem == "swapfile" && dev.starts_with("/dev/loop") {
-                            // Detach the loop device after swapoff to prevent it from
-                            // persisting with a "(deleted)" backing file reference.
-                            let _ = std::process::Command::new("losetup")
-                                .args(["-d", &dev])
-                                .status();
-                        } else if subsystem == "swapfile" && Path::new(&dev).is_file() {
-                            force_remove(&dev, true);
-                        } else if subsystem == "zram" {
-                            let _ = systemd_swap::zram::release(&dev);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Restore zswap parameters
+/// Undo what a previous instance left in the work directory, before this one
+/// sets up.
+///
+/// Stopping the service never swaps off. A swapoff has to bring every page
+/// back into RAM at once, and the moments the service stops — a restart, an
+/// uninstall, a shutdown — are no reason to do that: measured on the notebook,
+/// a restart under load sat in swapoff until `TimeoutStopSec` killed it, and
+/// the live daemon meanwhile created swap files behind the teardown. So the
+/// swap a stopped daemon leaves stays active: a new instance adopts its zram
+/// devices and swap files, and at shutdown systemd deactivates the `.swap`
+/// units itself.
+fn clear_previous_instance() {
+    // The previous instance's zswap settings go back to what it found, so this
+    // instance backs up the originals rather than its predecessor's values.
     let backup_path = format!("{}/zswap_backup", WORK_DIR);
     if Path::new(&backup_path).is_dir() {
         info!("Zswap: restore configuration: start");
@@ -525,32 +557,8 @@ fn stop(on_init: bool) -> Result<(), Box<dyn std::error::Error>> {
         info!("Zswap: restore configuration: complete");
     }
 
-    // Remove work directory
     info!("Removing working directory...");
     let _ = fs::remove_dir_all(WORK_DIR);
-
-    // Remove swap files (check both current and legacy paths).
-    // Skip during on_init: adopt_existing_swapfiles() will reuse them.
-    if !on_init {
-        let swapfile_path = config.get("swapfile_path").unwrap_or(defaults::SWAPFILE_PATH);
-        info!("Removing files in {}...", swapfile_path);
-        if let Ok(entries) = fs::read_dir(swapfile_path) {
-            for entry in entries.flatten() {
-                force_remove(entry.path(), true);
-            }
-        }
-        // Also clean legacy path
-        let legacy_swapfc_path = config.get("swapfc_path").unwrap_or("/swapfc/swapfile");
-        if legacy_swapfc_path != swapfile_path {
-            if let Ok(entries) = fs::read_dir(legacy_swapfc_path) {
-                for entry in entries.flatten() {
-                    force_remove(entry.path(), true);
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Format bytes as human-readable size
@@ -593,8 +601,12 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         0.0
                     };
-                    println!("  Stored data:   {} → {} compressed ({:.1}x ratio)",
-                        format_size(original), format_size(compressed), ratio);
+                    println!(
+                        "  Stored data:   {} → {} compressed ({:.1}x ratio)",
+                        format_size(original),
+                        format_size(compressed),
+                        ratio
+                    );
                     println!("  Pool fill:     {}%", usage.zswap_pool_percent);
                 } else {
                     println!("  Pool:          empty");
@@ -608,9 +620,19 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         if stats.orig_data_size > 0 {
             println!("\nZram:");
             println!("  Capacity:      {}", format_size(stats.disksize));
-            println!("  Stored data:   {} → {} compressed ({:.1}x ratio)",
-                format_size(stats.orig_data_size), format_size(stats.mem_used_total),
-                stats.compression_ratio());
+            println!("  Stored data:   {}", format_size(stats.orig_data_size));
+            println!(
+                "  In RAM:        {} → {} compressed ({:.1}x ratio)",
+                format_size(
+                    stats
+                        .orig_data_size
+                        .saturating_sub(stats.written_back_bytes)
+                ),
+                format_size(stats.compr_data_size),
+                stats.compression_ratio()
+            );
+            println!("  RAM allocated: {}", format_size(stats.mem_used_total));
+            println!("  Written back:  {}", format_size(stats.written_back_bytes));
             println!("  Utilization:   {}%", stats.memory_utilization());
         }
     }
@@ -633,7 +655,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() >= 4 {
                 let name = fields[0];
-                if name.contains("loop") || name.contains("swapfile") || name.starts_with("/swapfile/") {
+                if name.contains("swapfile") {
                     files.push(SwapEntry {
                         name: name.to_string(),
                         size: fields[2].parse().unwrap_or(0),
@@ -672,7 +694,8 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Total:         {}", format_size(swap_total));
 
         // Used = In zswap + Disk usage (when zswap active), else kernel metric
-        let zswap_stored = swap_usage.as_ref()
+        let zswap_stored = swap_usage
+            .as_ref()
             .filter(|u| u.zswap_active)
             .map(|u| u.zswapped_original_bytes)
             .unwrap_or(0);
@@ -689,26 +712,36 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         // Breakdown: In zswap + On disk
         if let Some(ref usage) = swap_usage {
             if usage.zswap_active && swap_used > 0 {
-                println!("  In zswap:      {} (compressed to {} in RAM)",
+                println!(
+                    "  In zswap:      {} (compressed to {} in RAM)",
                     format_size(usage.zswapped_original_bytes),
-                    format_size(usage.zswap_pool_bytes));
+                    format_size(usage.zswap_pool_bytes)
+                );
             }
         }
         if du_bytes > 0 && swap_used > 0 {
-            println!("  On disk:       {}", format_size(du_bytes));
+            println!("  Disk allocated: {}", format_size(du_bytes));
         }
 
         if !files.is_empty() {
             let file_total: u64 = files.iter().map(|f| f.size).sum();
-            println!("\n  Swap files:    {} ({} capacity)", files.len(), format_size(file_total));
+            println!(
+                "\n  Swap files:    {} ({} capacity)",
+                files.len(),
+                format_size(file_total)
+            );
 
             // Individual file list
             println!();
             println!("  {:<24} {:>12} {:>12}", "Device", "Size", "Used");
             println!("  {}", "-".repeat(50));
             for f in &files {
-                println!("  {:<24} {:>12} {:>12}",
-                    f.name, format_size(f.size), format_size(f.used));
+                println!(
+                    "  {:<24} {:>12} {:>12}",
+                    f.name,
+                    format_size(f.size),
+                    format_size(f.used)
+                );
             }
         }
     } else {
@@ -757,12 +790,18 @@ mod tests {
 
     #[test]
     fn swap_mode_auto_explicit() {
-        assert_eq!(get_swap_mode(&cfg(&[("swap_mode", "auto")])), SwapMode::Auto);
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "auto")])),
+            SwapMode::Auto
+        );
     }
 
     #[test]
     fn swap_mode_case_insensitive() {
-        assert_eq!(get_swap_mode(&cfg(&[("swap_mode", "AUTO")])), SwapMode::Auto);
+        assert_eq!(
+            get_swap_mode(&cfg(&[("swap_mode", "AUTO")])),
+            SwapMode::Auto
+        );
         assert_eq!(
             get_swap_mode(&cfg(&[("swap_mode", "Zram_Only")])),
             SwapMode::ZramOnly

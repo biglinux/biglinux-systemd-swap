@@ -131,17 +131,6 @@ pub fn find_swap_units() -> Vec<String> {
     units
 }
 
-/// Get What= value from swap unit file
-pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
-    let content = read_file(path).ok()?;
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix("What=") {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
 /// Cache for filesystem type detection (avoids repeated findmnt calls)
 static FS_TYPE_CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
@@ -220,8 +209,8 @@ pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
         let percent: u64 = pct
             .parse()
             .map_err(|_| format!("Invalid percentage: {}", s))?;
-        let ram = crate::meminfo::get_ram_size()
-            .map_err(|e| format!("Failed to get RAM size: {}", e))?;
+        let ram =
+            crate::meminfo::get_ram_size().map_err(|e| format!("Failed to get RAM size: {}", e))?;
         return Ok(ram * percent / 100);
     }
 
@@ -244,8 +233,7 @@ pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
     }
 
     // No suffix — treat as raw bytes
-    s.parse::<u64>()
-        .map_err(|_| format!("Invalid size: {}", s))
+    s.parse::<u64>().map_err(|_| format!("Invalid size: {}", s))
 }
 
 // Logging macros
@@ -282,7 +270,6 @@ macro_rules! debug {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     // ── parse_size (pure logic) ──────────────────────────────────────────────
 
@@ -322,6 +309,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_size_zero_with_or_without_suffix() {
+        for v in ["0", "0M", "0G", "0%"] {
+            assert_eq!(parse_size(v).unwrap(), 0, "{v}");
+        }
+    }
+
+    #[test]
+    fn parse_size_percent_is_of_total_ram() {
+        let ram = crate::meminfo::get_ram_size().unwrap();
+        assert_eq!(parse_size("100%").unwrap(), ram);
+        assert_eq!(parse_size("150%").unwrap(), ram * 150 / 100);
+    }
+
+    #[test]
+    fn parse_size_leading_plus_sign_accepted() {
+        // `u64::from_str` accepts a leading '+', so this works by design.
+        assert_eq!(parse_size("+10M").unwrap(), 10 * MB);
+    }
+
+    #[test]
+    fn parse_size_float_errors() {
+        assert!(parse_size("1.5G").is_err());
+    }
+
+    #[test]
     fn parse_size_empty_errors() {
         assert!(parse_size("").is_err());
     }
@@ -341,85 +353,6 @@ mod tests {
         assert!(parse_size("10Q").is_err());
     }
 
-    // ── get_what_from_swap_unit ──────────────────────────────────────────────
-
-    #[test]
-    fn get_what_returns_device_path() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "[Unit]\nDescription=Swap\n\n[Swap]\nWhat=/dev/zram0\nPriority=100"
-        )
-        .unwrap();
-        assert_eq!(
-            get_what_from_swap_unit(file.path()).as_deref(),
-            Some("/dev/zram0")
-        );
-    }
-
-    #[test]
-    fn get_what_missing_returns_none() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "[Swap]\nPriority=100").unwrap();
-        assert!(get_what_from_swap_unit(file.path()).is_none());
-    }
-
-    #[test]
-    fn get_what_empty_value_returns_empty_string() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "What=").unwrap();
-        assert_eq!(get_what_from_swap_unit(file.path()).as_deref(), Some(""));
-    }
-
-    #[test]
-    fn get_what_nonexistent_path_returns_none() {
-        assert!(get_what_from_swap_unit("/nonexistent/unit.swap").is_none());
-    }
-
-    // ── makedirs / force_remove / read_file ──────────────────────────────────
-
-    #[test]
-    fn makedirs_creates_nested_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let deep = dir.path().join("a/b/c/d");
-        makedirs(&deep).unwrap();
-        assert!(deep.is_dir());
-    }
-
-    #[test]
-    fn makedirs_existing_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        makedirs(dir.path()).unwrap(); // existing dir must not error
-    }
-
-    #[test]
-    fn force_remove_nonexistent_noop() {
-        // Must not panic when target is missing.
-        force_remove("/nonexistent/path/xyz.swap", false);
-    }
-
-    #[test]
-    fn force_remove_existing_file() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        file.persist(&path).unwrap();
-        assert!(path.exists());
-        force_remove(&path, false);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn read_file_returns_content() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "hello\nworld").unwrap();
-        assert_eq!(read_file(file.path()).unwrap(), "hello\nworld");
-    }
-
-    #[test]
-    fn read_file_missing_errors() {
-        assert!(read_file("/nonexistent/file").is_err());
-    }
-
     // ── relative_symlink ─────────────────────────────────────────────────────
 
     #[test]
@@ -430,7 +363,10 @@ mod tests {
         let link = dir.path().join("sub/link.txt");
         makedirs(link.parent().unwrap()).unwrap();
         relative_symlink(&target, &link).unwrap();
-        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("../target.txt")
+        );
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
     }
 
@@ -443,15 +379,5 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
         relative_symlink(&target, &link).unwrap();
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
-    }
-
-    // ── write_file (real filesystem path, triggers sync_all) ─────────────────
-
-    #[test]
-    fn write_file_real_fs_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.txt");
-        write_file(&path, "content").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
     }
 }

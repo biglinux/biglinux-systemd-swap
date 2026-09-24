@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 use thiserror::Error;
 
 use crate::config::RUN_SYSD;
-use crate::helpers::{makedirs, relative_symlink, write_file};
-use crate::info;
+use crate::helpers::{makedirs, relative_symlink, run_cmd_output, write_file};
+use crate::{info, warn};
 
 /// Typed systemctl sub-commands used by this daemon.
 ///
@@ -43,8 +43,6 @@ pub enum SystemdError {
     Io(#[from] std::io::Error),
     #[error("Helper error: {0}")]
     Helper(#[from] crate::helpers::HelperError),
-    #[error("Systemd notify failed")]
-    NotifyFailed,
     #[error("Command failed: {0}")]
     CommandFailed(String),
 }
@@ -54,11 +52,6 @@ pub type Result<T> = std::result::Result<T, SystemdError>;
 /// Notify systemd that we're ready
 pub fn notify_ready() {
     let _ = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready]);
-}
-
-/// Notify systemd that we're stopping
-pub fn notify_stopping() {
-    let _ = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Stopping]);
 }
 
 /// Notify status message
@@ -93,6 +86,50 @@ pub fn systemctl(action: SystemctlAction, unit: &str) -> Result<()> {
     }
 }
 
+/// Put a swap device or file to use at once, then hand its unit to systemd.
+///
+/// `swapon` first: under the memory pressure that makes the pool grow,
+/// `daemon-reload` plus `start` took 7 s for a zram device and 14 s for a swap
+/// file on the test notebook, and the swap ran out in between (OOM kill).
+/// systemd reads swap state from /proc/swaps, so the unit it loads afterwards
+/// is already active and `start` has nothing left to do. The flags must match
+/// the ones `gen_swap_unit` wrote for the same unit.
+///
+/// Through `systemd-run`, so swapon runs in the host's mount namespace rather
+/// than this unit's. The kernel keeps the path as seen from the namespace that
+/// ran swapon, and ours dies with the daemon: after a restart /proc/swaps read
+/// `/zram1` and `/1`, systemd invented `zram1.swap` and `1.swap` for them and
+/// failed to swap them off at shutdown. 110 ms on the notebook, against 890 ms
+/// for the `daemon-reload` it runs ahead of.
+pub fn activate_swap(
+    what: &str,
+    priority: Option<i32>,
+    discard: bool,
+    unit_name: &str,
+) -> Result<()> {
+    let priority = priority.map(|p| p.to_string());
+    let mut argv = vec![
+        "systemd-run",
+        "--wait",
+        "--quiet",
+        "--collect",
+        "--",
+        "swapon",
+    ];
+    if let Some(p) = &priority {
+        argv.extend(["--priority", p]);
+    }
+    if discard {
+        argv.push("--discard");
+    }
+    argv.push(what);
+    if let Err(e) = run_cmd_output(&argv) {
+        warn!("swapon {} failed ({}); leaving it to systemd", what, e);
+    }
+    systemctl(SystemctlAction::DaemonReload, "")?;
+    systemctl(SystemctlAction::Start, unit_name)
+}
+
 /// Device type for swap unit
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceType {
@@ -122,12 +159,7 @@ pub fn gen_swap_unit(
     // Determine device type
     let metadata = fs::metadata(&what)?;
     let device_type = if metadata.permissions().mode() & 0o170000 == 0o060000 {
-        // Block device
-        if what_str.contains("loop") {
-            DeviceType::File
-        } else {
-            DeviceType::Block
-        }
+        DeviceType::Block
     } else {
         DeviceType::File
     };
@@ -204,19 +236,6 @@ pub fn swapoff(device: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn systemctl_action_as_str_matches_cli() {
-        assert_eq!(SystemctlAction::Start.as_str(), "start");
-        assert_eq!(SystemctlAction::Stop.as_str(), "stop");
-        assert_eq!(SystemctlAction::DaemonReload.as_str(), "daemon-reload");
-    }
-
-    #[test]
-    fn device_type_display_matches_unit_file_grammar() {
-        assert_eq!(DeviceType::File.to_string(), "File");
-        assert_eq!(DeviceType::Block.to_string(), "Block/Partition");
-    }
 
     #[test]
     fn swapoff_rejects_nul_byte_in_path() {

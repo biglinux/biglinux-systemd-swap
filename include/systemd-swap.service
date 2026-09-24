@@ -2,15 +2,50 @@
 Description=Manage swap spaces on zram, files and partitions.
 Wants=pre-systemd-swap.service
 After=pre-systemd-swap.service
+# Rate limit for Restart=on-failure below (these two keys live in [Unit]).
+StartLimitIntervalSec=5min
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/systemd-swap start
-ExecStop=/usr/bin/systemd-swap stop
+# No ExecStop=: stopping the service only ends the daemon, by SIGTERM. The swap
+# it set up stays active, because a swapoff has to fit every swapped page back
+# into RAM at once — a restart under load sat in it until TimeoutStopSec.
+# The next start adopts the zram devices and swap files; at shutdown systemd
+# deactivates the generated .swap units itself.
 RemainAfterExit=yes
+# Service is resilient-by-design: transient kernel/module hiccups should
+# auto-recover without disabling swap management for the whole boot.
+#
+# The limit is what makes a *permanent* failure visible. With RestartSec=5s and
+# systemd's defaults (StartLimitIntervalSec=10s, Burst=5) the rate limit can
+# never trip — two restarts per interval — so a config error that fails before
+# ExecStart even runs retries forever. Measured on a live host: 4637 restarts
+# over two days, no swap the whole time, and the unit still reporting
+# "activating (auto-restart)" instead of "failed". Ten attempts over five
+# minutes still absorbs a slow zram module load; after that the unit lands in
+# `failed` where `systemctl --failed` reports it.
+Restart=on-failure
+RestartSec=5s
 TimeoutStopSec=300
 OOMScoreAdjust=-500
 CapabilityBoundingSet=CAP_SYS_ADMIN
+# Every device this daemon touches is created *while it runs*: zram nodes come
+# from /sys/class/zram-control/hot_add, loop nodes from losetup on the writeback
+# store. So the policy has to stay open — and `auto` only stays open while no
+# DeviceAllow= exists. Adding even one entry silently promotes `auto` to
+# `strict`, and then the allowlist is the whole world the daemon can see.
+#
+# That is not theory. `DeviceAllow=block-loop rw` was added here to make loop
+# teardown explicit, and it locked out /dev/zram* as a side effect: mkswap on a
+# fresh zram device returned EPERM, `ZramPool: start_primary failed` was the only
+# trace, and swapfc quietly absorbed everything the pool should have compressed —
+# on a 31 GB host, 7 GB of disk swap where zram was the design.
+#
+# Do not add DeviceAllow= here. Narrowing device access buys little against a
+# unit that already holds CAP_SYS_ADMIN with @swap and @mount, and costs the
+# next device group somebody forgets.
 DevicePolicy=auto
 NoNewPrivileges=yes
 PrivateNetwork=yes
@@ -19,12 +54,43 @@ ProtectControlGroups=yes
 ProtectHome=read-only
 ProtectHostname=yes
 ProtectProc=invisible
-ProtectSystem=full
+# ProtectSystem=strict makes the entire filesystem read-only except for the
+# paths listed in ReadWritePaths. The service writes to:
+#   /sys/block/zram*/{disksize,comp_algorithm,mem_limit,reset,...}  via /sys
+#   /sys/class/zram-control/{hot_add,hot_remove}                     via /sys
+#   /sys/module/zswap/parameters/*                                   via /sys
+#   /run/systemd/swap/                                               runtime state
+#   /run/systemd/system/                                             generated units
+#   /swapfile/                              swapfiles and zram writeback stores
+#
+# Every entry must exist when the mount namespace is built, or namespacing
+# fails and the daemon never runs at all: ExecStart is not even reached and the
+# unit exits 226/NAMESPACE. A stale `/var/lib/systemd-swap` sat in this list
+# while nothing in the tree created or used it, and that is exactly what
+# happened — the host booted with no swap and retried forever.
+#
+# Hence the `-` on /swapfile: pre-systemd-swap.service creates it before this
+# unit runs (After= above), but if that one-shot ever fails, `-` degrades the
+# daemon to zram-only instead of taking the whole service down. Kernel paths
+# need no prefix; /sys and /run always exist. /proc/sys/vm is not listed:
+# the daemon writes no sysctl (pre-systemd-swap sets min_free_kbytes in its
+# own unit).
+#
+# Only add a path here that something in this repository actually writes, and
+# keep it in sync with `unit_readwritepaths_are_all_reachable` in
+# tests/boundaries.rs. An administrator who moves swapfile_path must add the
+# new path through a drop-in, or the daemon will find it read-only.
+#
+# /etc is read-only at runtime; configuration is read on start only.
+ProtectSystem=strict
+ReadWritePaths=/sys /run -/swapfile
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service @swap @mount
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
