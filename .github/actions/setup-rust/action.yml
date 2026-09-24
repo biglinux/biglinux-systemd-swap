@@ -81,7 +81,9 @@ runs:
 
     # cargo helpers — taiki-e/install-action is precompiled & fast
     - name: install cargo tools
-      # taiki-e/install-action pinned to commit SHA (v2.44.x range)
-      uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2
+      # taiki-e/install-action v2.87.19 pinned to commit SHA. Its manifest decides
+      # which tool versions "latest" means: v2.44 installed cargo-audit 0.21, which
+      # cannot parse the current advisory database, and cargo-deny 0.18.
+      uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5
       with:
         tool: ${{ inputs.cargo-tools }}
