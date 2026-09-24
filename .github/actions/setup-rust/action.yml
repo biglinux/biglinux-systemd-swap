@@ -14,9 +14,9 @@ inputs:
     required: false
     default: "common"
   cargo-tools:
-    description: Space-separated cargo bin tools to install.
+    description: Comma-separated cargo bin tools to install (taiki-e/install-action syntax).
     required: false
-    default: "cargo-deny cargo-audit cargo-machete cargo-nextest"
+    default: "cargo-deny,cargo-audit,cargo-machete,cargo-nextest"
   cache-key:
     description: Extra cache key suffix.
     required: false
