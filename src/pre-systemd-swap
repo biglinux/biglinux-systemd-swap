@@ -3,6 +3,9 @@
 # Pre-systemd-swap setup script
 # Prepares btrfs subvolumes and disables existing swap partitions
 #
+# Log messages are English and untranslated, matching the daemon: this
+# package ships no gettext catalogs.
+#
 
 set -euo pipefail
 
@@ -11,12 +14,14 @@ set -euo pipefail
 # =============================================================================
 
 die() {
-    echo "ERROR: $1" >&2
+    # printf is safer than echo: handles leading '-' and backslash sequences
+    # predictably across bash/dash/posix shells.
+    printf 'ERROR: %s\n' "$1" >&2
     exit 1
 }
 
 log_info() {
-    echo "INFO: $1"
+    printf 'INFO: %s\n' "$1"
 }
 
 # =============================================================================
@@ -29,12 +34,17 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     die "Configuration file not found: $CONFIG_FILE"
 fi
 
-# Extract swapfc_path folder name (second component of path)
-# Using grep with anchored pattern to avoid partial matches
-swapfcfolder=$(grep "^swapfc_path=" "$CONFIG_FILE" | cut -d'/' -f2)
+# Extract swapfile_path folder name (second component of path).
+# Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
+# grep returns exit 1 when no match; || true prevents set -e from aborting.
+swapfcfolder=$(grep -E "^(swapfile_path|swapfc_path)=" "$CONFIG_FILE" \
+    | tail -n 1 \
+    | cut -d'=' -f2 \
+    | cut -d'/' -f2 || true)
 
 if [[ -z "$swapfcfolder" ]]; then
-    die "Could not determine swapfc_path from $CONFIG_FILE"
+    # Default path mirrors defaults::SWAPFILE_PATH in src/defaults.rs
+    swapfcfolder="swapfile"
 fi
 
 # =============================================================================
@@ -49,12 +59,12 @@ if [[ -z "$rootpartition" ]]; then
 fi
 
 # Get filesystem type
-fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || echo "unknown")
+fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || printf '%s\n' "unknown")
 
 # Check if path is a btrfs subvolume and get top level id
 toplevelid=""
 if [[ "$fstype" == "btrfs" ]] && [[ -d "/$swapfcfolder" ]]; then
-    toplevelid=$(btrfs subvolume show "/$swapfcfolder" 2>/dev/null | grep -i "top level id" | awk '{print $4}' || echo "")
+    toplevelid=$(btrfs subvolume show "/$swapfcfolder" 2>/dev/null | grep -i "top level id" | awk '{print $4}' || printf '')
 fi
 
 # =============================================================================
@@ -78,13 +88,85 @@ if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
         fi
     fi
 
-    # Add to fstab if not already present
-    if ! grep -q "@${swapfcfolder}" /etc/fstab; then
+    # =========================================================================
+    # /etc/fstab idempotency contract
+    # -------------------------------------------------------------------------
+    # Re-run = no dup lines. Rules:
+    #  1. Skip if any line already mentions "@${swapfcfolder}" (legacy guard).
+    #  2. Skip if exact line already present (grep -qxF).
+    #  3. Build new fstab in unique tempfile, rename(2) atomic-swap via mv -f,
+    #     then sync -f to flush data + dir entry (mv alone = rename only, NOT
+    #     fsync; /etc/fstab is boot-critical so we force durability).
+    #  4. Trap covers EXIT INT TERM HUP (RETURN trap does NOT fire on signals
+    #     under bash). Unique $tmp per call -> safe vs concurrent invocations.
+    # =========================================================================
+    fstab_append_idempotent() {
+        local line="$1"
+        local fstab="${2:-/etc/fstab}"
+        # Exact-line match (-x), fixed string (-F), quiet (-q).
+        if grep -qxF -- "$line" "$fstab"; then
+            return 0
+        fi
+        # Run the mutation inside a subshell so the trap is scoped to this
+        # invocation only: it fires when the subshell exits (return-path,
+        # error-path, or signal) and never persists into the caller's shell.
+        # This prevents two problems:
+        #   - leaked $tmp across repeated calls where an error path returned
+        #     before disarming the trap (subsequent calls would overwrite the
+        #     trap and orphan the prior tempfile);
+        #   - clobbering caller-installed EXIT/INT/TERM/HUP traps on success.
+        #
+        # Every step checks its own status. `set -e` would not: the caller runs
+        # this under `if !`, and bash ignores errexit for everything inside that
+        # condition, subshells included. With `set -e` alone a SIGTERM during
+        # the copy removed the tempfile, the append recreated it holding one
+        # line, and mv replaced /etc/fstab with it.
+        (
+            local tmp
+            tmp=$(mktemp "${fstab}.XXXXXX") || exit 1
+            # shellcheck disable=SC2064  # intentional early expansion of $tmp
+            trap "rm -f -- '$tmp'" EXIT
+            # shellcheck disable=SC2064
+            trap "rm -f -- '$tmp'; exit 1" INT TERM HUP
+            # Preserve mode/owner of original.
+            if command -v chmod >/dev/null 2>&1; then
+                chmod --reference="$fstab" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+            fi
+            if command -v chown >/dev/null 2>&1; then
+                chown --reference="$fstab" "$tmp" 2>/dev/null || true
+            fi
+            cat "$fstab" > "$tmp" || exit 1
+            # Ensure trailing newline before append.
+            if [[ -s "$tmp" && "$(tail -c1 "$tmp")" != "" ]]; then
+                printf '\n' >> "$tmp" || exit 1
+            fi
+            printf '%s\n' "$line" >> "$tmp" || exit 1
+            # rename(2) only -- NOT a fsync. We sync below for durability.
+            mv -f "$tmp" "$fstab" || exit 1
+            # Force flush of file data + parent dir entry to disk. /etc/fstab is
+            # boot-critical: a power-loss after mv but before writeback could
+            # otherwise leave a zero-length file post-reboot.
+            sync -f "$fstab" 2>/dev/null || true
+            # mv succeeded -- disarm trap so EXIT does not try to rm the now
+            # vanished tempfile path.
+            trap - EXIT INT TERM HUP
+        )
+    }
+
+    # Legacy guard: skip entirely if any entry already references @subvol.
+    # -F treats the user-controlled $swapfcfolder as a literal string so a
+    # value with regex metacharacters (e.g., "swap.dir") matches itself.
+    if ! grep -qF -- "@${swapfcfolder}" /etc/fstab; then
         log_info "Adding subvolume to /etc/fstab"
         uuid=$(blkid -s UUID -o value "$rootpartition")
         if [[ -n "$uuid" ]]; then
-            echo "UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults 0 0" >>/etc/fstab
+            fstab_line="UUID=$uuid /$swapfcfolder btrfs subvol=/@$swapfcfolder,defaults,noatime 0 0"
+            if ! fstab_append_idempotent "$fstab_line" /etc/fstab; then
+                umount /mnt 2>/dev/null || true
+                die "Failed to update /etc/fstab atomically"
+            fi
         else
+            umount /mnt 2>/dev/null || true
             die "Could not get UUID for $rootpartition"
         fi
     fi
@@ -109,15 +191,61 @@ if [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
 fi
 
 # =============================================================================
+# Swap Directory
+# =============================================================================
+
+# systemd-swap.service runs under ProtectSystem=strict, where ReadWritePaths=
+# can only unlock a path that already exists when the mount namespace is built,
+# and the read-only root leaves the daemon unable to create one itself. The
+# btrfs branch above made and mounted the directory; on every other filesystem
+# nothing had, and the daemon then met a read-only /swapfile and could not
+# place a single swap file. Idempotent, so re-running costs nothing.
+mkdir -p "/$swapfcfolder"
+
+# =============================================================================
 # Disable Existing Swap Partitions
 # =============================================================================
 
 # Find swap partitions (type 8x devices with SWAP)
 while IFS= read -r partswap; do
+    # A device with a unit systemd-swap generated is the running pool, which
+    # the daemon adopts. This helper runs before every start of the daemon, not
+    # only at boot, and swapping the pool off here forced every compressed page
+    # back into RAM on a plain restart.
+    if grep -qsxF '# Generated by systemd-swap' "/run/systemd/system/dev-$partswap.swap"; then
+        continue
+    fi
     if [[ -n "$partswap" ]]; then
         log_info "Disabling swap partition: /dev/$partswap"
         swapoff "/dev/$partswap" 2>/dev/null || true
     fi
 done < <(lsblk -lno NAME,FSTYPE | awk '$2 == "swap" {print $1}')
+
+# =============================================================================
+# Dynamic Kernel Tuning
+# =============================================================================
+
+# Calculate min_free_kbytes: 3% of RAM, capped at 512MB (524288 KB).
+# Gives kswapd enough headroom to reclaim before OOM.
+total_ram_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+if [[ -n "$total_ram_kb" ]]; then
+    min_free=$((total_ram_kb * 3 / 100))
+    if [[ "$min_free" -gt 524288 ]]; then
+        min_free=524288
+    fi
+    log_info "Setting vm.min_free_kbytes = $min_free (3% of ${total_ram_kb}KB)"
+    printf '%s\n' "$min_free" > /proc/sys/vm/min_free_kbytes
+fi
+
+# Transparent Huge Pages: madvise instead of the kernel default 'always'.
+# 'always' promotes anonymous ranges to 2MB huge pages aggressively, wasting
+# RAM via internal fragmentation on a desktop (a process touching part of a 2MB
+# page keeps the whole page) — measured ~hundreds of MB of AnonHugePages.
+# 'madvise' only uses huge pages where explicitly requested (madvise(MADV_HUGEPAGE)).
+thp="/sys/kernel/mm/transparent_hugepage/enabled"
+if [[ -w "$thp" ]]; then
+    log_info "Setting transparent_hugepage = madvise"
+    echo madvise > "$thp"
+fi
 
 log_info "Pre-systemd-swap setup complete"

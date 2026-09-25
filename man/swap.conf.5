@@ -1,4 +1,4 @@
-.TH SWAP.CONF 5 "NOVEMBER 2020" 4.4 swap.conf
+.TH SWAP.CONF 5 "SEPTEMBER 2026" "systemd-swap 0.2.0" swap.conf
 .\" disable french spacing
 .ss 12 0
 .SH NAME
@@ -11,7 +11,8 @@ swap.conf \- systemd-swap configuration files.
 .IP /usr/share/systemd-swap/swap-default.conf
 .SH DESCRIPTION
 .PP
-These configuration files control swapd, swapfc, zram and zswap.
+These configuration files control the zram pool, zswap and the dynamic swap files managed by
+.BR systemd-swap (8).
 .SH CONFIGURATION DIRECTORIES AND PRECEDENCE
 .PP
 The default configuration is defined during compilation, so a configuration file is only needed when it is necessary to deviate from those defaults.
@@ -29,114 +30,121 @@ It is recommended to prefix all filenames in those subdirectories with a two-dig
 To disable a configuration file supplied by the vendor, the recommended way is to place a symlink to /dev/null in the configuration directory in /etc/, with the same filename as the vendor configuration file.
 .SH OPTIONS
 .PP
-The following options are available in the "zswap" section:
-.I
-.IP zswap_enabled=
-Whether zswap is enabled, set to yes/y/1/true to enable zswap. Zswap is a compressed
-.B writeback cache
-for swap files and swap partitions.
-.I
-.IP zswap_compressor=
-Compressor algorithm for zswap, Linux currently supports
-.BR lzo ,
-.BR lz4 ,
-.BR zstd ,
-.B zlo-rle
+Sizes accept the suffixes K, M, G and T, or a percentage of RAM where noted.
+In auto mode the daemon injects the values marked "auto" in
+/usr/share/systemd-swap/swap-default.conf; any value set in a configuration
+file takes precedence.
+.SS Mode
+.IP swap_mode=
+.B auto
+(default) picks zram with swap files when the swap file system is btrfs, ext4
+or xfs with at least as much free space as RAM, and zram alone otherwise
+(live systems included).
+.B zram+swapfile
+uses a zram pool as primary swap and swap files for overflow.
+.B zswap+swapfile
+uses zswap in front of swap files.
+.B zram
+uses the zram pool only.
+.B manual
+enables only the subsystems switched on by
+.BR zram_enabled= ,
+.B zswap_enabled=
 and
-.BR zl4hc .
-.I
-.IP zswap_max_pool_percent=
-Percentage of ram that can be compressed.
-.I
-.IP zswap_zpool=
-Set wich compressed memory pool to use, if unsure use z3fold.
-.PP
-The following options are available in the "zram" section:
-.I
-.IP zram_enabled=
-Whether zram is enabled, set to yes/y/1/true to enable zram.
-Zram is a compressed
-.B ram
-disk.
-.I
+.BR swapfile_enabled= .
+.B disabled
+leaves swap alone and exits.
+.IP "zram_enabled=, zswap_enabled=, swapfile_enabled="
+Manual mode only. yes/y/1/true enables the subsystem; anything else leaves it off.
+.SS Zram pool
 .IP zram_size=
-Set the ammount of memory per zram device.
-.I
-.IP zram_count=
-Set the ammount of zram devices.
-(IGNORED IF KVER > 4.8, TO BE REMOVED)
-.I
+Upper bound on the total disksize of the pool, as a size or a percentage of RAM
+(default 150%, at least 50%). The pool starts with one device at 95% of
+.B zram_mem_limit
+and grows toward this bound only by the RAM compression has saved.
+.IP zram_mem_limit=
+Ceiling on the RAM the pool may hold, as a size or a percentage of RAM
+(default 50%). 0 removes it; the pool is then sized from
+.B zram_size
+directly and can exhaust RAM on incompressible data.
 .IP zram_alg=
-Compressor algorithm for zram, Linux currently supports
-.BR lzo ,
-.BR lz4 ,
-.BR zstd ,
-.B zlo-rle
-and
-.BR zl4hc .
-.I
+Compression algorithm (default zstd): any listed in
+/sys/block/zram*/comp_algorithm, such as lz4 or lzo.
 .IP zram_prio=
-Set the swap priority for zram devices.
+Swap priority of the first device (default 32767). Each added device gets the next lower one.
+.IP zram_max_devices=
+Most devices the pool may grow to, 1\(en8 (default 8).
+.IP zram_expand_threshold=
+Expand when the pool is fuller than this percentage, 50\(en95 (default 85).
+.IP zram_contract_threshold=
+Contract when the pool stays under this percentage, 5\(en50 (default 20).
+.IP zram_expand_cooldown=
+Seconds between expansions, 5\(en120 (default 10).
+.IP zram_contract_stability=
+Seconds the pool must stay under the contract threshold before a device is
+removed, 30\(en600 (default 120).
+.IP zram_check_interval=
+Longest wait between checks in seconds, 3\(en300 (default 5). Memory pressure (PSI) wakes the monitor at once.
+.SS Zram writeback
 .PP
-The following options are available in the "swapfc" section:
-.I
-.IP swapfc_enabled=
-Whether swapfc is enabled, set to yes/y/1/true to enable swapfc.
-Swapfc stands for "swap file chunked" and dynamically allocates new swap files when memory is running low and removes its swap files when not in use.
-.I
-.IP swapfc_force_use_loop=
-Whether swapfc should always create swap files on loopback devices.
-Usefull on if kernel doesn't support swapfiles on btrfs (<5.0), don't use unless you're sure what you are doing.
-.I
-.IP swapfc_frequency=
-The frequency in seconds swapfc should run at.
-.I
-.IP swapfc_chunk_size=
-Size of the swap files created by swapfc.
-.I
-.IP swapfc_max_count=
-Maximum number of swap files swapfc should create.
-(Note that most Linux distributions only support 32.)
-.I
-.IP swapfc_min_count=
-Minimum number of swap files swapfc should create on startup.
-Defaults to 0 to only allocate swap files when running lon free memory.
-.I
-.IP swapfc_free_ram_perc=
-Ammount of memory free (in percent) when swapfc creates a new swap file.
-(Note that this applies only to the first swap file.)
-.I
-.IP swapfc_free_swap_perc=
-Ammount of swap free (in percent) when swapfc creates a new swap file.
-.I
-.IP swapfc_remove_free_swap_perc=
-Ammount of swap free (in percent) when swapfc removes a swap file.
-.I
-.IP swapfc_priority=
-The priority given to swapfiles created by swapfc (decreasing by one for every swap file created).
-When at 0 it skips to -2. Max 32767.
-.I
-.IP swapfc_path=
-Path to folder where swapfc creates its swap files.
+Pages nobody has read for a while are written to a sparse file behind a loop
+device, one per zram device, and their RAM is returned. Needs a kernel with
+CONFIG_ZRAM_WRITEBACK and CONFIG_ZRAM_TRACK_ENTRY_ACTIME.
+.IP zram_writeback_size=
+Disk budget for the whole pool, as a size or a percentage of RAM (default 50%).
+0 turns writeback off.
+.IP zram_writeback_path=
+Directory for the backing files (default: swapfile_path). It must stay inside
+the service unit's ReadWritePaths=.
+.IP zram_writeback_threshold=
+Only write back while the pool holds more than this percentage of
+.B zram_mem_limit
+(default 20).
+.IP zram_writeback_idle=
+Seconds a page must go untouched to qualify (default 3600).
+.IP zram_writeback_interval=
+Seconds between passes (default 300).
+.SS Zswap
+.IP zswap_compressor=
+Compression algorithm (default zstd).
+.IP zswap_zpool=
+Compressed memory allocator (default zsmalloc).
+.IP zswap_max_pool_percent=
+Largest share of RAM the compressed pool may use (default 45).
+.IP zswap_shrinker_enabled=
+1 moves cold pages to disk when the pool is full (default 1).
+.IP zswap_accept_threshold=
+Resume accepting pages when the pool drops to this percentage (default 80).
+.SS Swap files
 .PP
-The following options are only for loop devices.
-.I
-.IP swapfc_nocow=
-Whether to disable CoW on swap file.
-.I
-.IP swapfc_directio=
-Whether to use direct_io.
-.I
-.IP swapfc_force_preallocated=
-Whether to preallocated files.
-.PP
-The following options are available in the "swapd" section:
-.I
-.IP swapd_auto_swapon=
-Whether to automatically find and activate all swap devices.
-.I
-.IP swapd_prio=
-Priority for devices found by swapd_auto_swapon.
+Preallocated files (NOCOW on btrfs) created under memory pressure and removed
+when idle. Their priority is below zram, so the kernel uses them once zram is
+full.
+.IP swapfile_path=
+Directory for the swap files (default /swapfile).
+.IP swapfile_chunk_size=
+Size of each file (default 512M).
+.IP swapfile_max_count=
+Most files at once, capped at 28 (default 28).
+.IP swapfile_min_count=
+Files kept even when swap is idle (default 1).
+.IP swapfile_free_ram_perc=
+No file is removed while free RAM is under this percentage (default 20). A file is created at once, whatever this says, when free RAM is under 10% and total free swap is under two chunks.
+.IP swapfile_free_swap_perc=
+Create a file when the files' free space falls under this percentage (default 40).
+.IP swapfile_remove_free_swap_perc=
+Remove a file when the files' free space is above this percentage (default 70).
+.IP swapfile_frequency=
+Seconds between checks while files exist, 1\(en86400 (default 1).
+.IP swapfile_shrink_threshold=
+A file less used than this percentage may be removed, 10\(en50 (default 30).
+.IP swapfile_safe_headroom=
+Percentage the remaining files must keep free after absorbing a removed file's
+pages, 20\(en60 (default 40).
+.SS MGLRU
+.IP mglru_min_ttl_ms=
+Pages younger than this many milliseconds are not reclaimed (default 1000;
+0 leaves the kernel setting alone). Needs a kernel with MGLRU.
 .SH AUTHOR
 Vilgot Fredenberg <vilgot@fredenberg.xyz>
 .SH "SEE ALSO"

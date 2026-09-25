@@ -1,11 +1,16 @@
-// Helper utilities for systemd-swap
+//! General-purpose utilities for systemd-swap.
+//!
+//! Provides config-value lookup helpers, unit conversions, and other
+//! small functions shared across multiple modules.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
 
@@ -36,9 +41,17 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> Result<String> {
 }
 
 /// Write string to file
+/// For sysfs/procfs (virtual filesystems), writes without fsync.
+/// For real filesystem paths, calls sync_all to ensure persistence.
 pub fn write_file<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
+    let path = path.as_ref();
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
+    // Skip fsync for virtual filesystems (sysfs, procfs) where it's meaningless
+    let path_str = path.to_string_lossy();
+    if !path_str.starts_with("/sys/") && !path_str.starts_with("/proc/") {
+        file.sync_all()?;
+    }
     Ok(())
 }
 
@@ -81,16 +94,6 @@ pub fn relative_symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link_name: Q)
     Ok(())
 }
 
-/// Run a command and return success status
-pub fn run_cmd(cmd: &[&str]) -> Result<bool> {
-    let status = Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(status.success())
-}
-
 /// Run a command and capture stdout
 pub fn run_cmd_output(cmd: &[&str]) -> Result<String> {
     let output = Command::new(cmd[0])
@@ -104,32 +107,7 @@ pub fn run_cmd_output(cmd: &[&str]) -> Result<String> {
     } else {
         Err(HelperError::CommandFailed(format!(
             "{} exited with {}",
-            cmd[0],
-            output.status
-        )))
-    }
-}
-
-/// Run systemctl action
-pub fn systemctl(action: &str, unit: &str) -> Result<()> {
-    let args = if action == "daemon-reload" {
-        vec!["systemctl", "daemon-reload"]
-    } else {
-        vec!["systemctl", action, unit]
-    };
-
-    let status = Command::new(args[0])
-        .args(&args[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(HelperError::CommandFailed(format!(
-            "systemctl {} {} failed",
-            action, unit
+            cmd[0], output.status
         )))
     }
 }
@@ -153,19 +131,14 @@ pub fn find_swap_units() -> Vec<String> {
     units
 }
 
+/// Cache for filesystem type detection (avoids repeated findmnt calls)
+static FS_TYPE_CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
-/// Get What= value from swap unit file
-pub fn get_what_from_swap_unit<P: AsRef<Path>>(path: P) -> Option<String> {
-    let content = read_file(path).ok()?;
-    for line in content.lines() {
-        if let Some(value) = line.strip_prefix("What=") {
-            return Some(value.to_string());
-        }
-    }
-    None
+fn fs_cache() -> &'static Mutex<HashMap<PathBuf, String>> {
+    FS_TYPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Get the filesystem type of a given path
+/// Get the filesystem type of a given path (cached)
 pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
     let path = path.as_ref();
     // Use parent if path doesn't exist
@@ -178,13 +151,28 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
             .unwrap_or_else(|| Path::new("/").to_path_buf())
     };
 
+    // Check cache first
+    if let Ok(cache) = fs_cache().lock() {
+        if let Some(cached) = cache.get(&check_path) {
+            return Some(cached.clone());
+        }
+    }
+
     let output = Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "--target", &check_path.to_string_lossy()])
+        .args([
+            "-n",
+            "-o",
+            "FSTYPE",
+            "--target",
+            &check_path.to_string_lossy(),
+        ])
         .stdout(Stdio::piped())
         .output()
         .ok()?;
 
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    let fstype = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_lowercase();
     if fstype.is_empty() {
         // Fallback to root filesystem
         if check_path != Path::new("/") {
@@ -193,22 +181,60 @@ pub fn get_fstype<P: AsRef<Path>>(path: P) -> Option<String> {
             None
         }
     } else {
+        // Store in cache
+        if let Ok(mut cache) = fs_cache().lock() {
+            cache.insert(check_path, fstype.clone());
+        }
         Some(fstype)
     }
 }
 
-/// Filesystems that support swap files well
-pub const SWAPFILE_SUPPORTED_FS: &[&str] = &["btrfs", "ext4", "xfs"];
+/// Common size-unit constants
+pub const KB: u64 = 1024;
+pub const MB: u64 = 1024 * KB;
+pub const GB: u64 = 1024 * MB;
 
-/// Check if a filesystem supports swap files
-pub fn supports_swapfiles(fstype: &Option<String>) -> bool {
-    match fstype {
-        Some(fs) => SWAPFILE_SUPPORTED_FS.contains(&fs.as_str()),
-        None => false,
+/// Parse size string to bytes.
+///
+/// Accepts: `"512M"`, `"1G"`, `"256K"`, `"2T"`, `"50%"` (percentage of RAM),
+/// or raw bytes `"1073741824"`.
+pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("Empty size string".to_string());
     }
+
+    // Handle percentage (e.g., "50%", "100%")
+    if let Some(pct) = s.strip_suffix('%') {
+        let percent: u64 = pct
+            .parse()
+            .map_err(|_| format!("Invalid percentage: {}", s))?;
+        let ram =
+            crate::meminfo::get_ram_size().map_err(|e| format!("Failed to get RAM size: {}", e))?;
+        return Ok(ram * percent / 100);
+    }
+
+    // Handle size with suffix (e.g., "1G", "512M")
+    if s.len() > 1 {
+        let (num_part, suffix) = s.split_at(s.len() - 1);
+        let multiplier = match suffix.to_ascii_uppercase().as_str() {
+            "K" => Some(KB),
+            "M" => Some(MB),
+            "G" => Some(GB),
+            "T" => Some(GB * 1024),
+            _ => None,
+        };
+        if let Some(m) = multiplier {
+            return num_part
+                .parse::<u64>()
+                .map(|n| n * m)
+                .map_err(|_| format!("Invalid size: {}", s));
+        }
+    }
+
+    // No suffix — treat as raw bytes
+    s.parse::<u64>().map_err(|_| format!("Invalid size: {}", s))
 }
-
-
 
 // Logging macros
 #[macro_export]
@@ -239,4 +265,119 @@ macro_rules! debug {
             eprintln!("DEBUG: {}", format!($($arg)*))
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_size (pure logic) ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_size_kib_suffix() {
+        assert_eq!(parse_size("512K").unwrap(), 512 * KB);
+    }
+
+    #[test]
+    fn parse_size_mib_suffix() {
+        assert_eq!(parse_size("128M").unwrap(), 128 * MB);
+    }
+
+    #[test]
+    fn parse_size_gib_suffix() {
+        assert_eq!(parse_size("2G").unwrap(), 2 * GB);
+    }
+
+    #[test]
+    fn parse_size_tib_suffix() {
+        assert_eq!(parse_size("1T").unwrap(), 1024 * GB);
+    }
+
+    #[test]
+    fn parse_size_lowercase_suffix() {
+        assert_eq!(parse_size("100m").unwrap(), 100 * MB);
+    }
+
+    #[test]
+    fn parse_size_raw_bytes() {
+        assert_eq!(parse_size("1048576").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn parse_size_trims_whitespace() {
+        assert_eq!(parse_size("  4K  ").unwrap(), 4 * KB);
+    }
+
+    #[test]
+    fn parse_size_zero_with_or_without_suffix() {
+        for v in ["0", "0M", "0G", "0%"] {
+            assert_eq!(parse_size(v).unwrap(), 0, "{v}");
+        }
+    }
+
+    #[test]
+    fn parse_size_percent_is_of_total_ram() {
+        let ram = crate::meminfo::get_ram_size().unwrap();
+        assert_eq!(parse_size("100%").unwrap(), ram);
+        assert_eq!(parse_size("150%").unwrap(), ram * 150 / 100);
+    }
+
+    #[test]
+    fn parse_size_leading_plus_sign_accepted() {
+        // `u64::from_str` accepts a leading '+', so this works by design.
+        assert_eq!(parse_size("+10M").unwrap(), 10 * MB);
+    }
+
+    #[test]
+    fn parse_size_float_errors() {
+        assert!(parse_size("1.5G").is_err());
+    }
+
+    #[test]
+    fn parse_size_empty_errors() {
+        assert!(parse_size("").is_err());
+    }
+
+    #[test]
+    fn parse_size_garbage_errors() {
+        assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn parse_size_negative_errors() {
+        assert!(parse_size("-100").is_err());
+    }
+
+    #[test]
+    fn parse_size_invalid_suffix_errors() {
+        assert!(parse_size("10Q").is_err());
+    }
+
+    // ── relative_symlink ─────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_symlink_creates_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "data").unwrap();
+        let link = dir.path().join("sub/link.txt");
+        makedirs(link.parent().unwrap()).unwrap();
+        relative_symlink(&target, &link).unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("../target.txt")
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
+    }
+
+    #[test]
+    fn relative_symlink_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "data").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink("/nonexistent", &link).unwrap();
+        relative_symlink(&target, &link).unwrap();
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
+    }
 }

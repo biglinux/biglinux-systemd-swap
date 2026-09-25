@@ -8,6 +8,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::config::{Config, WORK_DIR};
+use crate::defaults;
 use crate::helpers::{makedirs, read_file, write_file};
 use crate::{error, info, warn};
 
@@ -32,20 +33,6 @@ pub struct ZswapBackup {
     pub parameters: HashMap<String, String>,
 }
 
-impl ZswapBackup {
-    /// Restore original zswap parameters
-    pub fn restore(&self) -> Result<()> {
-        info!("Zswap: restore configuration: start");
-        for (path, value) in &self.parameters {
-            if let Err(e) = write_file(path, value) {
-                warn!("Failed to restore {}: {}", path, e);
-            }
-        }
-        info!("Zswap: restore configuration: complete");
-        Ok(())
-    }
-}
-
 /// Check if zswap is available (module loaded)
 pub fn is_available() -> bool {
     Path::new(ZSWAP_MODULE).is_dir()
@@ -66,7 +53,10 @@ fn set_enabled(enable: bool) -> Result<()> {
     let enabled_path = format!("{}/enabled", ZSWAP_PARAMS);
     let value = if enable { "1" } else { "0" };
     write_file(&enabled_path, value)?;
-    info!("Zswap: {} zswap", if enable { "enabled" } else { "disabled" });
+    info!(
+        "Zswap: {} zswap",
+        if enable { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 
@@ -95,17 +85,29 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     }
     info!("Zswap: backup current configuration: complete");
 
-    // Get config values
-    // Default to "1" because if start() is called, zswap should be enabled
+    // Get config values with adaptive defaults
     let enabled = config.get("zswap_enabled").unwrap_or("1");
-    let compressor = config.get("zswap_compressor").unwrap_or("lz4");  // LZ4 for speed
-    let max_pool_percent = config.get("zswap_max_pool_percent").unwrap_or("50");  // Unified 50%
-    let shrinker_enabled = config.get("zswap_shrinker_enabled").unwrap_or("1");  // Enable shrinker
-    let accept_threshold = config.get("zswap_accept_threshold").unwrap_or("90");
+    let compressor = config
+        .get("zswap_compressor")
+        .unwrap_or(defaults::ZSWAP_COMPRESSOR);
+    let zpool = config.get("zswap_zpool").unwrap_or(defaults::ZSWAP_ZPOOL);
+    let shrinker_enabled = config
+        .get("zswap_shrinker_enabled")
+        .unwrap_or(defaults::ZSWAP_SHRINKER_ENABLED);
+    let accept_threshold = config
+        .get("zswap_accept_threshold")
+        .unwrap_or(defaults::ZSWAP_ACCEPT_THRESHOLD);
+
+    // Use config value if set, otherwise fall back to the well-tested default.
+    let max_pool_percent = config
+        .get_opt("zswap_max_pool_percent")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(defaults::ZSWAP_MAX_POOL_PERCENT);
+    let max_pool_str = max_pool_percent.to_string();
 
     info!(
-        "Zswap: Enable: {}, Comp: {}, Max pool %: {}, Shrinker: {}, Accept threshold: {}%",
-        enabled, compressor, max_pool_percent, shrinker_enabled, accept_threshold
+        "Zswap: Enable: {}, Comp: {}, Zpool: {}, Max pool %: {} (default: {}%), Shrinker: {}, Accept threshold: {}%",
+        enabled, compressor, zpool, max_pool_str, defaults::ZSWAP_MAX_POOL_PERCENT, shrinker_enabled, accept_threshold
     );
 
     info!("Zswap: set new parameters: start");
@@ -123,20 +125,22 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     // Write parameters (except enabled) - order matters for some kernels
     let params = [
         ("compressor", compressor),
-        ("max_pool_percent", max_pool_percent),
+        ("zpool", zpool),
+        ("max_pool_percent", &max_pool_str),
         ("shrinker_enabled", shrinker_enabled),
         ("accept_threshold_percent", accept_threshold),
     ];
 
     for (name, value) in params {
         let path = format!("{}/{}", ZSWAP_PARAMS, name);
-        // Skip if parameter file doesn't exist (varies by kernel version)
         if !Path::new(&path).exists() {
-            warn!("Zswap: {} not supported on this kernel (file not found)", name);
+            warn!(
+                "Zswap: {} not supported on this kernel (file not found)",
+                name
+            );
             continue;
         }
         if let Err(e) = write_file(&path, value) {
-            // Some parameters may not be writable or supported on certain kernels
             if name == "shrinker_enabled" || name == "accept_threshold_percent" {
                 warn!("Zswap: {} not writable on this kernel: {}", name, e);
             } else {
@@ -146,13 +150,13 @@ pub fn start(config: &Config) -> Result<ZswapBackup> {
     }
 
     // Now enable zswap if requested
-    let should_enable = enabled == "1" || enabled.to_lowercase() == "y" || enabled.to_lowercase() == "yes";
+    let should_enable =
+        enabled == "1" || enabled.to_lowercase() == "y" || enabled.to_lowercase() == "yes";
     if should_enable {
         if let Err(e) = set_enabled(true) {
             error!("Failed to enable zswap: {}", e);
         }
     } else if was_enabled {
-        // If it was enabled before but config says disabled, keep it disabled
         info!("Zswap: keeping disabled as per configuration");
     }
 
@@ -178,6 +182,9 @@ pub fn get_status() -> Option<ZswapStatus> {
     }
     if let Ok(v) = read_file(params_dir.join("compressor")) {
         status.compressor = v.trim().to_string();
+    }
+    if let Ok(v) = read_file(params_dir.join("zpool")) {
+        status.zpool = v.trim().to_string();
     }
     if let Ok(v) = read_file(params_dir.join("max_pool_percent")) {
         status.max_pool_percent = v.trim().parse().unwrap_or(20);
@@ -205,6 +212,9 @@ pub fn get_status() -> Option<ZswapStatus> {
         status.same_filled_pages = read_stat("same_filled_pages");
         status.pool_limit_hit = read_stat("pool_limit_hit");
         status.duplicate_entry = read_stat("duplicate_entry");
+        status.stored_incompressible_pages = read_stat("stored_incompressible_pages");
+        status.reject_compress_fail = read_stat("reject_compress_fail");
+        status.reject_compress_poor = read_stat("reject_compress_poor");
     }
 
     Some(status)
@@ -216,6 +226,7 @@ pub struct ZswapStatus {
     // Configuration parameters
     pub enabled: bool,
     pub compressor: String,
+    pub zpool: String,
     pub max_pool_percent: u8,
     pub shrinker_enabled: bool,
     pub accept_threshold_percent: u8,
@@ -235,28 +246,126 @@ pub struct ZswapStatus {
     pub pool_limit_hit: u64,
     /// Duplicate entries found
     pub duplicate_entry: u64,
+    /// Incompressible pages stored
+    pub stored_incompressible_pages: u64,
+    /// Compression failures
+    pub reject_compress_fail: u64,
+    /// Poor compression rejections
+    pub reject_compress_poor: u64,
 }
 
 impl ZswapStatus {
-    /// Calculate pool utilization percentage
-    pub fn pool_utilization_percent(&self, mem_total: u64) -> u8 {
-        if mem_total == 0 || self.max_pool_percent == 0 {
-            return 0;
-        }
-        let max_pool_size = mem_total * self.max_pool_percent as u64 / 100;
-        if max_pool_size == 0 {
-            return 0;
-        }
-        ((self.pool_size * 100) / max_pool_size).min(100) as u8
-    }
-
-    /// Calculate compression ratio (compressed/uncompressed)
-    pub fn compression_ratio(&self, page_size: u64) -> f64 {
-        let uncompressed = self.stored_pages * page_size;
-        if uncompressed == 0 {
+    /// Physical RAM usage by pool (percentage of total RAM)
+    pub fn ram_usage_percent(&self) -> f64 {
+        let ram_bytes = crate::meminfo::get_ram_size().unwrap_or(1);
+        if ram_bytes == 0 {
             return 0.0;
         }
-        self.pool_size as f64 / uncompressed as f64
+        (self.pool_size as f64 / ram_bytes as f64) * 100.0
+    }
+
+    /// Compression ratio (original / compressed)
+    pub fn compression_ratio(&self) -> f64 {
+        if self.pool_size == 0 || self.stored_pages == 0 {
+            return 1.0;
+        }
+        let page_size = crate::meminfo::get_page_size();
+        let original_bytes = self.stored_pages * page_size;
+        original_bytes as f64 / self.pool_size as f64
+    }
+
+    /// Log a summary of the current status
+    pub fn log_summary(&self) {
+        if !self.enabled {
+            return;
+        }
+        let pool_mb = self.pool_size / (1024 * 1024);
+        let page_size = crate::meminfo::get_page_size();
+        let stored_mb = (self.stored_pages * page_size) / (1024 * 1024);
+        info!(
+            "Zswap: pool={}MB ({}% of RAM), stored={}MB, ratio={:.2}x, wb={}, rejects={}/{}/{}",
+            pool_mb,
+            self.ram_usage_percent() as u32,
+            stored_mb,
+            self.compression_ratio(),
+            self.written_back_pages,
+            self.reject_compress_fail,
+            self.reject_compress_poor,
+            self.reject_reclaim_fail,
+        );
+        if self.pool_limit_hit > 0 {
+            warn!("Zswap: pool limit hit {} time(s)", self.pool_limit_hit);
+        }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_status() -> ZswapStatus {
+        ZswapStatus {
+            enabled: true,
+            compressor: "zstd".to_string(),
+            ..ZswapStatus::default()
+        }
+    }
+
+    // ── compression_ratio ────────────────────────────────────────────────────
+
+    #[test]
+    fn compression_ratio_empty_pool_is_one() {
+        let s = sample_status();
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compression_ratio_zero_stored_pages_is_one() {
+        let s = ZswapStatus {
+            pool_size: 1024,
+            stored_pages: 0,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compression_ratio_computed() {
+        let page = crate::meminfo::get_page_size();
+        // 1 page compressed into 1 page (worst case)
+        let s = ZswapStatus {
+            pool_size: page,
+            stored_pages: 1,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 1.0).abs() < 1e-9);
+
+        // 4 pages of original data compressed to 1 page → ~4x
+        let s = ZswapStatus {
+            pool_size: page,
+            stored_pages: 4,
+            ..sample_status()
+        };
+        assert!((s.compression_ratio() - 4.0).abs() < 1e-9);
+    }
+
+    // ── ram_usage_percent ────────────────────────────────────────────────────
+
+    #[test]
+    fn ram_usage_percent_zero_when_pool_empty() {
+        let s = sample_status();
+        assert_eq!(s.ram_usage_percent(), 0.0);
+    }
+
+    #[test]
+    fn ram_usage_percent_bounded() {
+        // Real RAM size is unknown in test but must be >0.
+        let s = ZswapStatus {
+            pool_size: 1024 * 1024,
+            ..sample_status()
+        };
+        let pct = s.ram_usage_percent();
+        assert!(pct >= 0.0);
+        assert!(pct <= 100.0, "got {}", pct);
+    }
+}

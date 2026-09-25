@@ -10,3 +10,50 @@ post_install() {
         systemctl enable systemd-swap.service
     fi
 }
+
+## arg 1:  the new package version
+## arg 2:  the old package version
+post_upgrade() {
+    # Reload unit files so systemd picks up any changes to the .service files
+    # shipped by this package.
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # Restart so the new binary applies now. Safe under load: stopping only
+    # ends the daemon, the active swap stays in place and the new instance
+    # adopts it (a restart holding ~3.5 GB of swap took 2 s on a 3.7 GB host).
+    # Releases before this one swapped everything off on stop, which is why
+    # upgrades used to wait for the next boot; the daemon-reload above has
+    # already dropped that ExecStop=, so the old daemon only gets SIGTERM.
+    systemctl try-restart systemd-swap.service >/dev/null 2>&1 || true
+
+    # pre-systemd-swap is a oneshot that mutates /etc/fstab; do not restart it
+    # on upgrade — it already ran at boot. Leave the active state untouched.
+}
+
+## arg 1:  the old package version
+pre_remove() {
+    # Stop and disable units before files disappear. Ignore failures so
+    # removal still proceeds on a half-broken system. Stopping the daemon
+    # leaves the swap it set up active until the next shutdown, so removal
+    # never forces swapped pages back into RAM. pre-systemd-swap is a
+    # oneshot — usually inactive — but stop it defensively in case
+    # RemainAfterExit was ever toggled.
+    if systemctl is-active --quiet systemd-swap.service 2>/dev/null; then
+        systemctl stop systemd-swap.service >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet pre-systemd-swap.service 2>/dev/null; then
+        systemctl stop pre-systemd-swap.service >/dev/null 2>&1 || true
+    fi
+    systemctl disable systemd-swap.service >/dev/null 2>&1 || true
+    systemctl disable pre-systemd-swap.service >/dev/null 2>&1 || true
+}
+
+## arg 1:  the old package version
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Nothing runs after the next boot to delete the swap files, and an active
+    # swap file cannot be unlinked now.
+    printf '%s\n' \
+        ">>> The swap set up by systemd-swap stays active until the next reboot." \
+        ">>> After it, the files in /swapfile (or your swapfile_path) can be deleted."
+}

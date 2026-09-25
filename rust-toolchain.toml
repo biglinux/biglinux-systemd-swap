@@ -1,0 +1,5 @@
+# Pinned toolchain. Bumps are deliberate PRs with quality-check --full run.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"
