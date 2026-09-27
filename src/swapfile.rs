@@ -59,6 +59,31 @@ impl SwapFileInfo {
     }
 }
 
+const MB: u64 = 1024 * 1024;
+
+/// SwapFree under which the disk tier grows while RAM is short: 15% of
+/// SwapTotal, 5 points clear of systemd-oomd's default `SwapUsedLimit=90%`,
+/// and never under two chunks, which is what small hosts reach first.
+fn headroom_floor(total: u64, chunk: u64) -> u64 {
+    (total / 100 * 15).max(chunk.saturating_mul(2))
+}
+
+/// Size of one file that brings SwapFree back to twice `floor`, never below
+/// `chunk`, rounded up to whole MiB for mkswap.
+///
+/// Twice the floor, not a share of SwapTotal: on the 4 GB notebook the floor is
+/// the two-chunk minimum, a 25% share sat under it, and the file came out at
+/// one chunk -- 512 MB against random data arriving at 128 MB/s, with each
+/// create taking 9 s on the saturated HDD. oomd killed the load 20 s later.
+fn headroom_file_size(floor: u64, free: u64, chunk: u64) -> u64 {
+    floor
+        .saturating_mul(2)
+        .saturating_sub(free)
+        .div_ceil(MB)
+        .saturating_mul(MB)
+        .max(chunk)
+}
+
 /// SwapFC configuration
 #[derive(Debug)]
 pub struct SwapFileConfig {
@@ -200,11 +225,11 @@ impl SwapFileConfig {
 /// SwapFC manager - supports btrfs, ext4, and xfs
 pub struct SwapFile {
     config: SwapFileConfig,
+    /// How many of our files are active. Not the highest index: contraction
+    /// removes whichever file is safest, so the numbers in use have gaps.
     allocated: u32,
     /// True if path is on btrfs (for subvolume/nodatacow handling)
     is_btrfs: bool,
-    /// Track the size of each allocated file (for proper cleanup and stats)
-    file_sizes: Vec<u64>,
     /// Cooldown: last time a swap file was created (prevents runaway creation)
     last_creation: Option<Instant>,
     /// Escalating cooldown in seconds (doubles on each creation, resets when swap is consumed)
@@ -341,7 +366,6 @@ impl SwapFile {
             config: swapfile_config,
             allocated: 0,
             is_btrfs,
-            file_sizes: Vec::new(),
             last_creation: None,
             cooldown_secs: if is_zswap_active { 5 } else { 15 },
             prev_free_swap: 100,
@@ -515,12 +539,6 @@ impl SwapFile {
                     }
                 }
             }
-
-            // Update file_sizes if we tracked this file.
-            // Guard against idx==0 (would underflow (idx-1) as usize).
-            if idx > 0 && idx <= self.file_sizes.len() as u32 {
-                self.file_sizes.remove((idx - 1) as usize);
-            }
         }
 
         self.allocated = self.allocated.saturating_sub(1);
@@ -541,39 +559,14 @@ impl SwapFile {
     /// Adopt swap files that already exist from a previous run.
     /// Called before create_initial_swap() so we never swapoff active files on restart.
     fn adopt_existing_swapfiles(&mut self) {
-        let existing = self.get_swapfiles_info();
-        if existing.is_empty() {
-            return;
-        }
-
-        let mut max_num: u32 = 0;
-
-        for info in &existing {
-            if let Some(name) = info.path.file_name() {
-                if let Ok(n) = name.to_string_lossy().parse::<u32>() {
-                    max_num = max_num.max(n);
-                }
-            }
-        }
-
-        if max_num > 0 {
-            info!(
-                "swapFC: adopting {} existing file(s) (max index: {})",
-                existing.len(),
-                max_num
-            );
-            self.allocated = max_num;
-
-            // Reconstruct file_sizes from disk metadata
-            self.file_sizes.clear();
-            for i in 1..=max_num {
-                let path = self.config.path.join(i.to_string());
-                let size = path
-                    .metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(self.config.chunk_size);
-                self.file_sizes.push(size);
-            }
+        let count = self
+            .get_swapfiles_info()
+            .iter()
+            .filter(|f| self.find_file_index(&f.path).is_some())
+            .count() as u32;
+        if count > 0 {
+            info!("swapFC: adopting {} existing file(s)", count);
+            self.allocated = count;
         }
     }
 
@@ -595,7 +588,7 @@ impl SwapFile {
         self.cleanup_stale_disk_files();
 
         while self.allocated < self.config.min_count {
-            if let Err(e) = self.create_swapfile() {
+            if let Err(e) = self.create_swapfile(self.config.chunk_size) {
                 warn!(
                     "swapFC: initial swap creation stopped at {}/{}: {}",
                     self.allocated, self.config.min_count, e
@@ -759,34 +752,50 @@ impl SwapFile {
                 // Count files with no data yet to avoid pre-allocating more than needed
                 let unused_count = swap_files.iter().filter(|f| f.used_bytes == 0).count();
 
-                // EMERGENCY TRIGGER: critical RAM pressure.
-                let emergency_ram_threshold: u8 = 10;
-
-                // Low RAM alone does not justify a disk file. These files sit
-                // at priority -1, below the zram tier, so the kernel reaches
-                // them only once zram is full -- while real swap headroom
-                // remains, every page goes to zram and the file we create stays
-                // at Used=0. `unused_count` does not stop this: contraction
-                // deletes the idle file, and the next tick creates it again, so
-                // the pair flaps under sustained pressure (observed: 9 creates,
-                // 7 deletes in one boot, none ever used). Gate on the whole
-                // swap stack, not zram's share of it: create only when kernel
-                // SwapFree falls under two chunks, i.e. zram itself is nearly
-                // spent and the disk tier is about to be the one in use.
-                let swap_headroom = get_effective_swap_usage()
-                    .map(|u| u.swap_free)
-                    .unwrap_or(u64::MAX);
-                let swap_nearly_full = swap_headroom < self.config.chunk_size.saturating_mul(2);
-                if free_ram < emergency_ram_threshold
-                    && swap_nearly_full
+                // HEADROOM TRIGGER: the whole swap stack is running out while
+                // RAM is short. systemd-oomd's `ManagedOOMSwap=kill` acts once
+                // MemAvailable and SwapFree are both under 10% of their totals
+                // (SwapUsedLimit=90%), so the disk tier has to grow before that
+                // line, not after. The old gate -- free RAM under 10% and
+                // SwapFree under two chunks -- sat past it: 1 GB of a 16.8 GB
+                // stack is 94% used, and on the reference host oomd killed the
+                // browser in the same second the emergency file was created.
+                //
+                // Both halves are needed. These files sit at priority -1, below
+                // zram, so while the stack has headroom every page goes to zram
+                // and a new file stays at Used=0; contraction then deletes it
+                // and the next tick recreates it (observed: 9 creates, 7 deletes
+                // in one boot, none ever used). Keying on the whole stack keeps
+                // the file for when zram is nearly spent, and keying on RAM at
+                // `free_ram_perc` -- the same line contraction needs RAM above
+                // before it removes anything -- keeps the two from flapping.
+                let (swap_total, swap_free) = get_effective_swap_usage()
+                    .map(|u| (u.swap_total, u.swap_free))
+                    .unwrap_or((0, u64::MAX));
+                let floor = headroom_floor(swap_total, self.config.chunk_size);
+                if free_ram <= self.config.free_ram_perc
+                    && swap_free < floor
                     && unused_count < 2
                     && emergency_cooldown_ok
                 {
+                    // One file sized to restore the headroom, not a 512 MB
+                    // chunk every 5 s: the reference load moved 4 GB into swap
+                    // in 30 s. Only where the file is preallocated -- zero-filling
+                    // gigabytes elsewhere would add writeback under pressure.
+                    let refill = headroom_file_size(floor, swap_free, self.config.chunk_size);
+                    let size = if self.is_btrfs && self.has_enough_space(refill) {
+                        refill
+                    } else {
+                        self.config.chunk_size
+                    };
                     info!(
-                        "swapFC: EMERGENCY! free_ram={}% disk_free={}% unused={} - creating swap urgently",
-                        free_ram, disk_free_percent, unused_count
+                        "swapFC: swap headroom low! free_ram={}% swap_free={}MB/{}MB - creating {}MB",
+                        free_ram,
+                        swap_free / MB,
+                        swap_total / MB,
+                        size / MB
                     );
-                    if self.create_swapfile().is_ok() {
+                    if self.create_swapfile(size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
                     }
@@ -807,7 +816,7 @@ impl SwapFile {
                         "swapFC: all {} file(s) >= 85% full, disk_free={}% - expanding (stress trigger)",
                         swap_files.len(), disk_free_percent
                     );
-                    if self.create_swapfile().is_ok() {
+                    if self.create_swapfile(self.config.chunk_size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
                     }
@@ -820,7 +829,7 @@ impl SwapFile {
                         "swapFC: disk swap pressure! disk_free={}% < {}% (thresh) - expanding (cooldown={}s)",
                         disk_free_percent, swap_threshold, self.cooldown_secs
                     );
-                    if self.create_swapfile().is_ok() {
+                    if self.create_swapfile(self.config.chunk_size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = (self.cooldown_secs * 2).min(120);
                     }
@@ -910,9 +919,16 @@ impl SwapFile {
         }
     }
 
-    fn create_swapfile(&mut self) -> Result<()> {
-        let next_file_num = self.allocated + 1;
-        let chunk_size = self.config.chunk_size;
+    fn create_swapfile(&mut self, chunk_size: u64) -> Result<()> {
+        // The lowest number no active file of ours holds. `allocated + 1` was
+        // used before, and after contraction left only `/swapfile/3` a restart
+        // counted three files and shed the one real file as surplus.
+        let in_use: Vec<u32> = self
+            .get_swapfiles_info()
+            .iter()
+            .filter_map(|f| self.find_file_index(&f.path))
+            .collect();
+        let index = (1..).find(|n| !in_use.contains(n)).unwrap_or(1);
 
         if !self.has_enough_space(chunk_size) {
             if !self.disk_full {
@@ -927,31 +943,34 @@ impl SwapFile {
 
         notify_status(&format!(
             "Allocating swap file #{} ({}MB)...",
-            next_file_num,
+            index,
             chunk_size / (1024 * 1024)
         ));
         self.allocated += 1;
-        self.file_sizes.push(chunk_size);
 
-        let swapfile_path = self.config.path.join(self.allocated.to_string());
+        let swapfile_path = self.config.path.join(index.to_string());
 
         // Remove if exists
         force_remove(&swapfile_path, false);
 
         // One cleanup for every failure: a partial file would hold disk space
         // and the counters would name a swap file that does not exist.
+        info!(
+            "swapFC: creating preallocated file #{} ({}MB)",
+            index,
+            chunk_size / MB
+        );
         if let Err(e) = self.allocate_file(&swapfile_path, chunk_size) {
             {
                 force_remove(&swapfile_path, false);
                 self.allocated -= 1;
-                self.file_sizes.pop();
                 return Err(e);
             }
         }
         let swapfile = swapfile_path.to_string_lossy().to_string();
 
         // mkswap
-        let fs_label = format!("SWAP_btrfs_{}", self.allocated);
+        let fs_label = format!("SWAP_btrfs_{}", index);
         let status = Command::new("mkswap")
             .args(["-L", &fs_label])
             .arg(&swapfile)
@@ -960,7 +979,6 @@ impl SwapFile {
         if !status.success() {
             force_remove(&swapfile_path, false);
             self.allocated -= 1;
-            self.file_sizes.pop();
             return Err(SwapFileError::Io(std::io::Error::other("mkswap failed")));
         }
 
@@ -968,7 +986,7 @@ impl SwapFile {
             Path::new(&swapfile),
             None,
             None,
-            &format!("swapfile_{}", self.allocated),
+            &format!("swapfile_{}", index),
         )?;
 
         activate_swap(&swapfile, None, false, &unit_name)?;
@@ -1001,11 +1019,6 @@ impl SwapFile {
 
         // Btrfs supports preallocated NOCOW swapfiles. Avoid writing the
         // entire file under memory pressure just to reserve its extents.
-        info!(
-            "swapFC: creating preallocated file #{} ({}MB)",
-            self.allocated,
-            chunk_size / (1024 * 1024)
-        );
         if self.is_btrfs {
             run_cmd_output(&[
                 "fallocate",
@@ -1064,6 +1077,31 @@ mod tests {
             used_bytes: used,
             priority: 0,
         }
+    }
+
+    #[test]
+    fn headroom_file_doubles_the_floor() {
+        // The 2026-09-27 kill: 16.8 GB of swap with 1 GB free. 15% binds.
+        let (total, free) = (16_875_577_344u64, 1_013_567_488u64);
+        let floor = headroom_floor(total, 512 * MB);
+        assert_eq!(floor, total / 100 * 15);
+        let size = headroom_file_size(floor, free, 512 * MB);
+        assert_eq!(size % MB, 0);
+        assert!((0..MB).contains(&(free + size - 2 * floor)));
+    }
+
+    #[test]
+    fn small_hosts_double_the_two_chunk_floor() {
+        // The notebook: 2303 MB of swap, 809 MB free when the trigger fired.
+        let floor = headroom_floor(2303 * MB, 512 * MB);
+        assert_eq!(floor, 1024 * MB);
+        assert_eq!(headroom_file_size(floor, 809 * MB, 512 * MB), 1239 * MB);
+    }
+
+    #[test]
+    fn headroom_file_is_never_below_one_chunk() {
+        assert_eq!(headroom_file_size(1024 * MB, 2048 * MB, 512 * MB), 512 * MB);
+        assert_eq!(headroom_file_size(0, 0, 512 * MB), 512 * MB);
     }
 
     #[test]

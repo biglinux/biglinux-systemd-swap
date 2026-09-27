@@ -129,7 +129,7 @@ Most files at once, capped at 28 (default 28).
 .IP swapfile_min_count=
 Files kept even when swap is idle (default 1).
 .IP swapfile_free_ram_perc=
-No file is removed while free RAM is under this percentage (default 20). A file is created at once, whatever this says, when free RAM is under 10% and total free swap is under two chunks.
+No file is removed while free RAM is under this percentage (default 20). Below it, a file is created at once when total free swap is under 15% of total swap (or two chunks), ahead of systemd-oomd's default 90% swap limit; on btrfs that file is sized to bring free swap back to twice that level.
 .IP swapfile_free_swap_perc=
 Create a file when the files' free space falls under this percentage (default 40).
 .IP swapfile_remove_free_swap_perc=

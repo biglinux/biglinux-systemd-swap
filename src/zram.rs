@@ -1551,21 +1551,29 @@ impl ZramPool {
     /// `growth_budget` can back at 1:1 -- churn is eating the reserve -- and
     /// the last device is cheap enough to empty back into RAM.
     ///
-    /// Expansion never creates that state; it appears when compressible data
-    /// leaves. Its slots come free but the RAM it saved goes with it, so a pool
-    /// grown on 4x data and then emptied advertises far more than `mem_limit`,
-    /// and an incompressible burst would meet the refusing-device hang that
-    /// `expansion_step` exists to prevent. Removing the lowest-priority device
-    /// takes its free slots away; it is also the device written last, so it is
-    /// the one most likely to be nearly empty. `swapoff` reads its pages back
-    /// into RAM, hence the requirement that they fit twice over.
+    /// It appears mostly when compressible data leaves. Its slots come free but
+    /// the RAM it saved goes with it, so a pool grown on 4x data and then
+    /// emptied advertises far more than `mem_limit`, and an incompressible
+    /// burst would meet the refusing-device hang that `expansion_step` exists
+    /// to prevent. Removing the lowest-priority device takes its free slots
+    /// away; it is also the device written last, so it is the one most likely
+    /// to be nearly empty. `swapoff` reads its pages back into RAM, hence the
+    /// requirement that they fit twice over.
+    ///
+    /// Only past the smallest step expansion takes. Expansion sizes a device
+    /// to exactly the backable amount, so without that slack the next pages to
+    /// arrive tipped the pool over: on the notebook, under the incident load,
+    /// zram4 was removed 5 s after it was created, at 99% utilisation and 0%
+    /// free RAM, and created again 6 s later. The slack sits inside the 35%
+    /// reserve `growth_budget` leaves under the real ceiling.
     fn overcommitted(&self, stats: &ZramPoolStats, last: &ZramStats) -> bool {
         let budget = self.growth_budget();
         if budget == 0 {
             return false;
         }
         let free_slots = stats.total_disksize.saturating_sub(stats.total_orig_data);
-        if free_slots <= backable_bytes(budget, stats.total_phys_used) {
+        let slack = self.ram_total * 5 / 100;
+        if free_slots <= backable_bytes(budget, stats.total_phys_used).saturating_add(slack) {
             return false;
         }
         crate::meminfo::get_mem_stats(&["MemAvailable"])
@@ -2019,6 +2027,23 @@ mod tests {
                 Some((mode, limit))
             })
             .collect()
+    }
+
+    #[test]
+    fn fresh_expansion_survives_the_pages_that_arrive_next() {
+        // Growth budget 6500 pages, slack 1000 (5% of the 20000-page RAM).
+        // At 3000 resident pages 3325 slots are backable; zram1 was added to
+        // exactly that. 100 more resident pages must not remove it again.
+        let overcommitted = |phys| {
+            let (_dir, pool) = quota_pool(&[(9000, phys, 9500), (0, 0, 2825)], 10000);
+            let stats = pool.get_pool_stats().unwrap();
+            let last = pool.devices.last().unwrap();
+            let last = get_device_stats(&last.sysfs_path, last.disksize).unwrap();
+            pool.overcommitted(&stats, &last)
+        };
+        assert!(!overcommitted(3100));
+        // Past the slack the pool really advertises slots it cannot back.
+        assert!(overcommitted(4500));
     }
 
     #[test]

@@ -75,12 +75,14 @@ lines, left the swap files at 0 bytes, and hung with no OOM kill.
 
 In `zram+swapfile` mode, swap files provide emergency overflow:
 
-- **Size**: 512MB each, created on demand
+- **Size**: 512MB each, created on demand; a headroom file on btrfs is sized
+  to bring total free swap back to twice the trigger level
 - **Maximum**: 28 files (14GB total capacity)
 - **Priority**: negative, below zram (kernel only uses them when zram is full)
 - **NOCOW**: enabled on btrfs (prevents deadlock under pressure)
 - **Created when**: free space in the files < 40%, every file ≥ 85% full, or
-  free RAM < 10% with total free swap under two chunks
+  free RAM ≤ 20% with total free swap under 15% (ahead of systemd-oomd's
+  default 90% swap limit)
 - **Removed when**: free space in the files > 70% and free RAM > 20%
 
 ### Zswap Mode
@@ -258,7 +260,7 @@ Memory pressure (free RAM < threshold)
 
 SwapFile monitor (1s interval while files exist):
   ├─ files' free space < 40% → create 512MB swap file
-  ├─ free_ram < 10% and swap nearly full → emergency: create immediately
+  ├─ free_ram ≤ 20% and total free swap < 15% → create a headroom file now
   └─ files' free space > 70% and free_ram > 20% → remove an idle file
 
 ZramPool monitor (5s interval):
