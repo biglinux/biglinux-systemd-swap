@@ -1738,6 +1738,9 @@ impl ZramPool {
         let pressure = crate::meminfo::PressureWait::new();
         let check_interval = Duration::from_secs(self.config.check_interval);
         let mut last_log = Instant::now();
+        // (devices, util%, phys%) as last logged. Expansion, contraction and
+        // writeback log their own events.
+        let mut last_status: Option<(u8, u8, u8)> = None;
 
         loop {
             pressure.wait(check_interval);
@@ -1751,18 +1754,30 @@ impl ZramPool {
                 None => continue,
             };
 
-            // Periodic log (every ~30s)
+            // Every ~30s, and the status only when it moved: another device,
+            // 5 points of slot use or 1 point of RAM.
             if last_log.elapsed() >= Duration::from_secs(30) {
                 last_log = Instant::now();
-                info!(
-                    "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB)",
+                let status = (
                     stats.device_count,
                     stats.utilization_percent,
-                    stats.compression_ratio,
                     stats.phys_usage_percent,
-                    stats.total_phys_used / (1024 * 1024),
-                    self.ram_total / (1024 * 1024)
                 );
+                let moved = last_status.is_none_or(|(devices, util, phys)| {
+                    devices != status.0 || util.abs_diff(status.1) >= 5 || phys != status.2
+                });
+                if moved {
+                    last_status = Some(status);
+                    info!(
+                        "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB)",
+                        stats.device_count,
+                        stats.utilization_percent,
+                        stats.compression_ratio,
+                        stats.phys_usage_percent,
+                        stats.total_phys_used / (1024 * 1024),
+                        self.ram_total / (1024 * 1024)
+                    );
+                }
 
                 self.warn_on_unbackable_slots(&stats);
             }
