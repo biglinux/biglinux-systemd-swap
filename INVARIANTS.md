@@ -138,9 +138,14 @@ not look for one.
   sets `SHUTDOWN` (`ctrlc`, `Ordering::Release`, read with `Acquire`); the
   blocking loops (`ZramPool::run_monitor`, `SwapFile::run`,
   `idle_until_shutdown`) return and the process exits, leaving every zram
-  device and swap file active. The next `start` adopts them
-  (`clear_previous_instance` only restores zswap settings and clears the work
-  directory); at shutdown systemd deactivates the generated `.swap` units.
+  device and swap file active. The loops wait in `poll` on a pipe
+  `request_shutdown` writes, so SIGTERM ends any wait at once; a pass in
+  progress finishes first: `main` joins the zram monitor thread, and
+  `KillMode=mixed` sends SIGTERM to the daemon alone, so a `mkswap` or
+  `systemctl` it runs completes. The next `start` adopts the devices and
+  files (`clear_previous_instance` only restores zswap settings and clears
+  the work directory); at shutdown systemd deactivates the generated `.swap`
+  units.
 - Reason: a swapoff has to fit every swapped page back into RAM at once, and
   a restart, an uninstall or a shutdown is no reason to do that. Measured on
   the 3.7 GB notebook: a restart under load sat in swapoff until
@@ -149,7 +154,6 @@ not look for one.
 - Validation: on a test machine, `systemctl restart systemd-swap` with two
   zram devices and two swap files active keeps `swapon --show` unchanged,
   logs no swapoff, and the new instance reports the devices as adopted. No
-  automated test: it needs systemd and root. The stop is bounded by the
-  loops' poll interval (`swapfile_frequency`, default 1 s;
-  `zram_check_interval`, default 5 s; the idle loop, 60 s).
+  automated test: it needs systemd and root. Stopping an idle daemon takes
+  under a second and the journal shows it exiting, not killed.
 

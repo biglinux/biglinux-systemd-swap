@@ -300,36 +300,73 @@ impl PressureWait {
     }
 
     /// Wait up to `timeout`; true when memory pressure ended the wait.
+    /// Shutdown ends it too, and a wait asked for after shutdown returns at once.
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
-        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use nix::poll::{poll, PollFd, PollFlags};
         use std::os::fd::AsFd;
 
+        if crate::is_shutdown() {
+            return false;
+        }
         let Some(trigger) = &self.trigger else {
-            std::thread::sleep(timeout);
+            sleep_until_shutdown(timeout);
             return false;
         };
-        let mut fds = [PollFd::new(trigger.as_fd(), PollFlags::POLLPRI)];
-        let timeout_ms = PollTimeout::try_from(timeout.as_millis().min(i32::MAX as u128) as i32)
-            .unwrap_or(PollTimeout::MAX);
-        match poll(&mut fds, timeout_ms) {
+        let mut fds = Vec::with_capacity(2);
+        fds.push(PollFd::new(trigger.as_fd(), PollFlags::POLLPRI));
+        if let Some(fd) = crate::shutdown_fd() {
+            fds.push(PollFd::new(fd, PollFlags::POLLIN));
+        }
+        let result = loop {
+            match poll(&mut fds, poll_timeout(timeout)) {
+                // SIGTERM can land on this thread before ctrlc's thread sets
+                // the flag; the pipe turns readable right after.
+                Err(nix::errno::Errno::EINTR) => continue,
+                other => break other,
+            }
+        };
+        match result {
             Ok(n) if n > 0 => {
-                // POLLERR: the monitored cgroup went away. Never true for
-                // the system-wide file, but a wait that returns at once
-                // forever would turn this into a busy loop.
-                let err = fds[0]
-                    .revents()
-                    .is_some_and(|r| r.contains(PollFlags::POLLERR));
-                if err {
-                    std::thread::sleep(timeout);
+                if crate::is_shutdown() {
+                    return false;
                 }
-                !err
+                let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+                // POLLERR, with or without POLLPRI: the monitored cgroup went
+                // away. Never true for the system-wide file, but a wait that
+                // returns at once forever would turn this into a busy loop.
+                if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                {
+                    sleep_until_shutdown(timeout);
+                    return false;
+                }
+                revents.contains(PollFlags::POLLPRI)
             }
             Ok(_) => false,
             Err(_) => {
-                std::thread::sleep(timeout);
+                sleep_until_shutdown(timeout);
                 false
             }
         }
+    }
+}
+
+fn poll_timeout(timeout: std::time::Duration) -> nix::poll::PollTimeout {
+    use nix::poll::PollTimeout;
+    PollTimeout::try_from(timeout.as_millis().min(i32::MAX as u128) as i32)
+        .unwrap_or(PollTimeout::MAX)
+}
+
+/// Sleep for `timeout`, or until shutdown is requested.
+fn sleep_until_shutdown(timeout: std::time::Duration) {
+    use nix::poll::{poll, PollFd, PollFlags};
+    match crate::shutdown_fd() {
+        Some(fd) => {
+            let _ = poll(
+                &mut [PollFd::new(fd, PollFlags::POLLIN)],
+                poll_timeout(timeout),
+            );
+        }
+        None => std::thread::sleep(timeout),
     }
 }
 
