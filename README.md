@@ -44,7 +44,8 @@ contracts based on demand:
   longer back and that device is cheap to empty
 - **Monitoring**: woken by the kernel the moment memory pressure starts
   (a PSI trigger, no cost while idle), otherwise every 5 seconds for slow
-  trends; new devices are `swapon`ed directly, before systemd adopts the unit
+  trends, up to a minute while memory and swap hold still; new devices are
+  `swapon`ed directly, before systemd adopts the unit
 
 Each zram device uses:
 - **Algorithm**: zstd (level 3) — best ratio-to-speed balance
@@ -258,12 +259,12 @@ Memory pressure (free RAM < threshold)
       │   └─ All disksize consumed → kernel falls back to swapfiles
       └─ zswap: compress in kernel pool → shrinker writes back to disk
 
-SwapFile monitor (1s interval while files exist):
+SwapFile monitor (every 1s, up to 60s while RAM and swap hold still):
   ├─ files' free space < 40% → create 512MB swap file
   ├─ free_ram ≤ 20% and total free swap < 15% → create a headroom file now
   └─ files' free space > 70% and free_ram > 20% → remove an idle file
 
-ZramPool monitor (5s interval):
+ZramPool monitor (every 5s, up to 60s while the pool holds still):
   ├─ utilization > 85% → add zram device (up to 8)
   └─ utilization < 20% (120s stable) → remove idle device
 ```

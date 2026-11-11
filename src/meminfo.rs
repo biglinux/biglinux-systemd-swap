@@ -299,6 +299,11 @@ impl PressureWait {
         }
     }
 
+    /// Whether memory pressure can end a wait, or only its timeout and shutdown.
+    pub fn has_trigger(&self) -> bool {
+        self.trigger.is_some()
+    }
+
     /// Wait up to `timeout`; true when memory pressure ended the wait.
     /// Shutdown ends it too, and a wait asked for after shutdown returns at once.
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
@@ -370,6 +375,49 @@ fn sleep_until_shutdown(timeout: std::time::Duration) {
     }
 }
 
+/// Wait between two checks of a monitor: `min` while its readings move,
+/// doubling up to `max` while they hold still.
+///
+/// The memory pressure trigger and shutdown end any wait at once, so `max`
+/// only bounds how late a monitor sees a change that neither announces.
+/// Without a trigger nothing announces a surge, and without the shutdown pipe
+/// a stop would sit out the whole wait, so then the wait stays at `min`.
+pub struct Backoff {
+    min: std::time::Duration,
+    max: std::time::Duration,
+    current: std::time::Duration,
+}
+
+impl Backoff {
+    /// 60 s: a host whose readings hold still is looked at once a minute. Swap
+    /// filling fast enough to run out between two looks stalls tasks on
+    /// memory, and the pressure trigger wakes the monitor for that.
+    pub const SETTLED_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new(min: std::time::Duration, pressure: &PressureWait) -> Self {
+        let max = if pressure.has_trigger() && crate::shutdown_fd().is_some() {
+            Self::SETTLED_MAX.max(min)
+        } else {
+            min
+        };
+        Self {
+            min,
+            max,
+            current: min,
+        }
+    }
+
+    /// The next wait: back to `min` unless the last check found nothing moving.
+    pub fn next(&mut self, settled: bool) -> std::time::Duration {
+        self.current = if settled {
+            (self.current * 2).min(self.max)
+        } else {
+            self.min
+        };
+        self.current
+    }
+}
+
 impl Default for PressureWait {
     fn default() -> Self {
         Self::new()
@@ -379,6 +427,31 @@ impl Default for PressureWait {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_while_settled() {
+        let secs = std::time::Duration::from_secs;
+        // Any open file stands in for the trigger: only its presence counts.
+        let pressure = PressureWait {
+            trigger: Some(File::open("/dev/null").unwrap()),
+        };
+        let mut b = Backoff::new(secs(5), &pressure);
+        let waits: Vec<u64> = [false, true, true, true, true, true, false]
+            .iter()
+            .map(|&settled| b.next(settled).as_secs())
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60, 5]);
+        // A minimum above the settled cap is never shortened.
+        assert_eq!(Backoff::new(secs(120), &pressure).next(true).as_secs(), 120);
+    }
+
+    #[test]
+    fn backoff_stays_put_without_trigger() {
+        let pressure = PressureWait { trigger: None };
+        let mut b = Backoff::new(std::time::Duration::from_secs(5), &pressure);
+        assert_eq!(b.next(true).as_secs(), 5);
+        assert_eq!(b.next(true).as_secs(), 5);
+    }
 
     #[test]
     fn test_get_ram_size() {
