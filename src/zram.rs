@@ -159,6 +159,15 @@ fn bd_count(sysfs_path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a device may hold incompressible pages (`huge_pages`, the eighth
+/// column of `mm_stat`). A kernel that does not report it counts as yes.
+fn may_hold_huge_pages(sysfs_path: &str) -> bool {
+    std::fs::read_to_string(format!("{}/mm_stat", sysfs_path))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(7)?.parse::<u64>().ok())
+        .is_none_or(|huge| huge > 0)
+}
+
 /// Bytes of writeback store one device may have, from the pool total, the
 /// device's own capacity, and the free space on the filesystem holding it.
 ///
@@ -1090,7 +1099,14 @@ impl ZramPool {
         // A quarter of a normal pass per tick. Under the pressure that brings
         // this on, writeback crawls -- 256 MB took 70 s on the notebook -- and
         // the pass holds the monitor thread for as long as it runs.
-        let targets = self.writeback_targets();
+        //
+        // Only devices that hold huge pages: `writeback huge` walks every slot
+        // of a device whatever it finds.
+        let targets: Vec<_> = self
+            .writeback_targets()
+            .into_iter()
+            .filter(|(_, sysfs)| may_hold_huge_pages(sysfs))
+            .collect();
         self.write_back(
             &targets,
             "huge",
@@ -2057,6 +2073,31 @@ mod tests {
         for request in writeback_requests(&pool) {
             assert_eq!(request, Some(("huge".to_string(), want.clone())));
         }
+    }
+
+    #[test]
+    fn relief_skips_devices_without_huge_pages() {
+        let (_dir, mut pool) = overcommit_pool(&[(1000, 1000, 20000), (1000, 1000, 20000)], 10000);
+        let page = crate::meminfo::get_page_size();
+        for (dev, huge) in pool.devices.iter().zip([0, 7]) {
+            std::fs::write(
+                format!("{}/mm_stat", dev.sysfs_path),
+                format!(
+                    "{} {} {} {} 0 0 0 {} 0",
+                    1000 * page,
+                    1000 * page,
+                    1000 * page,
+                    10000 * page,
+                    huge
+                ),
+            )
+            .unwrap();
+        }
+        let stats = pool.get_pool_stats().unwrap();
+        pool.relieve_overcommit(&stats);
+        let requests = writeback_requests(&pool);
+        assert_eq!(requests[0], None);
+        assert_eq!(requests[1].as_ref().map(|r| r.0.as_str()), Some("huge"));
     }
 
     #[test]
