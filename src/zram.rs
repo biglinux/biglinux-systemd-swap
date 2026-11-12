@@ -44,6 +44,18 @@ fn backable_bytes(mem_limit: u64, phys: u64) -> u64 {
     (mem_limit.saturating_sub(phys) as u128 * 95 / 100) as u64
 }
 
+/// Whether the pool held still between two checks, each read as (devices,
+/// slot use %, RAM share %): the same devices, slot use within a point and
+/// more than 20 points under `expand_threshold`, and the same share of RAM.
+/// 20 points leave a minute of kswapd filling slots without a stall short of
+/// the expansion line.
+fn pool_held_still(last: Option<(u8, u8, u8)>, now: (u8, u8, u8), expand_threshold: u8) -> bool {
+    now.1.saturating_add(20) < expand_threshold
+        && last.is_some_and(|(devices, util, phys)| {
+            devices == now.0 && util.abs_diff(now.1) <= 1 && phys == now.2
+        })
+}
+
 /// `disksize` the pool may add now, or 0 when the step is too small to be worth
 /// a hot_add, a loop, an mkswap and a `daemon-reload`.
 ///
@@ -157,6 +169,15 @@ fn bd_count(sysfs_path: &str) -> u64 {
         .ok()
         .and_then(|s| s.split_whitespace().next()?.parse().ok())
         .unwrap_or(0)
+}
+
+/// Whether a device may hold incompressible pages (`huge_pages`, the eighth
+/// column of `mm_stat`). A kernel that does not report it counts as yes.
+fn may_hold_huge_pages(sysfs_path: &str) -> bool {
+    std::fs::read_to_string(format!("{}/mm_stat", sysfs_path))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(7)?.parse::<u64>().ok())
+        .is_none_or(|huge| huge > 0)
 }
 
 /// Bytes of writeback store one device may have, from the pool total, the
@@ -838,7 +859,7 @@ impl ZramPool {
         // its full size the instant it is created, so the first device always
         // reads as having claimed everything before it has written a page --
         // that is exactly what starved the second store to a sliver. The pool
-        // total is instead enforced live in `run_writeback`, against the pages
+        // total is instead enforced live in `write_back`, against the pages
         // each store actually holds (`bd_stat`), which is the only bound that
         // stays true as pages fault back and the count falls again.
         writeback_share(self.config.writeback_total, free, disksize)
@@ -1090,7 +1111,14 @@ impl ZramPool {
         // A quarter of a normal pass per tick. Under the pressure that brings
         // this on, writeback crawls -- 256 MB took 70 s on the notebook -- and
         // the pass holds the monitor thread for as long as it runs.
-        let targets = self.writeback_targets();
+        //
+        // Only devices that hold huge pages: `writeback huge` walks every slot
+        // of a device whatever it finds.
+        let targets: Vec<_> = self
+            .writeback_targets()
+            .into_iter()
+            .filter(|(_, sysfs)| may_hold_huge_pages(sysfs))
+            .collect();
         self.write_back(
             &targets,
             "huge",
@@ -1118,8 +1146,10 @@ impl ZramPool {
         // configured total minus what the stores already hold. `bd_count` falls
         // as pages fault back, so this reopens without a restart. This is where
         // `writeback_total` is really enforced -- a store's file size is only a
-        // ceiling, and the stores' sizes together can exceed the budget.
-        let occupied_pages: u64 = targets.iter().map(|(_, s)| bd_count(s)).sum();
+        // ceiling, and the stores' sizes together can exceed the budget. Every
+        // store counts: a device this pass skips or one still draining holds
+        // its pages until they fault back.
+        let occupied_pages: u64 = self.devices.iter().map(|d| bd_count(&d.sysfs_path)).sum();
         let mut budget_pages = (self.config.writeback_total / 4096)
             .saturating_sub(occupied_pages)
             .min(want);
@@ -1503,6 +1533,19 @@ impl ZramPool {
         );
     }
 
+    /// Whether the pool's free slots come within 5% of RAM of what the RAM
+    /// left under `growth_budget` can back: the line `relieve_overcommit` and
+    /// `overcommitted` act on. Churn crosses it with slot use unchanged.
+    fn near_overcommit(&self, stats: &ZramPoolStats) -> bool {
+        let budget = self.growth_budget();
+        if budget == 0 || self.active_count() <= INITIAL_DEVICES as usize {
+            return false;
+        }
+        let free_slots = stats.total_disksize.saturating_sub(stats.total_orig_data);
+        free_slots.saturating_add(self.ram_total * 5 / 100)
+            > backable_bytes(budget, stats.total_phys_used)
+    }
+
     /// Check if pool should contract (remove last device)
     fn should_contract(&self, stats: &ZramPoolStats) -> bool {
         // 1. Never remove the first device. It is the one sized to the RAM
@@ -1717,14 +1760,24 @@ impl ZramPool {
             self.config.contract_threshold
         );
 
-        // Woken by memory pressure as soon as it starts, and otherwise every
-        // `check_interval` for the slow trends pressure does not announce.
+        // Woken by memory pressure as soon as it starts. Otherwise every
+        // `check_interval` while the pool moves, for the slow trends pressure
+        // does not announce, and up to `Backoff::SETTLED_MAX` while it holds still.
         let pressure = crate::meminfo::PressureWait::new();
-        let check_interval = Duration::from_secs(self.config.check_interval);
+        let mut backoff = crate::meminfo::Backoff::new(
+            Duration::from_secs(self.config.check_interval),
+            &pressure,
+        );
+        let mut settled = false;
+        // (devices, util%, phys%) at the last check.
+        let mut last_reading: Option<(u8, u8, u8)> = None;
         let mut last_log = Instant::now();
+        // (devices, util%, phys%) as last logged. Expansion, contraction and
+        // writeback log their own events.
+        let mut last_status: Option<(u8, u8, u8)> = None;
 
         loop {
-            pressure.wait(check_interval);
+            let woke = pressure.wait(backoff.next(settled));
 
             if crate::is_shutdown() {
                 break;
@@ -1732,21 +1785,52 @@ impl ZramPool {
 
             let stats = match self.get_pool_stats() {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    settled = false;
+                    continue;
+                }
             };
 
-            // Periodic log (every ~30s)
+            // Settled: the pool held still, no device is draining and the
+            // pool is not near overcommit.
+            let reading = (
+                stats.device_count,
+                stats.utilization_percent,
+                stats.phys_usage_percent,
+            );
+            settled = !woke
+                && pool_held_still(last_reading, reading, self.config.expand_threshold)
+                && self
+                    .devices
+                    .iter()
+                    .all(|d| d.state != ZramDeviceState::Draining)
+                && !self.near_overcommit(&stats);
+            last_reading = Some(reading);
+
+            // Every ~30s, and the status only when it moved: another device,
+            // 5 points of slot use or 1 point of RAM.
             if last_log.elapsed() >= Duration::from_secs(30) {
                 last_log = Instant::now();
-                info!(
-                    "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB)",
+                let status = (
                     stats.device_count,
                     stats.utilization_percent,
-                    stats.compression_ratio,
                     stats.phys_usage_percent,
-                    stats.total_phys_used / (1024 * 1024),
-                    self.ram_total / (1024 * 1024)
                 );
+                let moved = last_status.is_none_or(|(devices, util, phys)| {
+                    devices != status.0 || util.abs_diff(status.1) >= 5 || phys != status.2
+                });
+                if moved {
+                    last_status = Some(status);
+                    info!(
+                        "ZramPool: {} dev(s), util={}%, ratio={:.2}x, phys={}% ({}MB/{}MB)",
+                        stats.device_count,
+                        stats.utilization_percent,
+                        stats.compression_ratio,
+                        stats.phys_usage_percent,
+                        stats.total_phys_used / (1024 * 1024),
+                        self.ram_total / (1024 * 1024)
+                    );
+                }
 
                 self.warn_on_unbackable_slots(&stats);
             }
@@ -1781,6 +1865,7 @@ impl ZramPool {
 
             // Expansion decision
             if self.should_expand(&stats) {
+                settled = false;
                 if let Err(e) = self.expand(&stats) {
                     warn!("ZramPool: expansion failed: {}", e);
                 }
@@ -1793,6 +1878,7 @@ impl ZramPool {
 
             // Contraction decision
             if self.should_contract(&stats) {
+                settled = false;
                 if let Err(e) = self.contract() {
                     warn!("ZramPool: contraction failed: {}", e);
                 }
@@ -2057,6 +2143,78 @@ mod tests {
         for request in writeback_requests(&pool) {
             assert_eq!(request, Some(("huge".to_string(), want.clone())));
         }
+    }
+
+    #[test]
+    fn pool_held_still_thresholds() {
+        // swap.conf(5): slot use within a point, more than 20 points under
+        // the expansion threshold, same devices and RAM share.
+        assert!(!pool_held_still(None, (1, 20, 3), 80));
+        assert!(pool_held_still(Some((1, 20, 3)), (1, 21, 3), 80));
+        assert!(!pool_held_still(Some((1, 20, 3)), (1, 22, 3), 80));
+        assert!(!pool_held_still(Some((1, 20, 3)), (2, 20, 3), 80));
+        assert!(!pool_held_still(Some((1, 20, 3)), (1, 20, 4), 80));
+        assert!(pool_held_still(Some((1, 59, 3)), (1, 59, 3), 80));
+        assert!(!pool_held_still(Some((1, 60, 3)), (1, 60, 3), 80));
+    }
+
+    #[test]
+    fn near_overcommit_margin_is_five_percent() {
+        // Growth budget 6500 pages, 2000 resident: 4275 slots backable. RAM
+        // is 20000 pages, so the margin is 1000 and the line sits at 3275
+        // free slots, 5275 slots for the 2000 pages stored.
+        let near = |rows: &[(u64, u64, u64)]| {
+            let (_dir, pool) = overcommit_pool(rows, 10000);
+            pool.near_overcommit(&pool.get_pool_stats().unwrap())
+        };
+        assert!(!near(&[(1000, 1000, 2637), (1000, 1000, 2638)]));
+        assert!(near(&[(1000, 1000, 2638), (1000, 1000, 2638)]));
+        // A lone device is safe by construction.
+        assert!(!near(&[(2000, 2000, 20000)]));
+    }
+
+    #[test]
+    fn relief_skips_devices_without_huge_pages() {
+        let (_dir, mut pool) = overcommit_pool(&[(1000, 1000, 20000), (1000, 1000, 20000)], 10000);
+        let page = crate::meminfo::get_page_size();
+        for (dev, huge) in pool.devices.iter().zip([0, 7]) {
+            std::fs::write(
+                format!("{}/mm_stat", dev.sysfs_path),
+                format!(
+                    "{} {} {} {} 0 0 0 {} 0",
+                    1000 * page,
+                    1000 * page,
+                    1000 * page,
+                    10000 * page,
+                    huge
+                ),
+            )
+            .unwrap();
+        }
+        let stats = pool.get_pool_stats().unwrap();
+        pool.relieve_overcommit(&stats);
+        let requests = writeback_requests(&pool);
+        assert_eq!(requests[0], None);
+        assert_eq!(requests[1].as_ref().map(|r| r.0.as_str()), Some("huge"));
+    }
+
+    #[test]
+    fn every_store_counts_against_budget() {
+        // zram0's store holds the whole budget; zram1 alone is the target.
+        let (_dir, mut pool) = overcommit_pool(&[(1000, 1000, 20000), (1000, 1000, 20000)], 10000);
+        let full = pool.config.writeback_total / 4096;
+        std::fs::write(
+            format!("{}/bd_stat", pool.devices[0].sysfs_path),
+            format!("{full} 0 0"),
+        )
+        .unwrap();
+        let target = [(pool.devices[1].id, pool.devices[1].sysfs_path.clone())];
+        pool.write_back(&target, "huge", u64::MAX, 0);
+        assert_eq!(writeback_requests(&pool), [None, None]);
+
+        pool.devices[0].state = ZramDeviceState::Draining;
+        pool.write_back(&target, "huge", u64::MAX, 0);
+        assert_eq!(writeback_requests(&pool), [None, None]);
     }
 
     #[test]

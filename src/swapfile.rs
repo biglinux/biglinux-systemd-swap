@@ -68,6 +68,15 @@ fn headroom_floor(total: u64, chunk: u64) -> u64 {
     (total / 100 * 15).max(chunk.saturating_mul(2))
 }
 
+/// Whether swap held still between two checks, each read as (free RAM %,
+/// effective SwapFree MB, used MB of our files): RAM within a point, swap
+/// within 64 MB.
+fn swap_held_still(last: Option<(u8, u64, u64)>, now: (u8, u64, u64)) -> bool {
+    last.is_some_and(|(ram, free, used)| {
+        ram.abs_diff(now.0) <= 1 && free.abs_diff(now.1) < 64 && used.abs_diff(now.2) < 64
+    })
+}
+
 /// Size of one file that brings SwapFree back to twice `floor`, never below
 /// `chunk`, rounded up to whole MiB for mkswap.
 ///
@@ -680,11 +689,14 @@ impl SwapFile {
 
         // Woken early when memory pressure starts; see `PressureWait`.
         let pressure = crate::meminfo::PressureWait::new();
+        let mut backoff =
+            crate::meminfo::Backoff::new(Duration::from_secs(self.config.frequency), &pressure);
+        let mut settled = false;
+        // (free RAM %, effective SwapFree MB, used MB of our files) at the last check.
+        let mut last_reading: Option<(u8, u64, u64)> = None;
 
-        // Ensure minimum files are created at startup
         loop {
-            let poll_interval = self.get_adaptive_poll_interval();
-            pressure.wait(Duration::from_secs(poll_interval));
+            let woke = pressure.wait(backoff.next(settled));
 
             if is_shutdown() {
                 break;
@@ -697,6 +709,8 @@ impl SwapFile {
 
             // Get individual file statistics from /proc/swaps
             let swap_files = self.get_swapfiles_info();
+
+            let usage = get_effective_swap_usage().ok();
 
             // How full OUR files are, from their own /proc/swaps rows.
             //
@@ -722,6 +736,26 @@ impl SwapFile {
                     ((total.saturating_sub(used) * 100) / total).min(100) as u8
                 }
             };
+
+            // Settled: RAM within a point and swap within 64 MB of the last
+            // check, and every expansion trigger clear by a margin, since a
+            // long wait leaves kswapd room to fill a file without a stall:
+            // RAM more than 5 points above `free_ram_perc`, SwapFree above
+            // twice the headroom floor, our files at least 10 points above
+            // `free_swap_perc` free and not all 75% full.
+            let reading = (
+                free_ram,
+                usage.as_ref().map_or(0, |u| u.swap_free / MB),
+                swap_files.iter().map(|f| f.used_bytes).sum::<u64>() / MB,
+            );
+            let far_from_triggers = free_ram > self.config.free_ram_perc.saturating_add(5)
+                && usage.as_ref().is_some_and(|u| {
+                    u.swap_free > 2 * headroom_floor(u.swap_total, self.config.chunk_size)
+                })
+                && disk_free_percent >= self.config.free_swap_perc.saturating_add(10)
+                && (swap_files.is_empty() || swap_files.iter().any(|f| f.usage_percent() < 75));
+            settled = !woke && far_from_triggers && swap_held_still(last_reading, reading);
+            last_reading = Some(reading);
 
             // Cooldown: prevent creating swapfiles too fast
             // ZSWAP: shorter cooldown since writeback consumes swapfiles quickly
@@ -769,7 +803,8 @@ impl SwapFile {
                 // the file for when zram is nearly spent, and keying on RAM at
                 // `free_ram_perc` -- the same line contraction needs RAM above
                 // before it removes anything -- keeps the two from flapping.
-                let (swap_total, swap_free) = get_effective_swap_usage()
+                let (swap_total, swap_free) = usage
+                    .as_ref()
                     .map(|u| (u.swap_total, u.swap_free))
                     .unwrap_or((0, u64::MAX));
                 let floor = headroom_floor(swap_total, self.config.chunk_size);
@@ -795,6 +830,7 @@ impl SwapFile {
                         swap_total / MB,
                         size / MB
                     );
+                    settled = false;
                     if self.create_swapfile(size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
@@ -816,6 +852,7 @@ impl SwapFile {
                         "swapFC: all {} file(s) >= 85% full, disk_free={}% - expanding (stress trigger)",
                         swap_files.len(), disk_free_percent
                     );
+                    settled = false;
                     if self.create_swapfile(self.config.chunk_size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
@@ -829,6 +866,7 @@ impl SwapFile {
                         "swapFC: disk swap pressure! disk_free={}% < {}% (thresh) - expanding (cooldown={}s)",
                         disk_free_percent, swap_threshold, self.cooldown_secs
                     );
+                    settled = false;
                     if self.create_swapfile(self.config.chunk_size).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = (self.cooldown_secs * 2).min(120);
@@ -879,6 +917,7 @@ impl SwapFile {
                             candidate.usage_percent()
                         );
                         let path = candidate.path.clone();
+                        settled = false;
                         if self.destroy_swapfile_by_path(&path).is_ok() {
                             self.disk_full = false; // Space freed, allow expansion again
                         }
@@ -888,24 +927,6 @@ impl SwapFile {
         }
 
         Ok(())
-    }
-
-    fn get_adaptive_poll_interval(&self) -> u64 {
-        if self.allocated > 0 {
-            return self.config.frequency;
-        }
-
-        let free_ram = get_free_ram_percent().unwrap_or(100);
-
-        if free_ram > 70 {
-            10.min(self.config.frequency * 10)
-        } else if free_ram > 50 {
-            5.min(self.config.frequency * 5)
-        } else if free_ram > self.config.free_ram_perc {
-            2.min(self.config.frequency * 2)
-        } else {
-            self.config.frequency
-        }
     }
 
     fn has_enough_space(&self, required_size: u64) -> bool {
@@ -1077,6 +1098,16 @@ mod tests {
             used_bytes: used,
             priority: 0,
         }
+    }
+
+    #[test]
+    fn swap_held_still_thresholds() {
+        // swap.conf(5): a point of RAM, 64 MB of swap.
+        assert!(!swap_held_still(None, (50, 1000, 100)));
+        assert!(swap_held_still(Some((50, 1000, 100)), (51, 1063, 37)));
+        assert!(!swap_held_still(Some((50, 1000, 100)), (52, 1000, 100)));
+        assert!(!swap_held_still(Some((50, 1000, 100)), (50, 1064, 100)));
+        assert!(!swap_held_still(Some((50, 1000, 100)), (50, 1000, 164)));
     }
 
     #[test]

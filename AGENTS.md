@@ -28,12 +28,12 @@ Behaviour under memory pressure is checked by hand on a test machine with
 
 | File | Responsibility |
 |------|----------------|
-| `lib.rs` | Re-exports, `SHUTDOWN`/`DRY_RUN` atomics, `#![deny(unsafe_code)]` |
+| `lib.rs` | Re-exports, `SHUTDOWN`/`DRY_RUN` atomics and the shutdown pipe, `#![deny(unsafe_code)]` |
 | `main.rs` | clap CLI (`start`/`status`/`autoconfig`), mode dispatch, monitors |
 | `config.rs` | `swap.conf` parser, `${VAR}` + `$(( … ))` expansion (no shell) |
 | `defaults.rs` | Compile-time defaults (paths, MGLRU TTL, fallbacks) |
 | `autoconfig.rs` | Hardware detect → `RecommendedConfig` → `SwapMode` |
-| `meminfo.rs` | `/proc/meminfo` + `/proc/cpuinfo` readers |
+| `meminfo.rs` | `/proc/meminfo` + `/proc/cpuinfo` readers, `PressureWait` (PSI trigger), `Backoff` |
 | `helpers.rs` | Root check, `run_cmd_output` argv helper, findmnt cache, log macros |
 | `systemd.rs` | `systemctl` wrapper, `systemd-escape`, `sd-notify`, sole `unsafe` (`libc::swapoff`) |
 | `zram.rs` | ZramPool state machine + monitor |

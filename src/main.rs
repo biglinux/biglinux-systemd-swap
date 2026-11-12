@@ -345,7 +345,7 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // Disable zswap when using zram (per kernel documentation)
     disable_zswap_for_zram();
 
-    let zram_ok = spawn_zram_pool(config);
+    let zram = spawn_zram_pool(config);
 
     // Create swapfc for overflow (lower priority) - non-critical
     info!("Setting up swapfc as secondary swap for overflow...");
@@ -364,7 +364,7 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            if zram_ok {
+            if zram.is_some() {
                 warn!("Swapfile setup failed, continuing with zram only: {}", e);
                 notify_ready();
                 idle_until_shutdown();
@@ -374,31 +374,39 @@ fn run_zram_swapfc(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    join_zram_monitor(zram);
     Ok(())
 }
 
 /// Start the zram pool as primary swap, its monitor on a background thread
-/// (expansion/contraction). False when the pool could not start.
-fn spawn_zram_pool(config: &Config) -> bool {
+/// (expansion/contraction). None when the pool could not start.
+fn spawn_zram_pool(config: &Config) -> Option<std::thread::JoinHandle<()>> {
     info!("Setting up ZramPool as primary swap...");
     match systemd_swap::zram::ZramPool::new(config) {
         Ok(mut pool) => match pool.start_primary() {
-            Ok(()) => {
-                std::thread::spawn(move || {
-                    if let Err(e) = pool.run_monitor() {
-                        warn!("ZramPool monitor error: {}", e);
-                    }
-                });
-                true
-            }
+            Ok(()) => Some(std::thread::spawn(move || {
+                if let Err(e) = pool.run_monitor() {
+                    warn!("ZramPool monitor error: {}", e);
+                }
+            })),
             Err(e) => {
                 error!("ZramPool: start_primary failed: {}", e);
-                false
+                None
             }
         },
         Err(e) => {
             error!("ZramPool: init failed: {}", e);
-            false
+            None
+        }
+    }
+}
+
+/// Wait for the zram monitor to end its pass after shutdown: the process
+/// exiting under it would leave a device half added.
+fn join_zram_monitor(monitor: Option<std::thread::JoinHandle<()>>) {
+    if let Some(monitor) = monitor {
+        if monitor.join().is_err() {
+            warn!("ZramPool monitor panicked");
         }
     }
 }
@@ -469,8 +477,15 @@ fn run_zram_only(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Keep the service alive with nothing to monitor until SIGTERM.
 fn idle_until_shutdown() {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     while !systemd_swap::is_shutdown() {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        match systemd_swap::shutdown_fd() {
+            Some(fd) => match poll(&mut [PollFd::new(fd, PollFlags::POLLIN)], PollTimeout::NONE) {
+                Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_secs(60)),
+            },
+            None => std::thread::sleep(std::time::Duration::from_secs(60)),
+        }
     }
 }
 
@@ -490,6 +505,7 @@ fn run_manual(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let mut zram = None;
     if config.get_bool("zram_enabled") {
         if !config.get_bool("zswap_enabled") {
             disable_zswap_for_zram();
@@ -497,19 +513,26 @@ fn run_manual(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         // The same pool as every other zram mode: one legacy device sized
         // straight from zram_size had no RAM bound on its slots, the setup that
         // hung with writes failing and disk swap untouched.
-        spawn_zram_pool(config);
+        zram = spawn_zram_pool(config);
     }
 
-    if config.get_bool("swapfile_enabled") {
-        let mut swapfc = SwapFile::new(config)?;
-        swapfc.create_initial_swap()?;
-        swapfc.run()?;
+    let swapfc = if config.get_bool("swapfile_enabled") {
+        SwapFile::new(config).and_then(|mut swapfc| {
+            swapfc.create_initial_swap()?;
+            swapfc.run()
+        })
     } else {
         notify_ready();
         info!("Manual mode swap setup complete");
         idle_until_shutdown();
+        Ok(())
+    };
+    // A failed swapfile ends the daemon: stop the zram monitor first.
+    if swapfc.is_err() {
+        systemd_swap::request_shutdown();
     }
-    Ok(())
+    join_zram_monitor(zram);
+    Ok(swapfc?)
 }
 
 /// Save zswap backup for later restoration

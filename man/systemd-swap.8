@@ -22,7 +22,8 @@ short. The swap mode and its tuning come from
 auto mode picks them from the hardware.
 .SH COMMANDS
 .IP start
-Set up swap and keep managing it until SIGTERM. Run by the service unit.
+Set up swap and keep managing it until SIGTERM, SIGINT or SIGHUP. Run by
+the service unit.
 Stopping the service ends the daemon but leaves its swap active, so no page
 has to come back into RAM; the next start adopts that swap, and at shutdown
 systemd deactivates it.

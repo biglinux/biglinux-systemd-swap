@@ -84,7 +84,12 @@ Seconds between expansions, 5\(en120 (default 10).
 Seconds the pool must stay under the contract threshold before a device is
 removed, 30\(en600 (default 120).
 .IP zram_check_interval=
-Longest wait between checks in seconds, 3\(en300 (default 5). Memory pressure (PSI) wakes the monitor at once.
+Wait between checks in seconds while the pool changes, 3\(en300 (default 5).
+While the device count and RAM share hold still, slot use moves by a point
+at most and stays more than 20 points under zram_expand_threshold, no device
+is being removed, and a grown pool keeps 5% of RAM clear of overcommit, the
+wait doubles up to 60 seconds (or this value, if larger). Memory pressure
+(PSI) wakes the monitor at once; without PSI the wait stays at this value.
 .SS Zram writeback
 .PP
 Pages nobody has read for a while are written to a sparse file behind a loop
@@ -135,7 +140,13 @@ Create a file when the files' free space falls under this percentage (default 40
 .IP swapfile_remove_free_swap_perc=
 Remove a file when the files' free space is above this percentage (default 70).
 .IP swapfile_frequency=
-Seconds between checks while files exist, 1\(en86400 (default 1).
+Seconds between checks while free RAM or swap use changes, 1\(en86400
+(default 1). While free RAM moves by a point at most and swap by less than
+64 MB, free RAM stays more than 5 points above swapfile_free_ram_perc,
+SwapFree above twice the headroom floor, and the files at least 10 points
+above swapfile_free_swap_perc free with one under 75% used, the wait doubles
+up to 60 seconds (or this value, if larger). Memory pressure (PSI) wakes the
+monitor at once; without PSI the wait stays at this value.
 .IP swapfile_shrink_threshold=
 A file less used than this percentage may be removed, 10\(en50 (default 30).
 .IP swapfile_safe_headroom=

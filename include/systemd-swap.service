@@ -15,6 +15,9 @@ ExecStart=/usr/bin/systemd-swap start
 # The next start adopts the zram devices and swap files; at shutdown systemd
 # deactivates the generated .swap units itself.
 RemainAfterExit=yes
+# SIGTERM to the daemon alone: a mkswap or systemctl it runs finishes, and the
+# daemon exits once it returns.
+KillMode=mixed
 # Service is resilient-by-design: transient kernel/module hiccups should
 # auto-recover without disabling swap management for the whole boot.
 #

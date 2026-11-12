@@ -61,7 +61,7 @@ get_swap_mode(config)
    │        ├── Disabled   ──► notify_ready, exit clean
    │        └── explicit modes pass through
    ▼
-ctrlc::set_handler ──► request_shutdown() (atomic flag)
+ctrlc::set_handler ──► request_shutdown() (atomic flag + pipe)
    │
    ▼
 apply_autoconfig (auto mode only) ──► configure_mglru()  // lru_gen/min_ttl_ms
@@ -82,7 +82,7 @@ effective_mode dispatcher:
 notify_ready ──► monitor loop polls /proc/meminfo + zram/zswap sysfs
    │             grows/shrinks swap, logs, re-notifies status
    ▼
-SIGINT/SIGTERM → SHUTDOWN flag → loops return → process exits
+SIGINT/SIGTERM/SIGHUP → SHUTDOWN flag → loops return → process exits
 ```
 
 Stopping the service only ends the daemon: the unit has no `ExecStop=`, so
@@ -109,10 +109,10 @@ No async runtime. Concurrency is `std::thread`:
   findmnt cache shared by background threads.
 - `ctrlc` crate installs a signal-handler thread that sets `SHUTDOWN`.
 - All inter-thread communication is via the two atomic flags
-  (`SHUTDOWN`, `DRY_RUN`); no channels.
-- SIGINT/SIGTERM are handled solely by `ctrlc` (the `signal-hook` dep was
-  removed); sd-notify (`libsystemd::daemon::notify`) is
-  fire-and-forget.
+  (`SHUTDOWN`, `DRY_RUN`) and the shutdown pipe that wakes waits; no
+  channels.
+- SIGINT, SIGTERM and SIGHUP are handled solely by `ctrlc`; sd-notify
+  (`libsystemd::daemon::notify`) is fire-and-forget.
 
 The systemd main loop is external (we are a `Type=simple` service, so
 systemd ignores `READY=1` and the sd-notify calls are advisory only);
