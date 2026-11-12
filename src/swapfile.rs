@@ -60,6 +60,9 @@ impl SwapFileInfo {
 }
 
 const MB: u64 = 1024 * 1024;
+/// How long expansion waits after finding no room before it asks again. Space
+/// freed by anything other than our own files is only seen by asking.
+const DISK_FULL_RETRY: Duration = Duration::from_secs(60);
 
 /// SwapFree under which the disk tier grows while RAM is short: 15% of
 /// SwapTotal, 5 points clear of systemd-oomd's default `SwapUsedLimit=90%`,
@@ -123,7 +126,7 @@ pub enum MinFree {
 }
 
 /// Parse a percentage of the filesystem ("5%", up to 100) or a size ("2G").
-pub fn parse_min_free(s: &str) -> Option<MinFree> {
+fn parse_min_free(s: &str) -> Option<MinFree> {
     let s = s.trim();
     match s.strip_suffix('%') {
         Some(pct) => pct
@@ -140,7 +143,7 @@ pub fn parse_min_free(s: &str) -> Option<MinFree> {
 ///
 /// An explicit value is taken as given; only the automatic default is clamped,
 /// since an admin asking for a specific reserve has already made the judgement.
-pub fn resolve_min_free(fs_total: u64, configured: Option<MinFree>) -> u64 {
+fn resolve_min_free(fs_total: u64, configured: Option<MinFree>) -> u64 {
     // Multiply before dividing, in u128 so a filesystem large enough to
     // overflow the intermediate cannot exist.
     let percent_of_total = |p: u64| -> u64 { ((fs_total as u128 * p as u128) / 100) as u64 };
@@ -155,13 +158,40 @@ pub fn resolve_min_free(fs_total: u64, configured: Option<MinFree>) -> u64 {
     }
 }
 
-/// Bytes not yet allocated to any btrfs chunk, from `btrfs filesystem usage -b`.
-pub fn parse_btrfs_unallocated(output: &str) -> Option<u64> {
-    output.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("Device unallocated:")
-            .and_then(|rest| rest.trim().parse().ok())
-    })
+/// `Device unallocated` and `Free (estimated)` from `btrfs filesystem usage -b`,
+/// in bytes.
+fn parse_btrfs_usage(output: &str) -> Option<(u64, u64)> {
+    let field = |label: &str| {
+        output.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(label)
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        })
+    };
+    Some((field("Device unallocated:")?, field("Free (estimated):")?))
+}
+
+/// Whether a failed creation (`disk_full`: when, and whether that file was
+/// urgent) still holds back a file of the given urgency. A failure at the
+/// urgent file's smaller reserve holds back every file; one at the full reserve
+/// leaves the urgent file free to try.
+fn expansion_paused(disk_full: Option<(Instant, bool)>, urgent: bool) -> bool {
+    disk_full
+        .is_some_and(|(at, was_urgent)| at.elapsed() < DISK_FULL_RETRY && (was_urgent || !urgent))
+}
+
+/// Whether a file of `required` bytes leaves btrfs enough unallocated space to
+/// carve a metadata chunk. Assumes single-profile data, the only profile the
+/// kernel activates a swap file on. Free space inside data chunks (the estimate minus
+/// what is unallocated) takes the file first; only the rest comes out of
+/// unallocated space, so a file that fits in the chunks costs nothing here.
+fn btrfs_keeps_unallocated(required: u64, unallocated: u64, free_estimated: u64) -> bool {
+    const DATA_CHUNK: u64 = 1024 * 1024 * 1024;
+    let in_chunks = free_estimated.saturating_sub(unallocated);
+    // A spill takes whole data chunks, 1 GiB on all but small filesystems.
+    let from_unallocated = required.saturating_sub(in_chunks).div_ceil(DATA_CHUNK) * DATA_CHUNK;
+    from_unallocated == 0
+        || unallocated.saturating_sub(from_unallocated) >= defaults::SWAPFILE_BTRFS_MIN_UNALLOCATED
 }
 
 /// Reject paths that point at critical system directories or are not absolute.
@@ -311,8 +341,10 @@ pub struct SwapFile {
     prev_free_swap: u8,
     /// Whether ZSWAP is active (kernel-level compression with writeback)
     is_zswap_active: bool,
-    /// Disk full flag: stops expansion attempts until space is freed
-    disk_full: bool,
+    /// When creating a file last failed, and whether that file was urgent.
+    /// Expansion pauses for `DISK_FULL_RETRY` after it, or until one of our
+    /// files is removed.
+    disk_full: Option<(Instant, bool)>,
 }
 
 impl SwapFile {
@@ -432,7 +464,7 @@ impl SwapFile {
             cooldown_secs: if is_zswap_active { 5 } else { 15 },
             prev_free_swap: 100,
             is_zswap_active,
-            disk_full: false,
+            disk_full: None,
         })
     }
 
@@ -650,7 +682,7 @@ impl SwapFile {
         self.cleanup_stale_disk_files();
 
         while self.allocated < self.config.min_count {
-            if let Err(e) = self.create_swapfile(self.config.chunk_size) {
+            if let Err(e) = self.create_swapfile(self.config.chunk_size, false) {
                 warn!(
                     "swapFC: initial swap creation stopped at {}/{}: {}",
                     self.allocated, self.config.min_count, e
@@ -835,7 +867,7 @@ impl SwapFile {
             // holds a slot in these files, so their fill is what zswap uses up.
             // Zswap mode used to skip all of this and grow only through the
             // removed sparse loop path, which left it at `min_count` files.
-            if !self.disk_full && self.allocated < self.config.max_count {
+            if self.allocated < self.config.max_count {
                 // Count files with no data yet to avoid pre-allocating more than needed
                 let unused_count = swap_files.iter().filter(|f| f.used_bytes == 0).count();
 
@@ -865,13 +897,14 @@ impl SwapFile {
                     && swap_free < floor
                     && unused_count < 2
                     && emergency_cooldown_ok
+                    && !expansion_paused(self.disk_full, true)
                 {
                     // One file sized to restore the headroom, not a 512 MB
                     // chunk every 5 s: the reference load moved 4 GB into swap
                     // in 30 s. Only where the file is preallocated -- zero-filling
                     // gigabytes elsewhere would add writeback under pressure.
                     let refill = headroom_file_size(floor, swap_free, self.config.chunk_size);
-                    let size = if self.is_btrfs && self.has_enough_space(refill) {
+                    let size = if self.is_btrfs && self.space_refusal(refill, true).is_none() {
                         refill
                     } else {
                         self.config.chunk_size
@@ -884,7 +917,7 @@ impl SwapFile {
                         size / MB
                     );
                     settled = false;
-                    if self.create_swapfile(size).is_ok() {
+                    if self.create_swapfile(size, true).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
                     }
@@ -900,13 +933,17 @@ impl SwapFile {
                 // `files_stressed` already means every file we own is 85% full,
                 // so the extra `free_swap` term added nothing but the chance to
                 // veto a justified expansion on a reading about zram.
-                if files_stressed && unused_count < 2 && emergency_cooldown_ok {
+                if files_stressed
+                    && unused_count < 2
+                    && emergency_cooldown_ok
+                    && !expansion_paused(self.disk_full, false)
+                {
                     info!(
                         "swapFC: all {} file(s) >= 85% full, disk_free={}% - expanding (stress trigger)",
                         swap_files.len(), disk_free_percent
                     );
                     settled = false;
-                    if self.create_swapfile(self.config.chunk_size).is_ok() {
+                    if self.create_swapfile(self.config.chunk_size, false).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = 30;
                     }
@@ -914,13 +951,17 @@ impl SwapFile {
                 }
 
                 // NORMAL TRIGGER: our own disk swap running low.
-                if cooldown_ok && disk_free_percent < swap_threshold && unused_count < 2 {
+                if cooldown_ok
+                    && disk_free_percent < swap_threshold
+                    && unused_count < 2
+                    && !expansion_paused(self.disk_full, false)
+                {
                     info!(
                         "swapFC: disk swap pressure! disk_free={}% < {}% (thresh) - expanding (cooldown={}s)",
                         disk_free_percent, swap_threshold, self.cooldown_secs
                     );
                     settled = false;
-                    if self.create_swapfile(self.config.chunk_size).is_ok() {
+                    if self.create_swapfile(self.config.chunk_size, false).is_ok() {
                         self.last_creation = Some(Instant::now());
                         self.cooldown_secs = (self.cooldown_secs * 2).min(120);
                     }
@@ -972,7 +1013,7 @@ impl SwapFile {
                         let path = candidate.path.clone();
                         settled = false;
                         if self.destroy_swapfile_by_path(&path).is_ok() {
-                            self.disk_full = false; // Space freed, allow expansion again
+                            self.disk_full = None; // Space freed, allow expansion again
                         }
                     }
                 }
@@ -982,26 +1023,33 @@ impl SwapFile {
         Ok(())
     }
 
-    /// Whether a file of `required_size` can be created while leaving the
-    /// filesystem with enough room to keep working.
+    /// Why a file of `required_size` cannot be created and still leave the
+    /// filesystem its reserve, or None when it can. The reserve is what has to survive the
+    /// allocation, so it scales with the filesystem and not with the file.
     ///
-    /// The old rule was free >= required * 2, which scales with the swap file
-    /// rather than with the filesystem, so it let allocation continue until
-    /// roughly one chunk remained free. What matters instead is what survives
-    /// the allocation, so the reserve is the thing that has to still be there
-    /// afterwards.
-    fn has_enough_space(&self, required_size: u64) -> bool {
-        let Ok(stat) = nix::sys::statvfs::statvfs(&self.config.path) else {
-            return false;
+    /// An `urgent` file, the headroom ahead of systemd-oomd's limit, keeps only
+    /// the 1 GiB floor of the automatic reserve: losing a process costs more
+    /// than a fuller disk. An explicit `swapfile_min_free_disk` holds for both.
+    fn space_refusal(&self, required_size: u64, urgent: bool) -> Option<String> {
+        let stat = match nix::sys::statvfs::statvfs(&self.config.path) {
+            Ok(stat) => stat,
+            Err(e) => return Some(format!("statvfs failed: {}", e)),
         };
 
         let block_size = stat.block_size();
         let free = stat.blocks_available() * block_size;
         let total = stat.blocks() * block_size;
-        let reserve = resolve_min_free(total, self.config.min_free_disk);
+        let reserve = match self.config.min_free_disk {
+            None if urgent => defaults::SWAPFILE_MIN_FREE_FLOOR,
+            configured => resolve_min_free(total, configured),
+        };
 
         if free < required_size.saturating_add(reserve) {
-            return false;
+            return Some(format!(
+                "{}MB free, {}MB reserve to keep",
+                free / MB,
+                reserve / MB
+            ));
         }
 
         // btrfs reports space inside allocated data chunks as free even when
@@ -1009,29 +1057,29 @@ impl SwapFile {
         // window is how a filesystem ends up ENOSPC with free space showing,
         // so ask btrfs directly rather than trusting statvfs alone.
         if self.is_btrfs {
-            if let Ok(out) = run_cmd_output(&[
-                "btrfs",
-                "filesystem",
-                "usage",
-                "-b",
-                &self.config.path.to_string_lossy(),
-            ]) {
-                if let Some(unallocated) = parse_btrfs_unallocated(&out) {
-                    if unallocated < defaults::SWAPFILE_BTRFS_MIN_UNALLOCATED {
-                        warn!(
-                            "swapFC: btrfs has only {}MB unallocated - refusing to allocate",
-                            unallocated / (1024 * 1024)
-                        );
-                        return false;
+            let path = self.config.path.to_string_lossy();
+            let usage = run_cmd_output(&["btrfs", "filesystem", "usage", "-b", &path]);
+            match usage.ok().as_deref().and_then(parse_btrfs_usage) {
+                Some((unallocated, free_estimated)) => {
+                    if !btrfs_keeps_unallocated(required_size, unallocated, free_estimated) {
+                        return Some(format!(
+                            "btrfs would keep under {}MB unallocated ({}MB now)",
+                            defaults::SWAPFILE_BTRFS_MIN_UNALLOCATED / MB,
+                            unallocated / MB
+                        ));
                     }
                 }
+                None => warn!(
+                    "swapFC: could not read `btrfs filesystem usage` for {}, checking free space only",
+                    path
+                ),
             }
         }
 
-        true
+        None
     }
 
-    fn create_swapfile(&mut self, chunk_size: u64) -> Result<()> {
+    fn create_swapfile(&mut self, chunk_size: u64, urgent: bool) -> Result<()> {
         // The lowest number no active file of ours holds. `allocated + 1` was
         // used before, and after contraction left only `/swapfile/3` a restart
         // counted three files and shed the one real file as surplus.
@@ -1042,14 +1090,14 @@ impl SwapFile {
             .collect();
         let index = (1..).find(|n| !in_use.contains(n)).unwrap_or(1);
 
-        if !self.has_enough_space(chunk_size) {
-            if !self.disk_full {
-                warn!(
-                    "swapFC: ENOSPC (need {}MB) - pausing expansion",
-                    chunk_size / (1024 * 1024)
-                );
-                self.disk_full = true;
-            }
+        if let Some(reason) = self.space_refusal(chunk_size, urgent) {
+            warn!(
+                "swapFC: no room for a {}MB file: {} - pausing expansion for {}s",
+                chunk_size / MB,
+                reason,
+                DISK_FULL_RETRY.as_secs()
+            );
+            self.disk_full = Some((Instant::now(), urgent));
             return Err(SwapFileError::NoSpace);
         }
 
@@ -1073,11 +1121,19 @@ impl SwapFile {
             chunk_size / MB
         );
         if let Err(e) = self.allocate_file(&swapfile_path, chunk_size) {
-            {
-                force_remove(&swapfile_path, false);
-                self.allocated -= 1;
-                return Err(e);
-            }
+            // The space check is a snapshot; other writers can fill the
+            // filesystem before the file does. Pause as for a refused check, or
+            // the next tick writes the same zeros again.
+            warn!(
+                "swapFC: could not fill {}: {} - pausing expansion for {}s",
+                swapfile_path.display(),
+                e,
+                DISK_FULL_RETRY.as_secs()
+            );
+            force_remove(&swapfile_path, false);
+            self.allocated -= 1;
+            self.disk_full = Some((Instant::now(), urgent));
+            return Err(e);
         }
         let swapfile = swapfile_path.to_string_lossy().to_string();
 
@@ -1229,7 +1285,21 @@ mod tests {
     // ── btrfs unallocated ────────────────────────────────────────────────────
 
     #[test]
-    fn parses_device_unallocated_from_btrfs_usage() {
+    fn full_reserve_failure_spares_headroom() {
+        let now = Instant::now();
+        assert!(!expansion_paused(None, false));
+        assert!(expansion_paused(Some((now, false)), false));
+        assert!(!expansion_paused(Some((now, false)), true));
+        assert!(expansion_paused(Some((now, true)), false));
+        assert!(expansion_paused(Some((now, true)), true));
+        let Some(old) = now.checked_sub(DISK_FULL_RETRY) else {
+            return; // Boot too recent to go back a minute.
+        };
+        assert!(!expansion_paused(Some((old, true)), true));
+    }
+
+    #[test]
+    fn parses_btrfs_usage() {
         let out = "\
 Overall:
     Device size:                 999930462208
@@ -1238,17 +1308,35 @@ Overall:
     Used:                        870399021056
     Free (estimated):            120930316288      (min: 120930316288)
 ";
-        assert_eq!(parse_btrfs_unallocated(out), Some(97953775616));
+        assert_eq!(parse_btrfs_usage(out), Some((97953775616, 120930316288)));
     }
 
     #[test]
-    fn btrfs_unallocated_absent_when_unparseable() {
-        assert_eq!(parse_btrfs_unallocated(""), None);
-        // Human-readable output (without -b) is not a number we can use.
+    fn btrfs_usage_absent_when_unparseable() {
+        assert_eq!(parse_btrfs_usage(""), None);
         assert_eq!(
-            parse_btrfs_unallocated("    Device unallocated:\t  91.23GiB\n"),
+            parse_btrfs_usage("    Device unallocated:\t  91.23GiB\n    Free (estimated): 1\n"),
             None
         );
+    }
+
+    #[test]
+    fn btrfs_file_in_chunks_costs_nothing() {
+        // 512 MB fits in the 2 GiB free inside data chunks: allowed even with
+        // unallocated space already under the floor.
+        assert!(btrfs_keeps_unallocated(
+            512 * MB,
+            512 * MB,
+            512 * MB + 2 * GIB
+        ));
+        // A 512 MB spill takes a 1 GiB chunk: out of 2 GiB unallocated that
+        // leaves 1 GiB, allowed; out of 1.5 GiB it leaves 512 MB, refused.
+        assert!(btrfs_keeps_unallocated(GIB, 2 * GIB, 2 * GIB + 512 * MB));
+        assert!(!btrfs_keeps_unallocated(
+            GIB,
+            3 * GIB / 2,
+            3 * GIB / 2 + 512 * MB
+        ));
     }
 
     // ── SwapFileInfo ─────────────────────────────────────────────────────────

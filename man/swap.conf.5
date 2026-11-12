@@ -161,9 +161,11 @@ Free space to keep on the file system after a file is allocated, as a
 percentage ("5%") or a size ("2G"). Empty, the default, uses 5% clamped to
 1\(en8 GB: 5% of a small file system does not cover one btrfs metadata chunk,
 and 5% of a large one withholds far more than any file system needs. An
-explicit value is used as given. On btrfs no file is allocated while less than
-1 GB is unallocated, since btrfs counts free space inside allocated data chunks
-as available even when no metadata chunk can be carved out.
+explicit value is used as given. The headroom file created ahead of
+systemd-oomd's limit keeps only the 1 GB floor unless a value is set. On btrfs
+no file is allocated that would take unallocated space below 1 GB, since btrfs
+counts free space inside allocated data chunks as available even when no
+metadata chunk can be carved out.
 .SS MGLRU
 .IP mglru_min_ttl_ms=
 Pages younger than this many milliseconds are not reclaimed (default 1000;

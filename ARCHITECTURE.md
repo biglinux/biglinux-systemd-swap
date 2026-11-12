@@ -136,7 +136,7 @@ sizes are `u64`, paths are `Path`, unit names are first run through
 | `systemd-run`    | `systemd.rs`                        | `systemd-run --wait --quiet --collect -- swapon [--priority <i32>] [--discard] <path>`: swapon in the host mount namespace, before `daemon-reload`. |
 | `swapon`         | `main.rs`                           | `swapon --raw --noheadings --bytes` (read-only, `status`).             |
 | `du`             | `main.rs`                           | `du -b <swapfile-path>` (read-only).                                  |
-| `btrfs`          | `swapfile.rs`, `zram.rs`, `autoconfig.rs` | `btrfs subvolume create/show` on managed paths.                 |
+| `btrfs`          | `swapfile.rs`, `zram.rs`, `autoconfig.rs` | `btrfs subvolume create/show` on managed paths; `btrfs filesystem usage -b` (read-only) before a swap file is allocated. |
 | `chattr`         | `swapfile.rs`, `zram.rs`            | `chattr +C` on managed swap and writeback paths (NOCOW for btrfs).    |
 | `losetup`        | `zram.rs`                           | `losetup -f --show --direct-io=on <store>` / `-d /dev/loopN` for the zram writeback store. |
 | `fallocate`      | `swapfile.rs`                       | `fallocate --length <size-bytes> -- <path>` (btrfs swap files); size is `u64`. |
