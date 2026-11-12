@@ -859,7 +859,7 @@ impl ZramPool {
         // its full size the instant it is created, so the first device always
         // reads as having claimed everything before it has written a page --
         // that is exactly what starved the second store to a sliver. The pool
-        // total is instead enforced live in `run_writeback`, against the pages
+        // total is instead enforced live in `write_back`, against the pages
         // each store actually holds (`bd_stat`), which is the only bound that
         // stays true as pages fault back and the count falls again.
         writeback_share(self.config.writeback_total, free, disksize)
@@ -1146,8 +1146,10 @@ impl ZramPool {
         // configured total minus what the stores already hold. `bd_count` falls
         // as pages fault back, so this reopens without a restart. This is where
         // `writeback_total` is really enforced -- a store's file size is only a
-        // ceiling, and the stores' sizes together can exceed the budget.
-        let occupied_pages: u64 = targets.iter().map(|(_, s)| bd_count(s)).sum();
+        // ceiling, and the stores' sizes together can exceed the budget. Every
+        // store counts: a device this pass skips or one still draining holds
+        // its pages until they fault back.
+        let occupied_pages: u64 = self.devices.iter().map(|d| bd_count(&d.sysfs_path)).sum();
         let mut budget_pages = (self.config.writeback_total / 4096)
             .saturating_sub(occupied_pages)
             .min(want);
@@ -2194,6 +2196,25 @@ mod tests {
         let requests = writeback_requests(&pool);
         assert_eq!(requests[0], None);
         assert_eq!(requests[1].as_ref().map(|r| r.0.as_str()), Some("huge"));
+    }
+
+    #[test]
+    fn every_store_counts_against_budget() {
+        // zram0's store holds the whole budget; zram1 alone is the target.
+        let (_dir, mut pool) = overcommit_pool(&[(1000, 1000, 20000), (1000, 1000, 20000)], 10000);
+        let full = pool.config.writeback_total / 4096;
+        std::fs::write(
+            format!("{}/bd_stat", pool.devices[0].sysfs_path),
+            format!("{full} 0 0"),
+        )
+        .unwrap();
+        let target = [(pool.devices[1].id, pool.devices[1].sysfs_path.clone())];
+        pool.write_back(&target, "huge", u64::MAX, 0);
+        assert_eq!(writeback_requests(&pool), [None, None]);
+
+        pool.devices[0].state = ZramDeviceState::Draining;
+        pool.write_back(&target, "huge", u64::MAX, 0);
+        assert_eq!(writeback_requests(&pool), [None, None]);
     }
 
     #[test]
