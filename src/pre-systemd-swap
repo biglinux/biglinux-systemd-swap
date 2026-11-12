@@ -70,11 +70,9 @@ fi
 
 swapfcfolder=""
 
-# The setup below maps this to subvolume @<folder> mounted at /<folder>, so
-# only single-component absolute paths work. Taking the second component of
-# /var/swap gave folder "var", mounting a new @var over the live /var.
-# Only checked when the value is used: in disabled mode swapfile_path is inert,
-# and rejecting it there would also skip the kernel tuning below.
+# The daemon needs an absolute path. Only checked when the value is used: in
+# disabled mode swapfile_path is inert, and rejecting it there would also skip
+# the kernel tuning below.
 if [[ "$swapfile_subvol_needed" == "1" ]]; then
     if [[ "$swapfcpath" != /* ]]; then
         die "swapfile_path must be an absolute path, got: $swapfcpath"
@@ -84,15 +82,17 @@ if [[ "$swapfile_subvol_needed" == "1" ]]; then
         die "swapfile_path must not contain whitespace, got: $swapfcpath"
     fi
 
-    swapfcfolder="${swapfcpath#/}"
-    swapfcfolder="${swapfcfolder%/}"
+    # The path without its leading and trailing slashes, as the daemon reads it.
+    swapfcfolder="$swapfcpath"
+    while [[ "$swapfcfolder" == /* ]]; do
+        swapfcfolder="${swapfcfolder#/}"
+    done
+    while [[ "$swapfcfolder" == */ ]]; do
+        swapfcfolder="${swapfcfolder%/}"
+    done
 
     if [[ -z "$swapfcfolder" ]]; then
         die "swapfile_path must not be the filesystem root"
-    fi
-
-    if [[ "$swapfcfolder" == */* ]]; then
-        die "swapfile_path must be a single top-level directory such as /swapfile, got: $swapfcpath"
     fi
 fi
 
@@ -110,10 +110,25 @@ fi
 # Get filesystem type
 fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || printf '%s\n' "unknown")
 
+# On a btrfs root the directory becomes subvolume @<folder> mounted at
+# /<folder>, which only a single top-level directory can be: /var/swap would
+# mount a new @var over the live /var, and /mnt/data/swapfile may sit on
+# another filesystem altogether. A deeper path is only created, as on any
+# other filesystem.
+subvolume=0
+if [[ "$fstype" == "btrfs" ]]; then
+    if [[ -z "$swapfcfolder" ]]; then
+        log_info "swap_mode=disabled uses no swap directory, skipping subvolume setup"
+    elif [[ "$swapfcfolder" == */* ]]; then
+        log_info "swapfile_path=$swapfcpath is not a top-level directory, skipping the btrfs subvolume"
+    else
+        subvolume=1
+    fi
+fi
+
 # Check if path is a btrfs subvolume and get top level id.
-# swapfcfolder is empty when the mode has no swap files, so gate on that too.
 toplevelid=""
-if [[ "$swapfile_subvol_needed" == "1" ]] && [[ "$fstype" == "btrfs" ]] && [[ -d "/$swapfcfolder" ]]; then
+if [[ "$subvolume" == "1" ]] && [[ -d "/$swapfcfolder" ]]; then
     toplevelid=$(btrfs subvolume show "/$swapfcfolder" 2>/dev/null | grep -i "top level id" | awk '{print $4}' || printf '')
 fi
 
@@ -121,9 +136,7 @@ fi
 # Btrfs Subvolume Setup
 # =============================================================================
 
-if [[ "$swapfile_subvol_needed" != "1" ]] && [[ "$fstype" == "btrfs" ]]; then
-    log_info "swap_mode=disabled uses no swap directory, skipping subvolume setup"
-elif [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
+if [[ "$subvolume" == "1" ]] && [[ "$toplevelid" != "5" ]]; then
     log_info "Setting up btrfs subvolume for swap files"
 
     # Mount the btrfs top level on /mnt. Plain `mount "$rootpartition"` gives
@@ -254,9 +267,8 @@ fi
 # systemd-swap.service runs under ProtectSystem=strict, where ReadWritePaths=
 # can only unlock a path that already exists when the mount namespace is built,
 # and the read-only root leaves the daemon unable to create one itself. The
-# btrfs branch above made and mounted the directory; on every other filesystem
-# nothing had, and the daemon then met a read-only /swapfile and could not
-# place a single swap file. Idempotent, so re-running costs nothing.
+# subvolume setup above covers a top-level directory on btrfs; every other case
+# needs the directory made here. Idempotent, so re-running costs nothing.
 if [[ -n "$swapfcfolder" ]]; then
     mkdir -p "/$swapfcfolder"
 fi

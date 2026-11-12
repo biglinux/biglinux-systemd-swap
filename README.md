@@ -211,6 +211,9 @@ zram_size=200%             # Virtual disksize (% of RAM)
 ```ini
 swapfile_path=/mnt/data/swapfile
 ```
+The service writes only to `/swapfile`, so another path also needs a drop-in
+for `systemd-swap.service` that adds it to `ReadWritePaths=`. On a btrfs root
+only a top-level directory such as `/swapfile` gets its own subvolume.
 
 **Adjust anti-thrashing protection:**
 ```ini

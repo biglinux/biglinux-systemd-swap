@@ -126,7 +126,11 @@ Preallocated files (NOCOW on btrfs) created under memory pressure and removed
 when idle. Their priority is below zram, so the kernel uses them once zram is
 full.
 .IP swapfile_path=
-Directory for the swap files (default /swapfile).
+Directory for the swap files (default /swapfile). On a btrfs root a top-level
+directory becomes its own subvolume, @swapfile for the default, kept out of
+snapshots of the root; a deeper path is only created. The service writes only
+to /swapfile: another path needs a drop-in that adds it to
+.BR ReadWritePaths= .
 .IP swapfile_chunk_size=
 Size of each file (default 512M).
 .IP swapfile_max_count=

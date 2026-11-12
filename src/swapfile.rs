@@ -353,36 +353,25 @@ impl SwapFile {
             // For btrfs: create subvolume with nodatacow for swap
             let is_subvolume = is_btrfs_subvolume(&swapfile_config.path);
 
-            if !is_subvolume {
-                // Clear the way only when there is nothing to lose. A directory
-                // with entries in it is holding live swap: the swapfiles this
-                // very instance is about to adopt a few lines further on, and
-                // any zram writeback store an administrator pointed here. The
-                // snapshot isolation a subvolume adds is not worth destroying
-                // those for, so an occupied directory is kept as it stands --
-                // `btrfs subvolume create` then fails on it and the fallback
-                // below carries on with a plain directory, NOCOW included.
-                let occupied = swapfile_config
-                    .path
-                    .read_dir()
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-
-                if swapfile_config.path.exists() && !occupied {
-                    warn!("swapFC: path exists but not a subvolume, removing...");
-                    if swapfile_config.path.is_dir() {
-                        fs::remove_dir_all(&swapfile_config.path)?;
-                    } else {
-                        fs::remove_file(&swapfile_config.path)?;
-                    }
-                } else if occupied {
+            if !is_subvolume && swapfile_config.path.is_dir() {
+                // An existing directory is kept as it stands, empty or not. It
+                // may hold the swap files this instance is about to adopt, or a
+                // zram writeback store, and under ProtectSystem=strict a path in
+                // ReadWritePaths= is a bind mount that cannot be removed anyway.
+                // It goes without the snapshot isolation a subvolume adds; the
+                // NOCOW flag below is what swapon needs.
+                info!(
+                    "swapFC: {:?} is a directory, not a subvolume; using it as it is",
+                    swapfile_config.path
+                );
+            } else if !is_subvolume {
+                if swapfile_config.path.exists() {
                     warn!(
-                        "swapFC: {:?} holds files and is not a subvolume; keeping it \
-                         (no snapshot isolation)",
+                        "swapFC: {:?} is not a directory, removing it",
                         swapfile_config.path
                     );
+                    fs::remove_file(&swapfile_config.path)?;
                 }
-
                 // Try to create btrfs subvolume
                 let output = Command::new("btrfs")
                     .args(["subvolume", "create"])
