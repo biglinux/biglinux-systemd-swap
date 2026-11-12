@@ -112,39 +112,46 @@ pub struct SwapFileConfig {
     pub safe_headroom: u8,
     /// Free space to keep on the filesystem, as a percentage ("5%") or a size
     /// ("2G"). None resolves to a percentage clamped into an absolute band.
-    pub min_free_disk: Option<String>,
+    pub min_free_disk: Option<MinFree>,
+}
+
+/// An explicit `swapfile_min_free_disk`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinFree {
+    Percent(u64),
+    Bytes(u64),
+}
+
+/// Parse a percentage of the filesystem ("5%", up to 100) or a size ("2G").
+pub fn parse_min_free(s: &str) -> Option<MinFree> {
+    let s = s.trim();
+    match s.strip_suffix('%') {
+        Some(pct) => pct
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&p| p <= 100)
+            .map(MinFree::Percent),
+        None => parse_size_shared(s).ok().map(MinFree::Bytes),
+    }
 }
 
 /// Free space to keep on the filesystem after allocating a swap file.
 ///
-/// `configured` accepts a percentage ("5%") or a size ("2G"). An explicit value
-/// is taken as given; only the automatic default is clamped, since an admin
-/// asking for a specific reserve has already made the judgement.
-pub fn resolve_min_free(fs_total: u64, configured: Option<&str>) -> u64 {
+/// An explicit value is taken as given; only the automatic default is clamped,
+/// since an admin asking for a specific reserve has already made the judgement.
+pub fn resolve_min_free(fs_total: u64, configured: Option<MinFree>) -> u64 {
     // Multiply before dividing, in u128 so a filesystem large enough to
     // overflow the intermediate cannot exist.
     let percent_of_total = |p: u64| -> u64 { ((fs_total as u128 * p as u128) / 100) as u64 };
 
-    let automatic = || {
-        percent_of_total(defaults::SWAPFILE_MIN_FREE_PERCENT).clamp(
+    match configured {
+        Some(MinFree::Percent(p)) => percent_of_total(p),
+        Some(MinFree::Bytes(b)) => b,
+        None => percent_of_total(defaults::SWAPFILE_MIN_FREE_PERCENT).clamp(
             defaults::SWAPFILE_MIN_FREE_FLOOR,
             defaults::SWAPFILE_MIN_FREE_CAP,
-        )
-    };
-
-    match configured {
-        None => automatic(),
-        Some(s) => {
-            let s = s.trim();
-            if let Some(pct) = s.strip_suffix('%') {
-                match pct.trim().parse::<u64>() {
-                    Ok(p) => percent_of_total(p),
-                    Err(_) => automatic(),
-                }
-            } else {
-                parse_size_shared(s).unwrap_or_else(|_| automatic())
-            }
-        }
+        ),
     }
 }
 
@@ -273,12 +280,16 @@ impl SwapFileConfig {
             shrink_threshold,
             safe_headroom,
             min_free_disk: {
-                let s = config.get("swapfile_min_free_disk").unwrap_or("").trim().to_string();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
+                let s = config.get("swapfile_min_free_disk").unwrap_or("").trim();
+                let parsed = parse_min_free(s);
+                if parsed.is_none() && !s.is_empty() {
+                    warn!(
+                        "swapFC: swapfile_min_free_disk={:?} is neither a percentage nor a size, \
+                         keeping the automatic reserve",
+                        s
+                    );
                 }
+                parsed
             },
         })
     }
@@ -998,7 +1009,7 @@ impl SwapFile {
         let block_size = stat.block_size();
         let free = stat.blocks_available() * block_size;
         let total = stat.blocks() * block_size;
-        let reserve = resolve_min_free(total, self.config.min_free_disk.as_deref());
+        let reserve = resolve_min_free(total, self.config.min_free_disk);
 
         if free < required_size.saturating_add(reserve) {
             return false;
@@ -1205,17 +1216,25 @@ mod tests {
 
     #[test]
     fn reserve_honours_an_explicit_size_or_percentage() {
-        assert_eq!(resolve_min_free(100 * GIB, Some("2G")), 2 * GIB);
-        assert_eq!(resolve_min_free(100 * GIB, Some("10%")), 10 * GIB);
+        assert_eq!(resolve_min_free(100 * GIB, parse_min_free("2G")), 2 * GIB);
+        assert_eq!(resolve_min_free(100 * GIB, parse_min_free("10%")), 10 * GIB);
         // An explicit value is not clamped: the admin has made the call.
-        assert_eq!(resolve_min_free(4096 * GIB, Some("50%")), 2048 * GIB);
-        assert_eq!(resolve_min_free(100 * GIB, Some("64M")), 64 * 1024 * 1024);
+        assert_eq!(
+            resolve_min_free(4096 * GIB, parse_min_free("50%")),
+            2048 * GIB
+        );
+        assert_eq!(
+            resolve_min_free(100 * GIB, parse_min_free("64M")),
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
-    fn reserve_falls_back_to_automatic_on_nonsense() {
-        assert_eq!(resolve_min_free(100 * GIB, Some("banana")), 5 * GIB);
-        assert_eq!(resolve_min_free(100 * GIB, Some("%")), 5 * GIB);
+    fn reserve_rejects_nonsense() {
+        assert_eq!(parse_min_free("banana"), None);
+        assert_eq!(parse_min_free("%"), None);
+        assert_eq!(parse_min_free("101%"), None);
+        assert_eq!(parse_min_free(""), None);
     }
 
     // ── btrfs unallocated ────────────────────────────────────────────────────
