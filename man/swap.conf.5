@@ -126,7 +126,11 @@ Preallocated files (NOCOW on btrfs) created under memory pressure and removed
 when idle. Their priority is below zram, so the kernel uses them once zram is
 full.
 .IP swapfile_path=
-Directory for the swap files (default /swapfile).
+Directory for the swap files (default /swapfile). On a btrfs root a top-level
+directory becomes its own subvolume, @swapfile for the default, kept out of
+snapshots of the root; a deeper path is only created. The service writes only
+to /swapfile: another path needs a drop-in that adds it to
+.BR ReadWritePaths= .
 .IP swapfile_chunk_size=
 Size of each file (default 512M).
 .IP swapfile_max_count=
@@ -152,6 +156,16 @@ A file less used than this percentage may be removed, 10\(en50 (default 30).
 .IP swapfile_safe_headroom=
 Percentage the remaining files must keep free after absorbing a removed file's
 pages, 20\(en60 (default 40).
+.IP swapfile_min_free_disk=
+Free space to keep on the file system after a file is allocated, as a
+percentage ("5%") or a size ("2G"). Empty, the default, uses 5% clamped to
+1\(en8 GB: 5% of a small file system does not cover one btrfs metadata chunk,
+and 5% of a large one withholds far more than any file system needs. An
+explicit value is used as given. The headroom file created ahead of
+systemd-oomd's limit keeps only the 1 GB floor unless a value is set. On btrfs
+no file is allocated that would take unallocated space below 1 GB, since btrfs
+counts free space inside allocated data chunks as available even when no
+metadata chunk can be carved out.
 .SS MGLRU
 .IP mglru_min_ttl_ms=
 Pages younger than this many milliseconds are not reclaimed (default 1000;
