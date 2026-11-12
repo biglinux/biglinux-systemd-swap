@@ -50,17 +50,14 @@ config_get() {
 }
 
 # swap_mode is read first because it decides whether swapfile_path is used at
-# all. Only zram and disabled never create swap files. auto is resolved by the
-# daemon at runtime, so treat it as needing the subvolume.
+# all. Only disabled leaves it unused: zram mode keeps its writeback stores
+# there, and auto is resolved by the daemon at runtime. The daemon matches the
+# mode case-insensitively.
 swap_mode=$(config_get "swap_mode")
 
-if [[ -z "$swap_mode" ]]; then
-    swap_mode="auto"
-fi
-
-case "$swap_mode" in
-    zram|disabled) swapfile_subvol_needed=0 ;;
-    *)             swapfile_subvol_needed=1 ;;
+case "${swap_mode,,}" in
+    disabled) swapfile_subvol_needed=0 ;;
+    *)        swapfile_subvol_needed=1 ;;
 esac
 
 # Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
@@ -76,8 +73,8 @@ swapfcfolder=""
 # The setup below maps this to subvolume @<folder> mounted at /<folder>, so
 # only single-component absolute paths work. Taking the second component of
 # /var/swap gave folder "var", mounting a new @var over the live /var.
-# Only checked when the value is used: in zram and disabled modes swapfile_path
-# is inert, and rejecting it there would also skip the kernel tuning below.
+# Only checked when the value is used: in disabled mode swapfile_path is inert,
+# and rejecting it there would also skip the kernel tuning below.
 if [[ "$swapfile_subvol_needed" == "1" ]]; then
     if [[ "$swapfcpath" != /* ]]; then
         die "swapfile_path must be an absolute path, got: $swapfcpath"
@@ -125,7 +122,7 @@ fi
 # =============================================================================
 
 if [[ "$swapfile_subvol_needed" != "1" ]] && [[ "$fstype" == "btrfs" ]]; then
-    log_info "swap_mode=$swap_mode does not use swap files, skipping subvolume setup"
+    log_info "swap_mode=disabled uses no swap directory, skipping subvolume setup"
 elif [[ "$toplevelid" != "5" ]] && [[ "$fstype" == "btrfs" ]]; then
     log_info "Setting up btrfs subvolume for swap files"
 
@@ -260,7 +257,9 @@ fi
 # btrfs branch above made and mounted the directory; on every other filesystem
 # nothing had, and the daemon then met a read-only /swapfile and could not
 # place a single swap file. Idempotent, so re-running costs nothing.
-mkdir -p "/$swapfcfolder"
+if [[ -n "$swapfcfolder" ]]; then
+    mkdir -p "/$swapfcfolder"
+fi
 
 # =============================================================================
 # Disable Existing Swap Partitions
