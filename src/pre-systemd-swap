@@ -60,8 +60,9 @@ case "${swap_mode,,}" in
     *)        swapfile_subvol_needed=1 ;;
 esac
 
-# Prefer new key (swapfile_path), fall back to legacy (swapfc_path).
-swapfcpath=$(config_get "swapfile_path|swapfc_path")
+# The daemon reads only swapfile_path; a legacy swapfc_path line is ignored by
+# both.
+swapfcpath=$(config_get "swapfile_path")
 
 if [[ -z "$swapfcpath" ]]; then
     # Default path mirrors defaults::SWAPFILE_PATH in src/defaults.rs
@@ -82,6 +83,12 @@ if [[ "$swapfile_subvol_needed" == "1" ]]; then
         die "swapfile_path must not contain whitespace, got: $swapfcpath"
     fi
 
+    # The daemon expands $VAR and ${VAR} from its own environment, which this
+    # script cannot reproduce, so the two would prepare different directories.
+    if [[ "$swapfcpath" == *'$'* ]]; then
+        die "swapfile_path must not contain \$, got: $swapfcpath"
+    fi
+
     # The path without its leading and trailing slashes, as the daemon reads it.
     swapfcfolder="$swapfcpath"
     while [[ "$swapfcfolder" == /* ]]; do
@@ -93,6 +100,19 @@ if [[ "$swapfile_subvol_needed" == "1" ]]; then
 
     if [[ -z "$swapfcfolder" ]]; then
         die "swapfile_path must not be the filesystem root"
+    fi
+
+    # The directories the daemon refuses (validate_swapfile_path in
+    # src/swapfile.rs). On btrfs a top-level one would otherwise become a
+    # subvolume mounted over the live directory.
+    for dir in /etc /sys /proc /dev /run /bin /sbin /usr /lib /lib64 /boot /snap /lost+found; do
+        if [[ "/$swapfcfolder" == "$dir" || "/$swapfcfolder" == "$dir"/* ]]; then
+            die "swapfile_path must not be a system directory, got: $swapfcpath"
+        fi
+    done
+
+    if [[ -e "/$swapfcfolder" && ! -d "/$swapfcfolder" ]]; then
+        die "swapfile_path exists and is not a directory, got: $swapfcpath"
     fi
 fi
 
@@ -115,12 +135,26 @@ fstype=$(lsblk -fno FSTYPE "$rootpartition" 2>/dev/null || printf '%s\n' "unknow
 # mount a new @var over the live /var, and /mnt/data/swapfile may sit on
 # another filesystem altogether. A deeper path is only created, as on any
 # other filesystem.
+#
+# A mount point is left alone: it is either the subvolume from an earlier run
+# or a separate file system, such as /home on its own partition. So is a
+# symbolic link, whose target lives elsewhere, and a directory that already
+# holds files, since mounting over it would hide them, active swap files
+# included.
 subvolume=0
 if [[ "$fstype" == "btrfs" ]]; then
     if [[ -z "$swapfcfolder" ]]; then
         log_info "swap_mode=disabled uses no swap directory, skipping subvolume setup"
     elif [[ "$swapfcfolder" == */* ]]; then
         log_info "swapfile_path=$swapfcpath is not a top-level directory, skipping the btrfs subvolume"
+    elif ! command -v btrfs >/dev/null; then
+        log_info "btrfs-progs is not installed, skipping the btrfs subvolume"
+    elif mountpoint -q "/$swapfcfolder"; then
+        :
+    elif [[ -L "/$swapfcfolder" ]]; then
+        log_info "/$swapfcfolder is a symbolic link, skipping the btrfs subvolume"
+    elif [[ -n "$(find "/$swapfcfolder" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        log_info "/$swapfcfolder already holds files, skipping the btrfs subvolume"
     else
         subvolume=1
     fi
