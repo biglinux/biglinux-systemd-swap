@@ -1055,10 +1055,22 @@ impl SwapFile {
         // btrfs reports space inside allocated data chunks as free even when
         // nothing is left to carve a metadata chunk from. Writing into that
         // window is how a filesystem ends up ENOSPC with free space showing,
-        // so ask btrfs directly rather than trusting statvfs alone.
+        // so ask btrfs directly rather than trusting statvfs alone. `timeout`
+        // bounds a hang that a signal can end, so a stuck ioctl does not stall
+        // the monitor, which also creates the headroom file.
         if self.is_btrfs {
             let path = self.config.path.to_string_lossy();
-            let usage = run_cmd_output(&["btrfs", "filesystem", "usage", "-b", &path]);
+            let usage = run_cmd_output(&[
+                "timeout",
+                "-k",
+                "1",
+                "5",
+                "btrfs",
+                "filesystem",
+                "usage",
+                "-b",
+                &path,
+            ]);
             match usage.ok().as_deref().and_then(parse_btrfs_usage) {
                 Some((unallocated, free_estimated)) => {
                     if !btrfs_keeps_unallocated(required_size, unallocated, free_estimated) {

@@ -165,7 +165,9 @@ explicit value is used as given. The headroom file created ahead of
 systemd-oomd's limit keeps only the 1 GB floor unless a value is set. On btrfs
 no file is allocated that would take unallocated space below 1 GB, since btrfs
 counts free space inside allocated data chunks as available even when no
-metadata chunk can be carved out.
+metadata chunk can be carved out. That check needs
+.BR "btrfs filesystem usage" ;
+when it fails or cannot be read, only the free space above is checked.
 .SS MGLRU
 .IP mglru_min_ttl_ms=
 Pages younger than this many milliseconds are not reclaimed (default 1000;
